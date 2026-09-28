@@ -553,8 +553,20 @@ impl Platform for PlatformBackend {
         b.wayland_on_ready(state)
     }
 
+    #[cfg(feature = "wayland")]
+    fn on_window_property_changed(
+        b: &mut KmsBackend,
+        state: &ServerState,
+        host_xid: u32,
+        property: yserver_protocol::x11::AtomId,
+    ) {
+        b.wayland_property_changed(state, host_xid, property);
+    }
+
     fn poll_deferred_input(b: &mut KmsBackend, state: &mut ServerState) {
-        KmsBackend::backend_session_poll_deferred_input(b, state)
+        KmsBackend::backend_session_poll_deferred_input(b, state);
+        #[cfg(feature = "wayland")]
+        b.sync_wayland(state);
     }
 
     fn start_device_config(

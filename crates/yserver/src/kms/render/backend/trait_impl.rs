@@ -412,6 +412,15 @@ impl<P: Platform> Backend for XBackend<P> {
         P::on_wayland_ready(self, state)
     }
 
+    fn on_window_property_changed(
+        &mut self,
+        state: &ServerState,
+        host_xid: u32,
+        property: yserver_protocol::x11::AtomId,
+    ) {
+        P::on_window_property_changed(self, state, host_xid, property);
+    }
+
     fn poll_deferred_input(&mut self, state: &mut ServerState) {
         P::poll_deferred_input(self, state)
     }

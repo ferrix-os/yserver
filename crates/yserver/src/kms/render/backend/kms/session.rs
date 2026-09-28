@@ -196,6 +196,8 @@ impl KmsBackend {
             wayland: None,
             #[cfg(feature = "wayland")]
             wayland_randr_ids: None,
+            #[cfg(feature = "wayland")]
+            wayland_redirect_refused: false,
         };
         let mut b = Self::assemble(core, platform, engine, scene, pstate, kms_outputs_active);
         // Validate every route already committed during platform bring-up,

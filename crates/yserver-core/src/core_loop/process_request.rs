@@ -105,6 +105,7 @@ pub(crate) use grabs::*;
 pub use present_ext::*;
 pub(crate) use props::*;
 pub use randr_ext::*;
+pub use redirect::redirect_subwindows_for_server;
 pub(crate) use redirect::*;
 pub(crate) use saver_dpms::*;
 pub(crate) use selection::*;

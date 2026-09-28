@@ -397,6 +397,14 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn on_wayland_ready(_b: &mut XBackend<Self>, _state: &mut ServerState) -> bool {
         true
     }
+    /// An X property changed on the window `host_xid`.
+    fn on_window_property_changed(
+        _b: &mut XBackend<Self>,
+        _state: &ServerState,
+        _host_xid: u32,
+        _property: yserver_protocol::x11::AtomId,
+    ) {
+    }
     fn poll_deferred_input(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
 
     fn start_device_config(

@@ -4,7 +4,9 @@
 
 use std::io;
 
-use crate::kms::render::backend::KmsBackend;
+use yserver_core::server::ServerState;
+
+use crate::kms::render::{backend::KmsBackend, scene::OutputSink as _};
 
 impl KmsBackend {
     /// Become a client of a Wayland compositor (`crate::wayland`): take its
@@ -71,22 +73,111 @@ impl KmsBackend {
     /// `false` when the compositor closed it.
     pub(in crate::kms::render::backend) fn wayland_on_ready(
         &mut self,
-        _state: &mut yserver_core::server::ServerState,
+        _state: &mut ServerState,
     ) -> bool {
         let Some(link) = self.pstate.wayland.as_mut() else {
             return true;
         };
         match link.dispatch() {
-            Ok(events) => {
-                for event in events {
-                    log::debug!("wayland: {event:?}");
-                }
+            Ok(()) => {
                 link.flush();
                 true
             }
             Err(error) => {
                 log::warn!("wayland: {error}");
                 false
+            }
+        }
+    }
+
+    /// The Wayland backend's turn of each loop iteration: keep the root's
+    /// children redirected for the server, so each top-level's image is one
+    /// backing, then bring the compositor's windows in line with them
+    /// (`crate::wayland::WaylandLink::sync`).
+    pub(in crate::kms::render::backend) fn sync_wayland(&mut self, state: &mut ServerState) {
+        if self.pstate.wayland.is_none() {
+            return;
+        }
+        let redirected = yserver_core::core_loop::process_request::redirect_subwindows_for_server(
+            state,
+            self,
+            yserver_core::resources::ROOT_WINDOW,
+            yserver_core::server::CompositeRedirectMode::Manual,
+        );
+        if !redirected && !self.pstate.wayland_redirect_refused {
+            // A client redirected the root's children first. The windows
+            // still show, but without their subwindows.
+            log::warn!("wayland: a client redirects the root's children; subwindows will not show");
+        }
+        self.pstate.wayland_redirect_refused = !redirected;
+        let Some(mut link) = self.pstate.wayland.take() else {
+            return;
+        };
+        link.sync(state, self);
+        self.pstate.wayland = Some(link);
+    }
+
+    /// An X property changed on `host_xid`: the compositor's title and app
+    /// id follow `_NET_WM_NAME`, `WM_NAME` and `WM_CLASS`.
+    pub(in crate::kms::render::backend) fn wayland_property_changed(
+        &mut self,
+        state: &ServerState,
+        host_xid: u32,
+        property: yserver_protocol::x11::AtomId,
+    ) {
+        if let Some(link) = self.pstate.wayland.as_mut() {
+            link.property_changed(state, host_xid, property);
+        }
+    }
+}
+
+/// Each top-level's image for the Wayland backend: the window read through
+/// its redirect routing, which under the server's own redirect of the root's
+/// children is its backing, subwindows included.
+impl crate::wayland::WindowImages for KmsBackend {
+    fn image_version(&self, host_xid: u32) -> Option<u64> {
+        let target = self.resolve_paint_target(host_xid)?;
+        self.store
+            .get(target.backing_id())
+            .map(|drawable| drawable.content_version)
+    }
+
+    fn read_image(&mut self, host_xid: u32, width: u16, height: u16) -> Option<Vec<u8>> {
+        let target = self.resolve_paint_target(host_xid)?;
+        let depth = target.x11_depth();
+        if depth != 24 && depth != 32 {
+            return None;
+        }
+        // The content, inside the border: `get_image`'s rectangle at the
+        // window's own origin.
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D {
+                x: target.offset().0,
+                y: target.offset().1,
+            },
+            extent: ash::vk::Extent2D {
+                width: u32::from(width),
+                height: u32::from(height),
+            },
+        };
+        let readback = self.engine.get_image(
+            &mut self.store,
+            self.platform.gpu_mut(),
+            target.src_including_border(),
+            rect,
+            depth,
+        );
+        self.drain_frame_builder_telemetry();
+        match readback {
+            Ok(mut bytes) => {
+                // Short only while a resize is under way: pad, as
+                // `get_image` does, so the rows stay where they belong.
+                bytes.resize(usize::from(width) * usize::from(height) * 4, 0);
+                Some(bytes)
+            }
+            Err(error) => {
+                log::warn!("wayland: reading window 0x{host_xid:x} back: {error:?}");
+                None
             }
         }
     }

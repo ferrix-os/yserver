@@ -1047,6 +1047,11 @@ pub struct KmsBackendState {
     /// allocated on first projection so they stay the same afterwards.
     #[cfg(feature = "wayland")]
     pub(in crate::kms::render::backend) wayland_randr_ids: Option<(u32, u32, u32)>,
+
+    /// A client redirected the root's children before the Wayland backend
+    /// could, which was said once (`sync_wayland`).
+    #[cfg(feature = "wayland")]
+    pub(in crate::kms::render::backend) wayland_redirect_refused: bool,
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.

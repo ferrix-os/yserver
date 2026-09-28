@@ -636,6 +636,8 @@ impl KmsBackend {
             wayland: None,
             #[cfg(feature = "wayland")]
             wayland_randr_ids: None,
+            #[cfg(feature = "wayland")]
+            wayland_redirect_refused: false,
         };
         let mut backend = Self::assemble(
             KmsCore::for_tests(),
