@@ -172,6 +172,10 @@ impl KmsBackend {
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
             export_holders: Default::default(),
+            #[cfg(feature = "wayland")]
+            wayland: None,
+            #[cfg(feature = "wayland")]
+            wayland_randr_ids: None,
         };
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every

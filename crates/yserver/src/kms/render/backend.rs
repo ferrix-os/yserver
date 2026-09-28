@@ -1444,6 +1444,16 @@ pub struct KmsBackend {
 
     /// Last `export holders` report, for change detection.
     export_holders: crate::kms::render::export_holders::ExportHoldersReporter,
+
+    /// The Wayland compositor this server is a client of, under
+    /// `YSERVER_BACKEND=wayland` (`crate::wayland`); `None` on a DRM card.
+    #[cfg(feature = "wayland")]
+    wayland: Option<crate::wayland::WaylandLink>,
+
+    /// The Wayland backend's one RandR output's (output, CRTC, mode) ids,
+    /// allocated on first projection so they stay the same afterwards.
+    #[cfg(feature = "wayland")]
+    wayland_randr_ids: Option<(u32, u32, u32)>,
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.

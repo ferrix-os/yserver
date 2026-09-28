@@ -131,6 +131,10 @@ impl Backend for KmsBackend {
     }
 
     fn before_block(&mut self) {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = self.wayland.as_mut() {
+            link.flush();
+        }
         Self::backend_scanout_before_block(self)
     }
 
@@ -306,7 +310,13 @@ impl Backend for KmsBackend {
     fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
         // Direct mode only: DRM fd + present-completion epfd. libinput runs
         // on its own thread, not the core poll.
-        self.platform.poll_fds()
+        #[allow(unused_mut)]
+        let mut fds = self.platform.poll_fds();
+        #[cfg(feature = "wayland")]
+        if let Some(link) = self.wayland.as_ref() {
+            fds.push((link.fd(), BackendFdKind::Wayland));
+        }
+        fds
     }
 
     fn vt_switching_armed(&self) -> bool {
@@ -468,6 +478,26 @@ impl Backend for KmsBackend {
         // Direct mode: libinput runs on the dedicated input thread and reaches
         // the core via Message::HostInput, so there is no on-core libinput fd
         // to dispatch here.
+    }
+
+    #[cfg(feature = "wayland")]
+    fn on_wayland_ready(&mut self, _state: &mut ServerState) -> bool {
+        let Some(link) = self.wayland.as_mut() else {
+            return true;
+        };
+        match link.dispatch() {
+            Ok(events) => {
+                for event in events {
+                    log::debug!("wayland: {event:?}");
+                }
+                link.flush();
+                true
+            }
+            Err(error) => {
+                log::warn!("wayland: {error}");
+                false
+            }
+        }
     }
 
     fn poll_deferred_input(&mut self, state: &mut ServerState) {

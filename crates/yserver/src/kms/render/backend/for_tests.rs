@@ -599,6 +599,10 @@ impl KmsBackend {
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
             export_holders: Default::default(),
+            #[cfg(feature = "wayland")]
+            wayland: None,
+            #[cfg(feature = "wayland")]
+            wayland_randr_ids: None,
         };
         let live: Vec<_> = backend
             .platform
