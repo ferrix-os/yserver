@@ -33,6 +33,7 @@ mod drawing;
 mod dri3;
 mod focus_pointer;
 mod fonts;
+mod for_server;
 mod gc_pixmap_cursor;
 mod glx;
 mod grabs;
@@ -102,6 +103,7 @@ use crate::core_loop::process_request::{
 };
 pub use focus_pointer::set_input_focus_for_server;
 pub(crate) use focus_pointer::*;
+pub use for_server::{close_window_for_server, configure_window_for_server};
 pub(crate) use grabs::*;
 pub use present_ext::*;
 pub(crate) use props::*;

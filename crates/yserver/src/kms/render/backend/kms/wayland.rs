@@ -119,7 +119,29 @@ impl KmsBackend {
         };
         link.sync(state, self);
         link.sync_cursor(self);
+        let requests = link.take_requests();
         self.pstate.wayland = Some(link);
+        // What the compositor asked of the windows, which only the core,
+        // with the state in hand, can carry out.
+        for request in requests {
+            let done = match request {
+                crate::wayland::Request::Resize {
+                    window,
+                    width,
+                    height,
+                } => yserver_core::core_loop::process_request::configure_window_for_server(
+                    state, self, window, width, height,
+                ),
+                crate::wayland::Request::Close { window } => {
+                    yserver_core::core_loop::process_request::close_window_for_server(
+                        state, self, window,
+                    )
+                }
+            };
+            if let Err(error) = done {
+                log::warn!("wayland: {request:?}: {error}");
+            }
+        }
     }
 
     /// An X property changed on `host_xid`: the compositor's title and app
