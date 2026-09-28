@@ -603,6 +603,8 @@ impl KmsBackend {
             wayland: None,
             #[cfg(feature = "wayland")]
             wayland_randr_ids: None,
+            #[cfg(feature = "wayland")]
+            wayland_redirect_refused: false,
         };
         let live: Vec<_> = backend
             .platform

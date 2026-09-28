@@ -176,6 +176,8 @@ impl KmsBackend {
             wayland: None,
             #[cfg(feature = "wayland")]
             wayland_randr_ids: None,
+            #[cfg(feature = "wayland")]
+            wayland_redirect_refused: false,
         };
         // Validate every route already committed during platform bring-up,
         // then apply Xorg's one-shot AutoBindGPU-shaped startup policy: every

@@ -15,12 +15,15 @@
 //! - `trait_impl`: `impl Backend for KmsBackend`, one file until the trait
 //!   bodies move to per-subsystem delegators.
 //! - `for_tests`: `*_for_tests` entry points for the acceptance tests.
+//! - `wayland`: the rootless Wayland backend's side (feature `wayland`).
 //! - `tests`, `crtc_transform_tests`: unit tests.
 
 mod for_tests;
 mod kms;
 mod portable;
 mod trait_impl;
+#[cfg(feature = "wayland")]
+mod wayland;
 
 use kms::*;
 pub(super) use portable::*;
@@ -1492,6 +1495,11 @@ pub struct KmsBackend {
     /// allocated on first projection so they stay the same afterwards.
     #[cfg(feature = "wayland")]
     wayland_randr_ids: Option<(u32, u32, u32)>,
+
+    /// A client redirected the root's children before the Wayland backend
+    /// could, which was said once (`sync_wayland`).
+    #[cfg(feature = "wayland")]
+    wayland_redirect_refused: bool,
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.

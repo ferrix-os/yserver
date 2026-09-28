@@ -486,10 +486,7 @@ impl Backend for KmsBackend {
             return true;
         };
         match link.dispatch() {
-            Ok(events) => {
-                for event in events {
-                    log::debug!("wayland: {event:?}");
-                }
+            Ok(()) => {
                 link.flush();
                 true
             }
@@ -500,8 +497,22 @@ impl Backend for KmsBackend {
         }
     }
 
+    #[cfg(feature = "wayland")]
+    fn on_window_property_changed(
+        &mut self,
+        state: &ServerState,
+        host_xid: u32,
+        property: yserver_protocol::x11::AtomId,
+    ) {
+        if let Some(link) = self.wayland.as_mut() {
+            link.property_changed(state, host_xid, property);
+        }
+    }
+
     fn poll_deferred_input(&mut self, state: &mut ServerState) {
-        Self::backend_session_poll_deferred_input(self, state)
+        Self::backend_session_poll_deferred_input(self, state);
+        #[cfg(feature = "wayland")]
+        self.sync_wayland(state);
     }
 
     fn start_device_config(
