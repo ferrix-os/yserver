@@ -3203,3 +3203,16 @@ fn reparent_between_redirected_parents_with_different_modes_flips_mode() {
         *calls,
     );
 }
+
+#[test]
+fn exposed_by_grow_is_the_new_area_and_nothing_else() {
+    assert_eq!(
+        exposed_by_grow((178, 178), (982, 726)),
+        vec![(178, 0, 804, 726), (0, 178, 178, 548)]
+    );
+    assert_eq!(
+        exposed_by_grow((178, 178), (178, 300)),
+        vec![(0, 178, 178, 122)]
+    );
+    assert!(exposed_by_grow((485, 726), (178, 178)).is_empty());
+}
