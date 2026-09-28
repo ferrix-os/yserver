@@ -2036,6 +2036,64 @@ fn cow_with_empty_input_shape_passes_clicks_to_sibling_below() {
     );
 }
 
+#[test]
+fn a_pointer_scope_keeps_the_hit_test_to_one_top_level() {
+    use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
+    use yserver_protocol::x11::CreateWindowRequest;
+
+    let mut state = ServerState::new();
+    // Two top-levels over each other at the root's origin, as two X
+    // windows a compositor shows side by side are; `upper` is on top.
+    let lower = ResourceId(0x0010_0080);
+    let upper = ResourceId(0x0010_0081);
+    let child = ResourceId(0x0010_0082);
+    for (window, parent, x) in [
+        (lower, ROOT_WINDOW, 0),
+        (upper, ROOT_WINDOW, 0),
+        (child, lower, 20),
+    ] {
+        state.resources.create_window(
+            ClientId(1),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent,
+                x,
+                y: x,
+                width: if parent == ROOT_WINDOW { 200 } else { 50 },
+                height: if parent == ROOT_WINDOW { 100 } else { 50 },
+                border_width: 0,
+                class: 1,
+                visual: ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        let _ = state.resources.map_window(window);
+    }
+
+    let at = |state: &ServerState, x, y| state.root_pointer_target_at(x, y);
+    assert_eq!(
+        at(&state, 30, 30),
+        Some((upper, 30, 30)),
+        "anywhere: the upper one"
+    );
+
+    state.pointer_scope = PointerScope::Within(lower);
+    assert_eq!(
+        at(&state, 30, 30),
+        Some((child, 10, 10)),
+        "within the lower one: its child, under the upper one"
+    );
+    assert_eq!(
+        at(&state, 300, 30),
+        Some((ROOT_WINDOW, 300, 30)),
+        "outside the one the pointer is on: the root"
+    );
+
+    state.pointer_scope = PointerScope::Nowhere;
+    assert_eq!(at(&state, 30, 30), Some((ROOT_WINDOW, 30, 30)));
+}
+
 // ---- #133 step 8 (P9): border-inclusive input ----------------
 //
 // The `ServerState` half of the hit test. `resources.rs` pins the

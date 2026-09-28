@@ -175,7 +175,8 @@ impl KmsBackend {
     ///
     /// Resizing the virtual screen failing.
     #[cfg(feature = "wayland")]
-    pub fn attach_wayland(&mut self, link: crate::wayland::WaylandLink) -> io::Result<()> {
+    pub fn attach_wayland(&mut self, mut link: crate::wayland::WaylandLink) -> io::Result<()> {
+        link.adopt_keyboard_layout(&mut self.core);
         if let Some((width, height)) = link.screen_size() {
             self.apply_virtual_screen_extent(width, height)?;
             log::info!("wayland: the root window is the compositor's screen, {width}x{height}");

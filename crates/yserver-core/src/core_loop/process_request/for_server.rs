@@ -66,3 +66,34 @@ pub fn redirect_subwindows_for_server(
     }
     true
 }
+
+/// The server's own SetInputFocus, for a backend whose host decides the
+/// focus: a rootless server gives its top-level the focus when the host's
+/// keyboard enters that window, as the window manager would, and takes it
+/// away (`None`) when the keyboard leaves. `window` is `None` for None; a
+/// window that is gone or not viewable is refused, as the request would be.
+/// The focus reverts to PointerRoot if the window goes.
+///
+/// Returns whether the focus is now where it was asked to be.
+pub fn set_input_focus_for_server(state: &mut ServerState, window: Option<ResourceId>) -> bool {
+    let to_raw = match window {
+        None => 0,
+        Some(window) => {
+            let viewable = state
+                .resources
+                .window(window)
+                .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
+            if !viewable {
+                return false;
+            }
+            window.0
+        }
+    };
+    let time = state
+        .timestamp_now()
+        .max(state.xi1_last_input_time)
+        .max(state.core_focus.time);
+    let revert_to = if to_raw == 0 { 0 } else { 1 };
+    apply_core_focus(state, to_raw, revert_to, time);
+    true
+}

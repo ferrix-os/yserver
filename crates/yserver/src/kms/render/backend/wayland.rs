@@ -29,7 +29,20 @@ impl KmsBackend {
             return;
         };
         link.sync(state, self);
+        link.sync_cursor(self);
         self.wayland = Some(link);
+    }
+}
+
+/// The cursor in effect, for the Wayland backend to give the compositor.
+impl crate::wayland::CursorSource for KmsBackend {
+    fn cursor_key(&self) -> Option<(u32, u64)> {
+        let xid = self.effective_cursor_xid?;
+        Some((xid, self.cursor_records.get(&xid)?.version))
+    }
+
+    fn cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
+        Backend::get_active_cursor_image(self)
     }
 }
 

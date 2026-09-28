@@ -481,12 +481,13 @@ impl Backend for KmsBackend {
     }
 
     #[cfg(feature = "wayland")]
-    fn on_wayland_ready(&mut self, _state: &mut ServerState) -> bool {
-        let Some(link) = self.wayland.as_mut() else {
+    fn on_wayland_ready(&mut self, state: &mut ServerState) -> bool {
+        let Some(mut link) = self.wayland.take() else {
             return true;
         };
-        match link.dispatch() {
+        let alive = match link.dispatch() {
             Ok(()) => {
+                link.deliver_input(state, self);
                 link.flush();
                 true
             }
@@ -494,7 +495,9 @@ impl Backend for KmsBackend {
                 log::warn!("wayland: {error}");
                 false
             }
-        }
+        };
+        self.wayland = Some(link);
+        alive
     }
 
     #[cfg(feature = "wayland")]
