@@ -100,6 +100,7 @@ use crate::core_loop::process_request::{
     xshm::handle_mit_shm_request,
     xtest::handle_xtest_request,
 };
+pub use focus_pointer::set_input_focus_for_server;
 pub(crate) use focus_pointer::*;
 pub(crate) use grabs::*;
 pub use present_ext::*;

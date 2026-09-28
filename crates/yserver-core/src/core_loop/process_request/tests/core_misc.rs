@@ -2058,3 +2058,68 @@ fn xcmisc_get_xid_list_returns_free_ids() {
     let bytes = read_all_available(&mut peer);
     assert_eq!(bytes[1], x11::error::BAD_LENGTH);
 }
+
+/// The server's own focus (a rootless backend's keyboard enter and
+/// leave) moves the focus as SetInputFocus does, with the events, and
+/// refuses a window that is not viewable.
+#[test]
+fn the_server_gives_the_focus_to_a_window_and_takes_it_away() {
+    use yserver_protocol::x11::CreateWindowRequest;
+
+    const CLIENT: u32 = 72;
+    const WIN: u32 = 0x0072_0001;
+    const HIDDEN: u32 = 0x0072_0002;
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, CLIENT);
+    for win in [WIN, HIDDEN] {
+        state.resources.create_window(
+            ClientId(CLIENT),
+            CreateWindowRequest {
+                depth: 24,
+                window: ResourceId(win),
+                parent: ROOT_WINDOW,
+                width: 200,
+                height: 100,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+    }
+    assert!(state.resources.map_window(ResourceId(WIN)).mapping_changed);
+    state
+        .clients
+        .get_mut(&CLIENT)
+        .unwrap()
+        .event_masks
+        .insert(ResourceId(WIN), FOCUS_CHANGE_MASK);
+
+    assert!(
+        !crate::core_loop::process_request::set_input_focus_for_server(
+            &mut state,
+            Some(ResourceId(HIDDEN))
+        )
+    );
+    assert_eq!(state.core_focus.raw, 1, "still PointerRoot");
+
+    assert!(
+        crate::core_loop::process_request::set_input_focus_for_server(
+            &mut state,
+            Some(ResourceId(WIN))
+        )
+    );
+    assert_eq!(state.core_focus.raw, WIN);
+    let bytes = read_all_available(&mut peer);
+    assert!(
+        bytes.chunks_exact(32).any(|event| event[0] & 0x7f == 9),
+        "FocusIn on the window"
+    );
+
+    assert!(crate::core_loop::process_request::set_input_focus_for_server(&mut state, None));
+    assert_eq!(state.core_focus.raw, 0, "None");
+    let bytes = read_all_available(&mut peer);
+    assert!(
+        bytes.chunks_exact(32).any(|event| event[0] & 0x7f == 10),
+        "FocusOut from the window"
+    );
+}

@@ -16,7 +16,8 @@ impl KmsBackend {
     /// # Errors
     ///
     /// Resizing the virtual screen failing.
-    pub fn attach_wayland(&mut self, link: crate::wayland::WaylandLink) -> io::Result<()> {
+    pub fn attach_wayland(&mut self, mut link: crate::wayland::WaylandLink) -> io::Result<()> {
+        link.adopt_keyboard_layout(&mut self.core);
         if let Some((width, height)) = link.screen_size() {
             self.apply_virtual_screen_extent(width, height)?;
             log::info!("wayland: the root window is the compositor's screen, {width}x{height}");
@@ -73,13 +74,14 @@ impl KmsBackend {
     /// `false` when the compositor closed it.
     pub(in crate::kms::render::backend) fn wayland_on_ready(
         &mut self,
-        _state: &mut ServerState,
+        state: &mut ServerState,
     ) -> bool {
-        let Some(link) = self.pstate.wayland.as_mut() else {
+        let Some(mut link) = self.pstate.wayland.take() else {
             return true;
         };
-        match link.dispatch() {
+        let alive = match link.dispatch() {
             Ok(()) => {
+                link.deliver_input(state, self);
                 link.flush();
                 true
             }
@@ -87,7 +89,9 @@ impl KmsBackend {
                 log::warn!("wayland: {error}");
                 false
             }
-        }
+        };
+        self.pstate.wayland = Some(link);
+        alive
     }
 
     /// The Wayland backend's turn of each loop iteration: keep the root's
@@ -114,6 +118,7 @@ impl KmsBackend {
             return;
         };
         link.sync(state, self);
+        link.sync_cursor(self);
         self.pstate.wayland = Some(link);
     }
 
@@ -128,6 +133,18 @@ impl KmsBackend {
         if let Some(link) = self.pstate.wayland.as_mut() {
             link.property_changed(state, host_xid, property);
         }
+    }
+}
+
+/// The cursor in effect, for the Wayland backend to give the compositor.
+impl crate::wayland::CursorSource for KmsBackend {
+    fn cursor_key(&self) -> Option<(u32, u64)> {
+        let xid = self.effective_cursor_xid?;
+        Some((xid, self.cursor_records.get(&xid)?.version))
+    }
+
+    fn cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
+        yserver_core::backend::Backend::get_active_cursor_image(self)
     }
 }
 
