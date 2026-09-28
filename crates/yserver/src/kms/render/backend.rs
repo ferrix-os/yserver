@@ -586,6 +586,44 @@ struct SeedInferiorDraw {
     height: u32,
 }
 
+/// One leaf→backing copy of a redirect seed, from `src` in the leaf to
+/// `dst` in the backing, `size` big. A negative destination shifts the
+/// source and shrinks the rect; the high side is left to
+/// `render_composite`'s destination clamp.
+fn push_seed_draw(
+    out: &mut Vec<SeedInferiorDraw>,
+    leaf_id: crate::kms::render::store::DrawableId,
+    src: (i32, i32),
+    dst: (i32, i32),
+    size: (i32, i32),
+) {
+    let ((mut sx, mut sy), (mut dx, mut dy)) = (src, dst);
+    let (mut rw, mut rh) = (i64::from(size.0), i64::from(size.1));
+    if dx < 0 {
+        sx -= dx;
+        rw += i64::from(dx);
+        dx = 0;
+    }
+    if dy < 0 {
+        sy -= dy;
+        rh += i64::from(dy);
+        dy = 0;
+    }
+    if rw <= 0 || rh <= 0 {
+        return;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    out.push(SeedInferiorDraw {
+        leaf_id,
+        src_x: sx,
+        src_y: sy,
+        dst_x: dx,
+        dst_y: dy,
+        width: rw as u32,
+        height: rh as u32,
+    });
+}
+
 /// Monotonic device-qualified RANDR connector registry.
 ///
 /// Authoritative store for every connector yserver has ever seen:
