@@ -3582,3 +3582,16 @@ fn redirect_subwindows_for_server_backs_existing_children_once() {
     let kept = state.composite_redirects.subwindows_records(root);
     assert!(kept.len() == 1 && kept[0].owner == ClientId(CLIENT_ID));
 }
+
+#[test]
+fn exposed_by_grow_is_the_new_area_and_nothing_else() {
+    assert_eq!(
+        exposed_by_grow((178, 178), (982, 726)),
+        vec![(178, 0, 804, 726), (0, 178, 178, 548)]
+    );
+    assert_eq!(
+        exposed_by_grow((178, 178), (178, 300)),
+        vec![(0, 178, 178, 122)]
+    );
+    assert!(exposed_by_grow((485, 726), (178, 178)).is_empty());
+}
