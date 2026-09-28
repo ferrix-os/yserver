@@ -192,6 +192,10 @@ impl KmsBackend {
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported,
             export_holders: Default::default(),
+            #[cfg(feature = "wayland")]
+            wayland: None,
+            #[cfg(feature = "wayland")]
+            wayland_randr_ids: None,
         };
         let mut b = Self::assemble(core, platform, engine, scene, pstate, kms_outputs_active);
         // Validate every route already committed during platform bring-up,

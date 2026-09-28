@@ -577,7 +577,7 @@ impl KmsBackend {
         endpoints
     }
 
-    fn reserve_randr_provider_ids(&mut self) {
+    pub(in crate::kms::render::backend) fn reserve_randr_provider_ids(&mut self) {
         for endpoint in self.randr_provider_endpoints() {
             let _ = self.pstate.randr_id_alloc.provider_id_for(endpoint);
         }
@@ -750,6 +750,11 @@ impl KmsBackend {
         Vec<yserver_core::randr::RandrMode>,
     ) {
         use yserver_core::randr::{RandrMode, RandrOutput};
+
+        #[cfg(feature = "wayland")]
+        if self.pstate.wayland.is_some() {
+            return self.wayland_randr_outputs_and_modes();
+        }
 
         // Provider ids share the same XID source as outputs, CRTCs, and modes
         // even before providers are exposed on the wire. Reserve every

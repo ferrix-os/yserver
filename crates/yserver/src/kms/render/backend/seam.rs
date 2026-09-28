@@ -391,6 +391,12 @@ pub trait Platform: OutputSink + Sized + 'static {
         yserver_core::randr::RandrLimits::default()
     }
 
+    /// The Wayland compositor's connection is readable; `false` when it
+    /// closed. Only a platform that registers a `BackendFdKind::Wayland` fd
+    /// sees this.
+    fn on_wayland_ready(_b: &mut XBackend<Self>, _state: &mut ServerState) -> bool {
+        true
+    }
     fn poll_deferred_input(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
 
     fn start_device_config(

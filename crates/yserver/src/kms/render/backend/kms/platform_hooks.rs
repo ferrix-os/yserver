@@ -321,6 +321,10 @@ impl Platform for PlatformBackend {
     }
 
     fn before_block(b: &mut KmsBackend) {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = b.pstate.wayland.as_mut() {
+            link.flush();
+        }
         b.reclaim_retired_gpu_work();
         b.platform
             .emit_tearing_summary_if_due(b.pstate.tearing.is_on(), b.telemetry.avg_gpu_render_ns());
@@ -434,7 +438,13 @@ impl Platform for PlatformBackend {
     fn poll_fds(b: &KmsBackend) -> Vec<(std::os::fd::RawFd, BackendFdKind)> {
         // Direct mode only: DRM fd + present-completion epfd. libinput runs
         // on its own thread, not the core poll.
-        b.platform.poll_fds()
+        #[allow(unused_mut)]
+        let mut fds = b.platform.poll_fds();
+        #[cfg(feature = "wayland")]
+        if let Some(link) = b.pstate.wayland.as_ref() {
+            fds.push((link.fd(), BackendFdKind::Wayland));
+        }
+        fds
     }
 
     fn vt_switching_armed(b: &KmsBackend) -> bool {
@@ -536,6 +546,11 @@ impl Platform for PlatformBackend {
 
     fn set_logical_screen_size(b: &mut KmsBackend, w: u16, h: u16) -> io::Result<()> {
         KmsBackend::backend_randr_set_logical_screen_size(b, w, h)
+    }
+
+    #[cfg(feature = "wayland")]
+    fn on_wayland_ready(b: &mut KmsBackend, state: &mut ServerState) -> bool {
+        b.wayland_on_ready(state)
     }
 
     fn poll_deferred_input(b: &mut KmsBackend, state: &mut ServerState) {

@@ -408,6 +408,10 @@ impl<P: Platform> Backend for XBackend<P> {
         // to dispatch here.
     }
 
+    fn on_wayland_ready(&mut self, state: &mut ServerState) -> bool {
+        P::on_wayland_ready(self, state)
+    }
+
     fn poll_deferred_input(&mut self, state: &mut ServerState) {
         P::poll_deferred_input(self, state)
     }

@@ -7,6 +7,8 @@ mod readback;
 mod scanout;
 pub(in crate::kms::render::backend) mod session;
 pub(in crate::kms::render::backend) mod state;
+#[cfg(feature = "wayland")]
+mod wayland;
 
 #[cfg(test)]
 pub(super) use crtc_config::*;
