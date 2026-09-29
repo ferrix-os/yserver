@@ -103,7 +103,11 @@ use crate::core_loop::process_request::{
 };
 pub use focus_pointer::set_input_focus_for_server;
 pub(crate) use focus_pointer::*;
-pub use for_server::{close_window_for_server, configure_window_for_server};
+pub use for_server::{
+    change_property_for_server, close_window_for_server, configure_window_for_server,
+    convert_selection_for_server, selection_window_for_server, send_selection_notify_for_server,
+    set_selection_owner_for_server,
+};
 pub(crate) use grabs::*;
 pub use present_ext::*;
 pub(crate) use props::*;

@@ -5,9 +5,10 @@
 
 use std::io;
 
-use yserver_protocol::x11::{RequestHeader, ResourceId, SequenceNumber};
+use log::debug;
+use yserver_protocol::x11::{self, AtomId, RequestHeader, ResourceId, SequenceNumber};
 
-use crate::{backend::Backend, server::ServerState};
+use crate::{backend::Backend, resources::ROOT_WINDOW, server::ServerState};
 
 /// Resize a window for the server itself, as a window manager's
 /// `ConfigureWindow` would: the window, its backing and its children follow,
@@ -121,6 +122,183 @@ pub fn close_window_for_server(
         crate::resources::SERVER_OWNER,
         SequenceNumber(0),
         &window.0.to_le_bytes(),
+    )
+    .map(drop)
+}
+
+/// A window of the server's own that can own a selection and be sent one:
+/// an unmapped `InputOnly` child of the root, owned by `SERVER_OWNER`, at
+/// the first free id of the server's range. Made once; an existing one is
+/// given back, and one a server reset took is made again.
+///
+/// A rootless server's bridge to another display system's clipboard
+/// (yserver's Wayland backend) owns X selections with it on that system's
+/// behalf, and asks X clients for theirs with it, as Xwayland does with a
+/// window of its own. What the selection protocol sends it is queued in
+/// [`ServerState::server_selection_events`].
+pub fn selection_window_for_server(
+    state: &mut ServerState,
+    known: Option<ResourceId>,
+) -> ResourceId {
+    if let Some(window) = known
+        && state.resources.window_owner(window) == Some(crate::resources::SERVER_OWNER)
+    {
+        return window;
+    }
+    let mut id = 0x110;
+    while state.xid_occupied(id) {
+        id += 1;
+    }
+    let window = ResourceId(id);
+    state.resources.create_window(
+        crate::resources::SERVER_OWNER,
+        x11::CreateWindowRequest {
+            window,
+            parent: ROOT_WINDOW,
+            width: 1,
+            height: 1,
+            class: 2, // InputOnly
+            ..x11::CreateWindowRequest::default()
+        },
+    );
+    debug!("the server's selection window is 0x{id:x}");
+    window
+}
+
+/// Make the server's `window` the owner of `selection`, or give it up with
+/// `None`, as a client's `SetSelectionOwner` at `CurrentTime` would: the
+/// previous owner hears `SelectionClear`, and XFIXES subscribers are told.
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn set_selection_owner_for_server(
+    state: &mut ServerState,
+    selection: AtomId,
+    window: Option<ResourceId>,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&window.map_or(0, |window| window.0).to_le_bytes());
+    body.extend_from_slice(&selection.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    super::selection::handle_set_selection_owner(
+        state,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        &body,
+    )
+    .map(drop)
+}
+
+/// Ask for `selection` as `target`, to be put in `property` on the server's
+/// `requestor`, as a client's `ConvertSelection` at `CurrentTime` would.
+/// The answer is a [`crate::server::ServerSelectionEvent::Notify`].
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn convert_selection_for_server(
+    state: &mut ServerState,
+    requestor: ResourceId,
+    selection: AtomId,
+    target: AtomId,
+    property: AtomId,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(20);
+    for word in [requestor.0, selection.0, target.0, property.0, 0] {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    super::selection::handle_convert_selection(
+        state,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        &body,
+    )
+    .map(drop)
+}
+
+/// Replace `property` on `window` with `data` of `type` in `format` (8, 16
+/// or 32, `data` in this machine's order), as a client's `ChangeProperty`
+/// would: the window's watchers hear `PropertyNotify`. How the server
+/// answers a `SelectionRequest` it was sent.
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn change_property_for_server(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: ResourceId,
+    property: AtomId,
+    r#type: AtomId,
+    format: u8,
+    data: &[u8],
+) -> io::Result<()> {
+    let unit = usize::from(format / 8).max(1);
+    let length = u32::try_from(data.len() / unit).unwrap_or(u32::MAX);
+    let mut body = Vec::with_capacity(20 + data.len() + 3);
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&property.0.to_le_bytes());
+    body.extend_from_slice(&r#type.0.to_le_bytes());
+    body.extend_from_slice(&[format, 0, 0, 0]);
+    body.extend_from_slice(&length.to_le_bytes());
+    body.extend_from_slice(data);
+    while body.len() % 4 != 0 {
+        body.push(0);
+    }
+    let header = RequestHeader {
+        opcode: 18,
+        data: 0, // Replace
+        length_units: u32::try_from(body.len() / 4 + 1).unwrap_or(u32::MAX),
+    };
+    super::props::handle_change_property(
+        state,
+        backend,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        header,
+        &body,
+    )
+    .map(drop)
+}
+
+/// Tell `requestor`'s client the answer to its `ConvertSelection` is in
+/// `property` (`None` for a refusal), as a selection owner's `SendEvent`
+/// of a `SelectionNotify` would.
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn send_selection_notify_for_server(
+    state: &mut ServerState,
+    time: u32,
+    requestor: ResourceId,
+    selection: AtomId,
+    target: AtomId,
+    property: AtomId,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(40);
+    body.extend_from_slice(&requestor.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let mut event = [0u8; 32];
+    event[0] = 31; // SelectionNotify
+    event[4..8].copy_from_slice(&time.to_le_bytes());
+    event[8..12].copy_from_slice(&requestor.0.to_le_bytes());
+    event[12..16].copy_from_slice(&selection.0.to_le_bytes());
+    event[16..20].copy_from_slice(&target.0.to_le_bytes());
+    event[20..24].copy_from_slice(&property.0.to_le_bytes());
+    body.extend_from_slice(&event);
+    let header = RequestHeader {
+        opcode: 25,
+        data: 0,
+        length_units: 11,
+    };
+    super::selection::handle_send_event(
+        state,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        header,
+        &body,
     )
     .map(drop)
 }

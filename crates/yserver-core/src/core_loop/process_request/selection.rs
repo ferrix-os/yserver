@@ -309,6 +309,29 @@ pub(super) fn handle_convert_selection(
     let property = AtomId(u32::from_le_bytes([body[12], body[13], body[14], body[15]]));
     let time_val = u32::from_le_bytes([body[16], body[17], body[18], body[19]]);
 
+    // A selection the server's own window owns is answered by the backend
+    // that made it, which has no connection for the SelectionRequest.
+    if let Some(&(owner_window, _)) = state.selections.get(&selection)
+        && owner_window != ROOT_WINDOW
+        && state.resources.window_owner(owner_window) == Some(crate::resources::SERVER_OWNER)
+    {
+        state
+            .server_selection_events
+            .push(crate::server::ServerSelectionEvent::Request {
+                time: time_val,
+                owner: owner_window,
+                requestor,
+                selection,
+                target: target_atom,
+                property,
+            });
+        debug!(
+            "client {} #{} ConvertSelection -> the server's window 0x{:x}",
+            client_id.0, sequence.0, owner_window.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+
     if let Some((owner_window, owner_id)) = selection_owner_target_id(state, selection) {
         let _dropped = fanout_event_to_clients(state, &[owner_id], |buf, seq, order| {
             x11::encode_selection_request_event(
@@ -327,6 +350,18 @@ pub(super) fn handle_convert_selection(
             "client {} #{} ConvertSelection -> owner 0x{:x}",
             client_id.0, sequence.0, owner_window.0
         );
+    } else if requestor != ROOT_WINDOW
+        && state.resources.window_owner(requestor) == Some(crate::resources::SERVER_OWNER)
+    {
+        // No owner, and the server asked: its backend hears the refusal.
+        state
+            .server_selection_events
+            .push(crate::server::ServerSelectionEvent::Notify {
+                requestor,
+                selection,
+                target: target_atom,
+                property: AtomId(0),
+            });
     } else {
         // No owner — send SelectionNotify(None) to the requestor.
         let requestor_id = state
@@ -412,6 +447,39 @@ pub(super) fn handle_send_event(
             req.event_mask,
             25,
         );
+    }
+    // A SelectionNotify for a window of the server's own, the answer to a
+    // `convert_selection_for_server`: its backend takes it, as no client
+    // can.
+    if event_type == 31
+        && req.destination != ROOT_WINDOW
+        && state.resources.window_owner(req.destination) == Some(crate::resources::SERVER_OWNER)
+    {
+        let word = |at: usize| {
+            let bytes = [
+                req.event[at],
+                req.event[at + 1],
+                req.event[at + 2],
+                req.event[at + 3],
+            ];
+            match sender_byte_order {
+                ClientByteOrder::BigEndian => u32::from_be_bytes(bytes),
+                ClientByteOrder::LittleEndian => u32::from_le_bytes(bytes),
+            }
+        };
+        state
+            .server_selection_events
+            .push(crate::server::ServerSelectionEvent::Notify {
+                requestor: ResourceId(word(8)),
+                selection: AtomId(word(12)),
+                target: AtomId(word(16)),
+                property: AtomId(word(20)),
+            });
+        debug!(
+            "client {} #{} SendEvent SelectionNotify to the server's window 0x{:x}",
+            client_id.0, sequence.0, req.destination.0
+        );
+        return Ok(RequestOutcome::Handled);
     }
     let targets = match send_event_recipients(state, req.destination, req.event_mask, header.data) {
         Ok(targets) => targets,

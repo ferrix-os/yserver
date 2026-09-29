@@ -335,7 +335,17 @@ impl Platform for PlatformBackend {
     }
 
     fn next_wakeup(b: &KmsBackend) -> Option<std::time::Instant> {
-        KmsBackend::backend_scanout_next_wakeup(b)
+        let scanout = KmsBackend::backend_scanout_next_wakeup(b);
+        // A paste between X and the compositor moves a little each
+        // iteration, through pipes the loop does not poll.
+        #[cfg(feature = "wayland")]
+        if let Some(link) = b.pstate.wayland.as_ref()
+            && link.clipboard_busy()
+        {
+            let clipboard = std::time::Instant::now() + std::time::Duration::from_millis(5);
+            return Some(scanout.map_or(clipboard, |at| at.min(clipboard)));
+        }
+        scanout
     }
 
     fn maybe_composite(b: &mut KmsBackend) -> io::Result<()> {
