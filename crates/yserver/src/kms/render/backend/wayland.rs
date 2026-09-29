@@ -31,6 +31,7 @@ impl KmsBackend {
         link.sync(state, self);
         link.sync_cursor(self);
         let requests = link.take_requests();
+        link.sync_clipboard(state, self);
         self.wayland = Some(link);
         // What the compositor asked of the windows, which only the core,
         // with the state in hand, can carry out.

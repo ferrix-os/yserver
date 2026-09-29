@@ -1917,9 +1917,20 @@ impl KmsBackend {
         // no other activity nothing would wake us to release it.
         let retire_deadline =
             (self.store.pending_retire_count() > 0).then(|| now + PENDING_RETIRE_POLL_INTERVAL);
+        // A paste between X and the compositor moves a little each
+        // iteration, through pipes the loop does not poll.
+        #[cfg(feature = "wayland")]
+        let clipboard_deadline = self
+            .wayland
+            .as_ref()
+            .filter(|link| link.clipboard_busy())
+            .map(|_| now + std::time::Duration::from_millis(5));
+        #[cfg(not(feature = "wayland"))]
+        let clipboard_deadline = None;
         scene_deadline
             .into_iter()
             .chain(present_deadline)
+            .chain(clipboard_deadline)
             .chain(rescan_deadline)
             .chain(retire_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
