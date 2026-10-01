@@ -2023,15 +2023,13 @@ fn reconcile_writable_interest_tracks_outbound_state() {
     use yserver_protocol::x11::{ClientByteOrder, ClientId as Cid};
 
     let poll = Poll::new().unwrap();
-    // We just need a real fd registered with the poller.
+    // A client's writer fd is in the poller only while output waits:
+    // a new client's is not.
     let (mut peer, writer) = UnixStream::pair().unwrap();
     writer.set_nonblocking(true).unwrap();
     let writer_arc = Arc::new(Mutex::new(crate::transport::Transport::Unix(writer)));
     let raw = writer_arc.lock().unwrap().as_raw_fd();
     let token = client_token(Cid(7));
-    poll.registry()
-        .register(&mut SourceFd(&raw), token, Interest::READABLE)
-        .unwrap();
 
     let mut state = ServerState::new();
     state.clients.insert(
@@ -2145,6 +2143,10 @@ fn reconcile_writable_interest_tracks_outbound_state() {
     assert!(disc.is_empty());
     assert!(state.clients[&7].outbound.is_empty());
     assert!(!state.clients[&7].watching_writable);
+    // And out of the poller again: registering it anew succeeds.
+    poll.registry()
+        .register(&mut SourceFd(&raw), token, Interest::READABLE)
+        .expect("the drained writer was deregistered");
 
     drop(peer);
 }
