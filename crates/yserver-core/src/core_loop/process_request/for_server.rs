@@ -248,6 +248,34 @@ pub fn announce_window_manager_for_server(
     Ok(())
 }
 
+/// Whether the server itself is the window manager the root names
+/// (`announce_window_manager_for_server`) and lists `hint` in the root's
+/// `_NET_SUPPORTED`: whether a client's request of that kind is the
+/// server's to carry out.
+pub(super) fn server_manages(state: &ServerState, hint: AtomId) -> bool {
+    let root_word_list = |name: &str| -> Vec<u32> {
+        state
+            .atoms
+            .id_for(name)
+            .and_then(|atom| state.resources.window(ROOT_WINDOW)?.properties.get(&atom))
+            .map(|value| {
+                value
+                    .data
+                    .chunks_exact(4)
+                    .filter_map(|word| word.try_into().ok().map(u32::from_le_bytes))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let announced = root_word_list("_NET_SUPPORTING_WM_CHECK")
+        .first()
+        .is_some_and(|window| {
+            state.resources.window_owner(ResourceId(*window))
+                == Some(crate::resources::SERVER_OWNER)
+        });
+    announced && root_word_list("_NET_SUPPORTED").contains(&hint.0)
+}
+
 /// Make the server's `window` the owner of `selection`, or give it up with
 /// `None`, as a client's `SetSelectionOwner` at `CurrentTime` would: the
 /// previous owner hears `SelectionClear`, and XFIXES subscribers are told.

@@ -355,3 +355,67 @@ fn the_server_announces_itself_as_the_window_manager() {
         replaced.0
     );
 }
+
+/// A `_NET_WM_MOVERESIZE` a client sends the root is queued for the
+/// backend only while the server is the window manager and lists it.
+#[test]
+fn a_move_resize_is_the_servers_while_it_manages_and_lists_it() {
+    const CLIENT: u32 = 1;
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let _peer = install_client(&mut state, CLIENT);
+    let move_resize = state.atoms.intern("_NET_WM_MOVERESIZE", false);
+    let send = |state: &mut ServerState| {
+        let mut body = Vec::with_capacity(40);
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        // SubstructureRedirect | SubstructureNotify, as EWMH says.
+        body.extend_from_slice(&0x0018_0000u32.to_le_bytes());
+        let mut event = [0u8; 32];
+        event[0] = 33; // ClientMessage
+        event[1] = 32;
+        event[4..8].copy_from_slice(&0x0020_0001u32.to_le_bytes());
+        event[8..12].copy_from_slice(&move_resize.0.to_le_bytes());
+        event[12..16].copy_from_slice(&300u32.to_le_bytes()); // x_root
+        event[16..20].copy_from_slice(&200u32.to_le_bytes()); // y_root
+        event[20..24].copy_from_slice(&8u32.to_le_bytes()); // move
+        event[24..28].copy_from_slice(&1u32.to_le_bytes()); // button 1
+        body.extend_from_slice(&event);
+        let header = yserver_protocol::x11::RequestHeader {
+            opcode: 25,
+            data: 0,
+            length_units: 11,
+        };
+        handle_send_event(state, ClientId(CLIENT), SequenceNumber(1), header, &body)
+            .expect("SendEvent");
+    };
+
+    send(&mut state);
+    assert_eq!(state.server_wm_requests, [], "no window manager yet");
+
+    announce_window_manager_for_server(&mut state, &mut backend, "hyprix", &["_NET_WM_NAME"])
+        .expect("announce");
+    send(&mut state);
+    assert_eq!(state.server_wm_requests, [], "not listed");
+
+    let net_supported = state.atoms.intern("_NET_SUPPORTED", false);
+    let atom_type = state.atoms.intern("ATOM", false);
+    change_property_for_server(
+        &mut state,
+        &mut backend,
+        ROOT_WINDOW,
+        net_supported,
+        atom_type,
+        32,
+        &move_resize.0.to_le_bytes(),
+    )
+    .expect("listed");
+    send(&mut state);
+    assert_eq!(
+        state.server_wm_requests,
+        [crate::server::ServerWmRequest::MoveResize {
+            window: ResourceId(0x0020_0001),
+            direction: 8,
+            button: 1,
+        }]
+    );
+}
