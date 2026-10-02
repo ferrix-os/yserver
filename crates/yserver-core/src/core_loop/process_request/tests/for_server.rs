@@ -396,3 +396,86 @@ fn a_selection_the_server_owns_is_asked_of_and_answered_by_the_server() {
         }]
     );
 }
+
+/// The server announces itself as the window manager the EWMH way: the
+/// root and a window of its own name that window, which carries the
+/// name; once there, it is not made again, and a window manager
+/// client's announcement is left alone, while a stale one is replaced.
+#[test]
+fn the_server_announces_itself_as_the_window_manager() {
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let word = |state: &ServerState, window: ResourceId, name: &str| {
+        let atom = state.atoms.id_for(name).expect("interned");
+        let data = &state.resources.window(window).expect("window").properties[&atom].data;
+        u32::from_le_bytes(data[0..4].try_into().expect("a word"))
+    };
+
+    announce_window_manager_for_server(&mut state, &mut backend, "hyprix", &["_NET_WM_NAME"])
+        .expect("announce");
+    let wm = ResourceId(word(&state, ROOT_WINDOW, "_NET_SUPPORTING_WM_CHECK"));
+    assert_eq!(word(&state, wm, "_NET_SUPPORTING_WM_CHECK"), wm.0);
+    assert_eq!(
+        state.resources.window_owner(wm),
+        Some(crate::resources::SERVER_OWNER)
+    );
+    let window = state.resources.window(wm).expect("window");
+    assert_eq!(window.class, crate::resources::WindowClass::InputOnly);
+    assert_eq!(window.map_state, MapState::Unmapped);
+    let name = state.atoms.id_for("_NET_WM_NAME").expect("interned");
+    assert_eq!(window.properties[&name].data, b"hyprix");
+    assert_eq!(
+        word(&state, ROOT_WINDOW, "_NET_SUPPORTED"),
+        name.0,
+        "the root lists the hints honoured"
+    );
+
+    announce_window_manager_for_server(&mut state, &mut backend, "hyprix", &[]).expect("again");
+    assert_eq!(
+        word(&state, ROOT_WINDOW, "_NET_SUPPORTING_WM_CHECK"),
+        wm.0,
+        "made once"
+    );
+
+    // A window manager client's own window is left alone.
+    let client = server_helper_window(&mut state);
+    let check = state
+        .atoms
+        .id_for("_NET_SUPPORTING_WM_CHECK")
+        .expect("interned");
+    let window_type = state.atoms.intern("WINDOW", false);
+    change_property_for_server(
+        &mut state,
+        &mut backend,
+        ROOT_WINDOW,
+        check,
+        window_type,
+        32,
+        &client.0.to_le_bytes(),
+    )
+    .expect("a client's announcement");
+    announce_window_manager_for_server(&mut state, &mut backend, "hyprix", &[])
+        .expect("left alone");
+    assert_eq!(
+        word(&state, ROOT_WINDOW, "_NET_SUPPORTING_WM_CHECK"),
+        client.0
+    );
+
+    // One naming a window that is gone is the server's to replace.
+    change_property_for_server(
+        &mut state,
+        &mut backend,
+        ROOT_WINDOW,
+        check,
+        window_type,
+        32,
+        &0x0bad_0000u32.to_le_bytes(),
+    )
+    .expect("a stale announcement");
+    announce_window_manager_for_server(&mut state, &mut backend, "hyprix", &[]).expect("replaced");
+    let replaced = ResourceId(word(&state, ROOT_WINDOW, "_NET_SUPPORTING_WM_CHECK"));
+    assert_eq!(
+        word(&state, replaced, "_NET_SUPPORTING_WM_CHECK"),
+        replaced.0
+    );
+}
