@@ -175,6 +175,7 @@ impl RenderEngine {
                 vk,
                 submitted: VecDeque::new(),
                 staging_pool: StagingPool::default(),
+                readback_spare: None,
                 upload_arena: crate::kms::render::upload_arena::UploadArena::default(),
                 upload_copy_align,
                 picture_paint: HashMap::new(),
@@ -253,8 +254,18 @@ impl RenderEngine {
             }
             // staging drops at end of scope → destroys Vk handles. (Frame-
             // builder put_image staging lives in the frame pin-set, not here;
-            // it's pooled at the pending_frames retire below.)
-            drop(op.staging.take());
+            // it's pooled at the pending_frames retire below.) A readback
+            // buffer is kept as the spare instead, the larger of the two.
+            if let Some(arc) = op.staging.take()
+                && let Ok(buf) = Arc::try_unwrap(arc)
+                && buf.for_readback
+                && inner
+                    .readback_spare
+                    .as_ref()
+                    .is_none_or(|spare| spare.size <= buf.size)
+            {
+                inner.readback_spare = Some(buf);
+            }
             // Phase B.2 Mechanism 3: release retired BatchResources
             // attached via adopt_retired_resource_for_gpu_retirement
             // case (b). BatchResource::release is explicit (no Drop);

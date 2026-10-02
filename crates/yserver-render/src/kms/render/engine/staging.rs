@@ -160,6 +160,7 @@ impl StagingBuffer {
             size,
             coherent,
             from_pool: false,
+            for_readback: readback,
         })
     }
 
