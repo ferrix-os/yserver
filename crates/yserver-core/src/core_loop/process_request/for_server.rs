@@ -145,6 +145,15 @@ pub fn selection_window_for_server(
     {
         return window;
     }
+    let window = server_input_only_window(state);
+    debug!("the server's selection window is 0x{:x}", window.0);
+    window
+}
+
+/// A new unmapped `InputOnly` child of the root, owned by `SERVER_OWNER`,
+/// at the first free id of the server's range: nothing to draw, nothing a
+/// client's disconnect takes.
+fn server_input_only_window(state: &mut ServerState) -> ResourceId {
     let mut id = 0x110;
     while state.xid_occupied(id) {
         id += 1;
@@ -161,8 +170,82 @@ pub fn selection_window_for_server(
             ..x11::CreateWindowRequest::default()
         },
     );
-    debug!("the server's selection window is 0x{id:x}");
     window
+}
+
+/// Say that the server itself manages the windows, under the name `name`,
+/// as an EWMH window manager does (EWMH 1.5, `_NET_SUPPORTING_WM_CHECK`):
+/// a window of the server's own (an unmapped `InputOnly` child of the root)
+/// whose `_NET_SUPPORTING_WM_CHECK` names itself and whose `_NET_WM_NAME`
+/// is `name`, the root's `_NET_SUPPORTING_WM_CHECK` naming that window, and
+/// the root's `_NET_SUPPORTED` listing `supported`, the hints honoured.
+///
+/// A rootless server whose top-level windows another display system shows
+/// (yserver's Wayland backend, where the compositor manages each) has no X
+/// window manager, so without this clients find none: Steam reports the
+/// window manager as `<Unknown>`. Xwayland's compositors say it with a
+/// window of theirs the same way.
+///
+/// Cheap when the root names a window that exists, so it may be called on
+/// every loop iteration, which also puts it back after a server reset. A
+/// window manager client that announced itself first is left alone.
+///
+/// # Errors
+///
+/// As `ChangeProperty`'s handler.
+pub fn announce_window_manager_for_server(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    name: &str,
+    supported: &[&str],
+) -> io::Result<()> {
+    let check = state.atoms.intern("_NET_SUPPORTING_WM_CHECK", false);
+    let announced = state
+        .resources
+        .window(ROOT_WINDOW)
+        .and_then(|root| root.properties.get(&check))
+        .and_then(|value| value.data.get(0..4))
+        .and_then(|data| data.try_into().ok())
+        .map(|data| ResourceId(u32::from_le_bytes(data)));
+    if announced.is_some_and(|window| state.resources.window(window).is_some()) {
+        return Ok(());
+    }
+    let window = server_input_only_window(state);
+    let net_wm_name = state.atoms.intern("_NET_WM_NAME", false);
+    let utf8 = state.atoms.intern("UTF8_STRING", false);
+    let net_supported = state.atoms.intern("_NET_SUPPORTED", false);
+    let window_type = state.atoms.intern("WINDOW", false);
+    let atom_type = state.atoms.intern("ATOM", false);
+    let supported: Vec<u8> = supported
+        .iter()
+        .flat_map(|hint| state.atoms.intern(hint, false).0.to_le_bytes())
+        .collect();
+    let id = window.0.to_le_bytes();
+    change_property_for_server(state, backend, window, check, window_type, 32, &id)?;
+    change_property_for_server(
+        state,
+        backend,
+        window,
+        net_wm_name,
+        utf8,
+        8,
+        name.as_bytes(),
+    )?;
+    change_property_for_server(
+        state,
+        backend,
+        ROOT_WINDOW,
+        net_supported,
+        atom_type,
+        32,
+        &supported,
+    )?;
+    change_property_for_server(state, backend, ROOT_WINDOW, check, window_type, 32, &id)?;
+    debug!(
+        "the server is the window manager {name:?}, window 0x{:x}",
+        window.0
+    );
+    Ok(())
 }
 
 /// Make the server's `window` the owner of `selection`, or give it up with
