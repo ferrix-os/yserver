@@ -465,6 +465,40 @@ pub(super) fn handle_send_event(
         );
         return Ok(RequestOutcome::Handled);
     }
+
+    // A window manager request for the server itself, when it says it is
+    // the window manager. It is still delivered below: a client selecting
+    // on the root sees it as it would under any window manager.
+    if event_type == 33 && req.event[1] == 32 && req.destination == ROOT_WINDOW {
+        let word = |at: usize| {
+            let bytes = [
+                req.event[at],
+                req.event[at + 1],
+                req.event[at + 2],
+                req.event[at + 3],
+            ];
+            match sender_byte_order {
+                ClientByteOrder::BigEndian => u32::from_be_bytes(bytes),
+                ClientByteOrder::LittleEndian => u32::from_le_bytes(bytes),
+            }
+        };
+        let message_type = AtomId(word(8));
+        if state.atoms.name(message_type) == Some("_NET_WM_MOVERESIZE")
+            && server_manages(state, message_type)
+        {
+            let request = crate::server::ServerWmRequest::MoveResize {
+                window: ResourceId(word(4)),
+                direction: word(20),
+                button: word(24),
+            };
+            debug!(
+                "client {} #{} SendEvent {request:?} to the server as window manager",
+                client_id.0, sequence.0
+            );
+            state.server_wm_requests.push(request);
+        }
+    }
+
     let targets = match send_event_recipients(state, req.destination, req.event_mask, header.data) {
         Ok(targets) => targets,
         Err((code, value)) => return emit_x11_error(state, client_id, sequence, code, value, 25),
