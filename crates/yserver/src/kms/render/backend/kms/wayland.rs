@@ -45,6 +45,14 @@ impl KmsBackend {
             .wayland_randr_ids
             .get_or_insert_with(|| (alloc.fresh(), alloc.fresh(), alloc.fresh()));
         let (width, height) = self.platform.fb_dimensions();
+        // The compositor's screen's rate, not a fixed 60: Chromium on X
+        // paces its frames by the RandR mode's.
+        let vrefresh = self
+            .pstate
+            .wayland
+            .as_ref()
+            .and_then(crate::wayland::WaylandLink::screen_refresh_hz)
+            .unwrap_or(60);
         let outputs = vec![yserver_core::randr::RandrOutput {
             name: "WAYLAND-1".to_string(),
             output_id,
@@ -55,7 +63,7 @@ impl KmsBackend {
             y: 0,
             width,
             height,
-            vrefresh: 60,
+            vrefresh,
             timing: None,
             // No EDID: `RandrState::output_info` synthesises 96 DPI.
             mm_width: 0,
