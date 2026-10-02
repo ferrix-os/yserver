@@ -494,6 +494,9 @@ pub(crate) struct StagingBuffer {
     /// per-upload vkCreateBuffer/vkAllocateMemory churn, which is costly on
     /// NVIDIA.
     from_pool: bool,
+    /// Made by [`StagingBuffer::new_for_readback`]: kept as the engine's
+    /// spare readback buffer at retire rather than destroyed.
+    for_readback: bool,
 }
 
 impl std::fmt::Debug for StagingBuffer {
@@ -626,6 +629,10 @@ struct RenderEngineInner {
     /// `put_image`, to avoid per-upload vkCreateBuffer/vkAllocateMemory churn
     /// (costly on NVIDIA). See [`StagingPool`].
     staging_pool: StagingPool,
+    /// The last `get_image` readback buffer, retired and free: a window
+    /// read back every frame (the Wayland backend's) would otherwise make
+    /// and destroy one the size of the window each time.
+    readback_spare: Option<StagingBuffer>,
     /// #177: idle blocks of the per-frame upload arena that glyph-run /
     /// ImageText instance data, trapezoid/triangle vertices and glyph-atlas
     /// upload staging are bump-allocated from. A frame's blocks come back
