@@ -2350,6 +2350,35 @@ pub(crate) struct PlatformBackend {
     force_next_submit_failure: bool,
 }
 
+/// The render node of a server with no KMS card: the one
+/// `YSERVER_DRI_RENDER_NODE` names, else the one the selected Vulkan device
+/// advertises through `VK_EXT_physical_device_drm`. `None` (DRI3 stays off)
+/// for a software Vulkan device, or one that names no render node.
+fn headless_render_node(vk: &VkContext) -> Option<crate::kms::render_node::OpenedRenderNode> {
+    if vk.device_type == ash::vk::PhysicalDeviceType::CPU {
+        return None;
+    }
+    let advertised = vk.selected_drm_identity.and_then(|identity| identity.render);
+    match crate::kms::render_node::open_headless(advertised) {
+        Ok(Some(node)) => {
+            log::info!(
+                "DRI3 render node ready for the card-less server: path={:?} rdev={}",
+                node.path(),
+                node.key(),
+            );
+            Some(node)
+        }
+        Ok(None) => {
+            log::warn!("DRI3: the Vulkan device names no render node; DRI3 is off");
+            None
+        }
+        Err(error) => {
+            log::warn!("DRI3: render node unavailable for the card-less server: {error}");
+            None
+        }
+    }
+}
+
 fn build_render_device_inventory(
     vk: &Arc<VkContext>,
     render_node: Option<crate::kms::render_node::OpenedRenderNode>,
@@ -2719,6 +2748,14 @@ impl PlatformBackend {
             vk.driver_id,
             vk.device_type,
         );
+        // A server that owns no card -- the rootless Wayland backend --
+        // still has a GPU when Vulkan found one: DRI3 needs its render
+        // node, which no KMS card led to.
+        let render_node = match render_node {
+            Some(node) => Some(node),
+            None if devices.is_empty() => headless_render_node(&vk),
+            None => None,
+        };
         let (render_devices, selected_render_device) =
             build_render_device_inventory(&vk, render_node)?;
         let selected_renderer = render_devices
