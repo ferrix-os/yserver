@@ -84,6 +84,32 @@ pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<OpenedRenderNode> {
     Ok(OpenedRenderNode { fd, node: render })
 }
 
+/// Open the render node of a server that owns no card: the one
+/// `YSERVER_DRI_RENDER_NODE` names, else `/dev/dri/renderD<minor>` for the
+/// render node the renderer advertises, checked against that identity.
+pub(crate) fn open_headless(
+    advertised: Option<DrmDeviceKey>,
+) -> io::Result<Option<OpenedRenderNode>> {
+    let node = if let Some(path) = explicit_render_node_path() {
+        drm::render_node_from_path(path)?
+    } else if let Some(key) = advertised {
+        let node =
+            drm::render_node_from_path(PathBuf::from(format!("/dev/dri/renderD{}", key.minor)))?;
+        if node.key != key {
+            return Err(io::Error::other(format!(
+                "{} is {}, not the renderer's render node {key}",
+                node.path.display(),
+                node.key,
+            )));
+        }
+        node
+    } else {
+        return Ok(None);
+    };
+    let fd = drm::open_node(&node)?;
+    Ok(Some(OpenedRenderNode { fd, node }))
+}
+
 fn explicit_render_node_path() -> Option<PathBuf> {
     let path = PathBuf::from(env::var_os(RENDER_NODE_ENV)?);
     (!path.as_os_str().is_empty()).then_some(path)
