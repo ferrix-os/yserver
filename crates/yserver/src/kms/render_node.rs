@@ -86,7 +86,8 @@ pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<OpenedRenderNode> {
 
 /// Open the render node of a server that owns no card: the one
 /// `YSERVER_DRI_RENDER_NODE` names, else `/dev/dri/renderD<minor>` for the
-/// render node the renderer advertises, checked against that identity.
+/// render node the renderer advertises, checked against that identity, or
+/// the machine's only render node when the renderer advertises none.
 pub(crate) fn open_headless(
     advertised: Option<DrmDeviceKey>,
 ) -> io::Result<Option<OpenedRenderNode>> {
@@ -104,7 +105,13 @@ pub(crate) fn open_headless(
         }
         node
     } else {
-        return Ok(None);
+        // A renderer that names no node (its driver lacks
+        // VK_EXT_physical_device_drm): the machine's only render node, if
+        // it has exactly one, is the GPU that renderer drives.
+        match drm::render_nodes()?.as_slice() {
+            [only] => only.clone(),
+            _ => return Ok(None),
+        }
     };
     let fd = drm::open_node(&node)?;
     Ok(Some(OpenedRenderNode { fd, node }))
