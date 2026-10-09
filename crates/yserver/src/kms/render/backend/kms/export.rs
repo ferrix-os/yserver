@@ -575,6 +575,15 @@ impl KmsBackend {
             .filter(|(_, planes)| *planes == 1)
             .map(|(m, _)| *m)
             .collect();
+        // A server that owns no card hands every window to a compositor,
+        // as a buffer that compositor must be able to take: LINEAR is the
+        // one every importer takes, and the only one some drivers' render
+        // nodes export at all (Ferrix's nvrm gives a dma-buf only for a
+        // pitch-linear buffer, in system memory). A client then allocates
+        // LINEAR rather than a tiled buffer it cannot share.
+        if self.platform.devices.is_empty() {
+            return (vec![0], vec![0]);
+        }
         (window, screen)
     }
 
