@@ -9436,6 +9436,18 @@ impl KmsBackend {
             PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
         };
 
+        // A rootless server on a compositor has no device of its own. Its
+        // Vulkan renderer would be listed as a provider that owns no CRTC
+        // and no output, beside no provider that does, and a client that
+        // looks for the screen's outputs under its providers finds none:
+        // Wine's X driver then has no monitor, and its server divides by a
+        // DPI of zero. Xwayland lists no provider, and clients fall back
+        // to the screen's resources.
+        #[cfg(feature = "wayland")]
+        if self.wayland.is_some() {
+            return Vec::new();
+        }
+
         self.reserve_randr_provider_ids();
         let selected_endpoint = self.selected_render_provider_endpoint();
         let distinct_renderer = match selected_endpoint {
