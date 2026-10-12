@@ -1,0 +1,50 @@
+name: rootless suite
+# ywayland, the rootless Wayland backend, on a headless sway on the runner
+# itself: tools/rootless-suite.sh. No VM and no GPU -- sway draws with
+# pixman, ywayland renders on lavapipe -- so every scenario runs on every
+# PR and push.
+on:
+  workflow_dispatch:
+  workflow_call:
+  pull_request:
+  push:
+    branches: [master]
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  rootless:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        # The build's own (as the CI workflow's), then the compositor and
+        # the clients the scenarios run: sway and swaymsg, grim for the
+        # screen, x11-utils for xwininfo, python3-xlib for the probe
+        # windows.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libgbm-dev libfontconfig-dev xfonts-base mesa-vulkan-drivers \
+            sway grim x11-utils python3-xlib
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Build ywayland
+        run: cargo build --locked --features wayland --bin ywayland
+      - name: Versions
+        run: |
+          sway --version
+          dpkg-query -W mesa-vulkan-drivers
+      - name: rootless suite
+        run: tools/rootless-suite.sh --binary target/debug/ywayland --out target/rootless-suite/ci
+      - name: Drop sockets before upload
+        if: always()
+        run: find target/rootless-suite -type s -delete 2>/dev/null || true
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: rootless-suite
+          path: target/rootless-suite/**
+          if-no-files-found: warn

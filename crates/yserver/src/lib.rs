@@ -8,8 +8,11 @@ pub mod kms;
 pub mod launch;
 pub(crate) mod platform;
 pub mod present;
+pub mod rootless;
 pub mod version;
 mod vt;
+#[cfg(feature = "wayland")]
+pub mod wayland;
 
 use std::{fs, io, path::PathBuf, thread};
 
@@ -269,7 +272,79 @@ fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
 /// which is a log you can keep.
 pub const RESOURCE_TELEMETRY_TARGET: &str = "yserver::resources";
 
+/// Where the server shows its windows: which backend a binary runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Display {
+    /// On the DRM cards it owns (`yserver`).
+    Kms,
+    /// As windows of the Wayland compositor `WAYLAND_DISPLAY` names, a
+    /// client of it (`ywayland`).
+    #[cfg(feature = "wayland")]
+    Wayland,
+}
+
+/// The backend `run` drives: the renderer itself, or the renderer wrapped
+/// for a host window system.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one, on `run_on`'s stack for the server's life"
+)]
+enum ServerBackend {
+    Kms(crate::kms::render::KmsBackend),
+    #[cfg(feature = "wayland")]
+    Wayland(
+        crate::rootless::RootlessBackend<
+            crate::wayland::WaylandHost<crate::wayland::toolkit::ToolkitTransport>,
+        >,
+    ),
+}
+
+impl ServerBackend {
+    /// The renderer, for what only `KmsBackend` itself does.
+    fn kms(&mut self) -> &mut crate::kms::render::KmsBackend {
+        match self {
+            Self::Kms(kms) => kms,
+            #[cfg(feature = "wayland")]
+            Self::Wayland(rootless) => rootless.inner_mut(),
+        }
+    }
+
+    /// The backend, as the core drives it.
+    fn as_dyn(&mut self) -> &mut dyn Backend {
+        match self {
+            Self::Kms(kms) => kms,
+            #[cfg(feature = "wayland")]
+            Self::Wayland(rootless) => rootless,
+        }
+    }
+}
+
+/// Run the X server on the DRM cards it owns: `yserver`.
+///
+/// # Errors
+///
+/// As [`run`]'s startup and core loop.
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
+    run_on(opts, Display::Kms)
+}
+
+/// Run the X server as a client of the Wayland compositor
+/// `WAYLAND_DISPLAY` names, each top-level X window a window of the
+/// compositor's: `ywayland` (`crate::wayland`).
+///
+/// # Errors
+///
+/// As [`run`], and no compositor to connect to.
+#[cfg(feature = "wayland")]
+pub fn run_wayland(opts: launch::LaunchOptions) -> io::Result<()> {
+    run_on(opts, Display::Wayland)
+}
+
+fn run_on(opts: launch::LaunchOptions, display_kind: Display) -> io::Result<()> {
+    // A client of a host window system owns neither the console nor a
+    // card: the host has both, and the renderer runs headless. Its input
+    // comes from the host, not from evdev.
+    let rootless = display_kind != Display::Kms;
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
 
@@ -667,10 +742,18 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // inside an X client. Skipped silently when not on a Linux VC (pty
     // under SSH or a graphical terminal emulator).
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
+    let console_guard = if rootless {
+        None
+    } else {
+        crate::kms::console::ConsoleGuard::acquire(opts.vt)?
+    };
     #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
     let console_guard: Option<()> = None;
-    let device_paths = crate::platform::drm::resolve_default_kms_devices()?;
+    let device_paths = if rootless {
+        Vec::new()
+    } else {
+        crate::platform::drm::resolve_default_kms_devices()?
+    };
     if device_paths.is_empty() {
         log::info!("yserver: no DRM devices to open; starting zero-card headless");
     } else {
@@ -687,13 +770,21 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Always Direct (self-managed DRM master + VT_PROCESS): open DRM +
     // libinput directly, arming VT_PROCESS when a controlling console is
     // present.
-    let mut backend = build_kms_backend(&device_paths, console_guard, opts.layout.clone())?;
+    let kms = build_kms_backend(&device_paths, console_guard, opts.layout.clone())?;
+    let mut backend = match display_kind {
+        Display::Kms => ServerBackend::Kms(kms),
+        #[cfg(feature = "wayland")]
+        Display::Wayland => ServerBackend::Wayland(crate::rootless::RootlessBackend::new(
+            kms,
+            crate::wayland::WaylandHost::new(crate::wayland::toolkit::ToolkitTransport::connect()?),
+        )?),
+    };
     // One snapshot of everything `ServerState` needs from the live
     // backend — screen extent, RandR outputs/modes/providers, backend
     // capabilities. The server-reset boundary re-derives a generation
     // through this same call, so a second session is seeded exactly the
     // way the first one was.
-    let topology = BackendTopology::from_backend(&mut backend);
+    let topology = BackendTopology::from_backend(backend.as_dyn());
     let (fb_w, fb_h) = (topology.width, topology.height);
     log::info!("yserver: scanout {fb_w}x{fb_h}");
     let mut state = topology.into_server_state();
@@ -708,7 +799,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // the same amount — wedging menu close paths that ungrab with
     // saved press timestamps.
     crate::clock::init(state.start_instant);
-    install_backend_root_bindings(&mut state, &backend);
+    install_backend_root_bindings(&mut state, backend.as_dyn());
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir).map_err(|e| {
@@ -759,7 +850,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
 
     // Initial composite+flip so the screen has a known frame before any
     // client connects.
-    if let Err(e) = backend.composite_and_flip(&state) {
+    if let Err(e) = backend.kms().composite_and_flip(&state) {
         log::warn!("yserver: initial composite_and_flip failed: {e}");
     }
 
@@ -768,7 +859,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     let (poll, sender, rx) = core_loop::channel()?;
     // Backend-originated failures (GPU/device loss, unrecoverable VT resume
     // errors) use the same core-channel shutdown path as input hotkeys.
-    backend.set_input_sender(sender.clone_handle());
+    backend.as_dyn().set_input_sender(sender.clone_handle());
 
     // Spawn the dedicated libinput sender thread. After `take_input_ctx`
     // the backend's `poll_fds()` no longer returns the libinput fd, so
@@ -776,15 +867,18 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Take the libinput context (created in `platform_init`). `None` means
     // `SendContext::new()` failed — libinput unavailable, or every input
     // device was permission-denied — so we refuse to start below.
-    let direct_input_ctx = backend.take_input_ctx();
+    // A rootless server's input comes from its host's seat: the devices
+    // libinput opened belong to the host, and are let go at once.
+    let direct_input_ctx = backend.kms().take_input_ctx().filter(|_| !rootless);
+    let no_input_allowed = rootless || std::env::var_os("YSERVER_ALLOW_NO_INPUT").is_some();
     match input_startup_action(direct_input_ctx.is_some()) {
         InputStartup::AbortNoInput => {
             // libinput could not be set up at all (`SendContext::new()` failed
             // → `take_input_ctx()` is None). Refuse to start: a session with no
             // input is dead on arrival and cannot even be zapped.
-            if std::env::var_os("YSERVER_ALLOW_NO_INPUT").is_some() {
+            if no_input_allowed {
                 log::warn!(
-                    "yserver: no input devices; YSERVER_ALLOW_NO_INPUT set, starting anyway"
+                    "yserver: no input devices; starting anyway (rootless, or YSERVER_ALLOW_NO_INPUT)"
                 );
             } else {
                 ensure_input_devices_opened(0)?;
@@ -815,7 +909,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             // satisfy the guard, or we come up with a dead, un-zappable
             // session. The context tracks capability at add time.
             let opened = input_ctx.usable_input_device_count();
-            if opened > 0 || std::env::var_os("YSERVER_ALLOW_NO_INPUT").is_none() {
+            if opened > 0 || !no_input_allowed {
                 ensure_input_devices_opened(opened)?;
             }
             log::info!("yserver: {opened} usable input device(s) opened at startup");
@@ -827,12 +921,16 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             // input thread owns the libinput devices; LED transitions
             // cross via this eventfd-backed mask.
             let led_relay = std::sync::Arc::new(crate::input::LedRelay::new()?);
-            backend.set_input_thread_control(std::sync::Arc::clone(&input_control));
-            backend.set_led_relay(std::sync::Arc::clone(&led_relay));
+            backend
+                .kms()
+                .set_input_thread_control(std::sync::Arc::clone(&input_control));
+            backend
+                .kms()
+                .set_led_relay(std::sync::Arc::clone(&led_relay));
             log::info!("yserver: Direct mode — spawning libinput sender thread");
             // Seed the input thread's cursor at the primary-output centre so it
             // agrees with the core's startup position (Xorg-style warp to display 0).
-            let (init_cx, init_cy) = backend.initial_pointer_position();
+            let (init_cx, init_cy) = backend.kms().initial_pointer_position();
             thread::Builder::new()
                 .name("yserver-libinput".into())
                 .spawn(move || {
@@ -984,7 +1082,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         rx,
         sender,
         &mut state,
-        &mut backend,
+        backend.as_dyn(),
         listeners,
         &alloc,
         auth,
@@ -996,13 +1094,13 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     }
 
     log::info!("yserver: shutting down, disabling output");
-    if let Err(e) = backend.disable_output() {
+    if let Err(e) = backend.kms().disable_output() {
         log::warn!("yserver: disable_output failed: {e}");
     }
     // Stage 5 Task 6.1: fan out any PRESENT completions deferred past
     // shutdown drain — events must reach clients before we tear down
     // the socket.
-    for entry in backend.take_shutdown_present_events() {
+    for entry in backend.kms().take_shutdown_present_events() {
         yserver_core::core_loop::process_request::fire_present_completion_events(
             &mut state, &entry,
         );
@@ -1012,14 +1110,14 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // them (core paces at vblank). At teardown there is no more vblank clock,
     // so flush every still-retained wake to release the buffers clients are
     // blocked on. This replaces the release the old shutdown/force path did.
-    backend.signal_all_retained_present_wakes();
+    backend.kms().signal_all_retained_present_wakes();
     // Symmetric flush for the *pre*-copy half: any Present still parked in
     // the unified pending-present store (source wait not yet signalled)
     // would otherwise leak its entry pin and strand the client's idle
     // fence / release syncobj forever once the socket goes away.
     yserver_core::core_loop::process_request::shutdown_drain_present_pending_exec(
         &mut state,
-        &mut backend,
+        backend.as_dyn(),
     );
 
     // 2026-05-31: destroy every drawable's Vk handles before
@@ -1029,7 +1127,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // `&PlatformBackend` for pool-return + DRI3-import handling
     // and Drop has no access to disjoint sibling fields), so
     // bridge them explicitly here.
-    backend.shutdown_destroy_drawables();
+    backend.kms().shutdown_destroy_drawables();
 
     let _ = fs::remove_file(&socket_path);
     log::info!("yserver: master released, exiting");

@@ -167,6 +167,52 @@ pub(in crate::kms::render::backend) fn restore_primary_output_after_rebuild(
 }
 
 impl KmsBackend {
+    /// A rootless backend's RandR topology: one connected output standing
+    /// for the host's screen (`set_host_output`), covering the virtual
+    /// screen. The X screen's size is derived from the outputs, so without
+    /// it the root would stay 0x0.
+    fn host_randr_outputs_and_modes(
+        &mut self,
+    ) -> (
+        Vec<yserver_core::randr::RandrOutput>,
+        Vec<yserver_core::randr::RandrMode>,
+    ) {
+        self.reserve_randr_provider_ids();
+        let alloc = &mut self.randr_id_alloc;
+        let (output_id, crtc_id, mode_id) = *self
+            .host_randr_ids
+            .get_or_insert_with(|| (alloc.fresh(), alloc.fresh(), alloc.fresh()));
+        let (width, height) = self.platform.fb_dimensions();
+        let host = self.host_output.as_ref();
+        // The host screen's rate, not a fixed 60: Chromium on X paces its
+        // frames by the RandR mode's.
+        let vrefresh = host.map_or(60, |host| host.refresh_hz);
+        let name = host.map_or_else(|| "HOST-1".to_owned(), |host| host.name.clone());
+        let outputs = vec![yserver_core::randr::RandrOutput {
+            name,
+            output_id,
+            crtc_id,
+            mode_id,
+            connected: true,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            vrefresh,
+            timing: None,
+            // No EDID: `RandrState::output_info` synthesises 96 DPI.
+            mm_width: 0,
+            mm_height: 0,
+            mode_ids: vec![mode_id],
+            num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: yserver_core::randr::RR_ROTATE_0,
+        }];
+        let modes = yserver_core::randr::RandrState::from_outputs(0, outputs.clone()).mode_table;
+        (outputs, modes)
+    }
+
     /// Virtual-screen extent — mirrors `KmsBackend::fb_dimensions`.
     /// Called by `lib.rs` during the pre-`Box<dyn Backend>` setup
     /// (capability advertisement, `ServerState::with_randr_outputs`).
@@ -607,6 +653,17 @@ impl KmsBackend {
             PROVIDER_CAPABILITY_SINK_OUTPUT, PROVIDER_CAPABILITY_SOURCE_OUTPUT,
         };
 
+        // A rootless server on a host display has no device of its own. Its
+        // Vulkan renderer would be listed as a provider that owns no CRTC
+        // and no output, beside no provider that does, and a client that
+        // looks for the screen's outputs under its providers finds none:
+        // Wine's X driver then has no monitor, and its server divides by a
+        // DPI of zero. Xwayland lists no provider, and clients fall back
+        // to the screen's resources.
+        if self.host_output.is_some() {
+            return Vec::new();
+        }
+
         self.reserve_randr_provider_ids();
         let selected_endpoint = self.selected_render_provider_endpoint();
         let distinct_renderer = match selected_endpoint {
@@ -727,6 +784,10 @@ impl KmsBackend {
         Vec<yserver_core::randr::RandrMode>,
     ) {
         use yserver_core::randr::{RandrMode, RandrOutput};
+
+        if self.host_output.is_some() {
+            return self.host_randr_outputs_and_modes();
+        }
 
         // Provider ids share the same XID source as outputs, CRTCs, and modes
         // even before providers are exposed on the wire. Reserve every
@@ -1010,11 +1071,23 @@ impl KmsBackend {
         );
         // CRTC transforms are client-owned, like the logical size below.
         state.randr.restore_crtc_transforms(prev_transforms);
-        let associations = self
+        let mut associations: Vec<(u32, u32)> = self
             .randr_id_alloc
             .entries()
             .filter(|(_, entry)| entry.crtc_associated)
-            .map(|(_, entry)| (entry.ids.output_id, entry.ids.crtc_id));
+            .map(|(_, entry)| (entry.ids.output_id, entry.ids.crtc_id))
+            .collect();
+        // A rootless backend's synthetic output is not among
+        // `randr_id_alloc`'s entries, so without this its CRTC association
+        // is dropped on the first rebuild: GetOutputInfo then reports crtc 0
+        // (the output looks disabled), and a client that builds its display
+        // list from RandR finds no screen (Chromium, so Steam's webhelper:
+        // "CreateOutputWindow: Could not find display info").
+        if self.host_output.is_some()
+            && let Some((output_id, crtc_id, _)) = self.host_randr_ids
+        {
+            associations.push((output_id, crtc_id));
+        }
         state.randr.set_output_crtc_associations(associations);
         state.randr.set_providers(providers);
         // Carry forward the client-set logical size (from_outputs reseeds

@@ -15,15 +15,20 @@
 //! - `trait_impl`: `impl Backend for KmsBackend`, one file until the trait
 //!   bodies move to per-subsystem delegators.
 //! - `for_tests`: `*_for_tests` entry points for the acceptance tests.
+//! - `rootless`: what a rootless backend (`crate::rootless`) needs of the
+//!   renderer: each top-level's image, the cursor in effect, and a RandR
+//!   output standing for the host's screen.
 //! - `tests`, `crtc_transform_tests`: unit tests.
 
 mod for_tests;
 mod kms;
 mod portable;
+mod rootless;
 mod trait_impl;
 
 use kms::*;
 pub(super) use portable::*;
+pub use rootless::HostOutput;
 
 #[cfg(test)]
 mod tests;
@@ -1482,6 +1487,15 @@ pub struct KmsBackend {
 
     /// Last `export holders` report, for change detection.
     export_holders: crate::kms::render::export_holders::ExportHoldersReporter,
+
+    /// The host screen a rootless backend shows the server's windows on
+    /// (`crate::rootless`), which the one RandR output stands for in place
+    /// of the card's connectors; `None` on a DRM card.
+    host_output: Option<rootless::HostOutput>,
+
+    /// That output's (output, CRTC, mode) ids, allocated on first
+    /// projection so they stay the same afterwards.
+    host_randr_ids: Option<(u32, u32, u32)>,
 }
 
 /// GLX-TFP export state for one drawable. See `exported_dmabufs`.

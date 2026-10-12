@@ -18,7 +18,15 @@ path = "src/lib.rs"
 name = "yserver"
 path = "src/bin/yserver.rs"
 
+# The rootless Wayland backend: an X server that is a client of a Wayland
+# compositor, each top-level X window a window of the compositor's.
+[[bin]]
+name = "ywayland"
+path = "src/bin/ywayland.rs"
+required-features = ["wayland"]
+
 [dependencies]
+compositor-toolkit = { git = "https://github.com/SetZero/ferrix", rev = "ec831a5f19396c097b1bceb103026ea03ddfaa2b", optional = true }
 ash.workspace = true
 crossbeam-channel.workspace = true
 drm.workspace = true
@@ -50,6 +58,11 @@ udev.workspace = true
 default = []
 tcp-transport = []
 xdmcp = ["tcp-transport", "yserver-core/xdmcp"]
+# The rootless Wayland backend, the `ywayland` binary. Off by default: it
+# speaks Wayland through Ferrix's client runtime (`compositor-toolkit`, std
+# and libc only, MIT), a git dependency a build that does not ask for it
+# never fetches. `src/wayland/transport.rs` is all it asks of that library.
+wayland = ["dep:compositor-toolkit"]
 
 [lints]
 workspace = true

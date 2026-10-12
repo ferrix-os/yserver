@@ -599,6 +599,8 @@ impl KmsBackend {
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
             export_holders: Default::default(),
+            host_output: None,
+            host_randr_ids: None,
         };
         let live: Vec<_> = backend
             .platform

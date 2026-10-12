@@ -81,6 +81,11 @@ pub enum BackendFdKind {
     /// fences which gate a copied scanout path. Readiness means work rendered
     /// on the source GPU may advance to the sink-GPU copy.
     ScanoutRenderCompletion,
+    /// The connection to the host window system a hosted backend shows its
+    /// windows through (a rootless server's Wayland compositor, say);
+    /// readiness drives [`Backend::on_host_display_ready`] on the core
+    /// thread.
+    HostDisplay,
 }
 
 /// Result of arming the implicit producer fence for a `PresentPixmap`
@@ -882,6 +887,17 @@ pub trait Backend {
     /// Dispatch libinput inline. Default: no-op; direct KMS uses a dedicated
     /// input thread and never registers this fd.
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
+
+    /// The host window system's connection
+    /// ([`BackendFdKind::HostDisplay`]) is readable: read its events and act
+    /// on them with `state` in hand -- input from the host's seat goes to
+    /// [`crate::core_loop::handle_host_input`] from here. Returns `false`
+    /// when the host closed the connection, which ends the server as the
+    /// loss of its only display would. Default: `true`; only a hosted
+    /// backend registers the fd.
+    fn on_host_display_ready(&mut self, _state: &mut ServerState) -> bool {
+        true
+    }
 
     /// Called once per core-loop iteration (with `state`) so a backend can
     /// service time-based backend work that isn't tied to an fd readiness

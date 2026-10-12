@@ -1,0 +1,8 @@
+# Scenarios run by tools/rootless-suite.sh against ywayland on a headless
+# sway, one per line: name, then key=value.
+#   script=  run with bash in the scenario's artifact directory; must write
+#            RESULT (pass | fail: <reason> | skip: <reason>)
+#   needs=   commands it runs, comma-separated; a missing one skips it
+#   timeout= seconds (default 120)
+# Paths are relative to this file.
+toplevel   script=toplevel.sh   needs=python3,xwininfo,grim              timeout=120

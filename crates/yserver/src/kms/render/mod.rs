@@ -38,4 +38,4 @@ pub(crate) mod telemetry;
 pub(crate) mod transform_intermediate;
 pub(crate) mod upload_arena;
 
-pub use backend::KmsBackend;
+pub use backend::{HostOutput, KmsBackend};
