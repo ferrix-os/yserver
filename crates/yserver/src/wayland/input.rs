@@ -364,11 +364,12 @@ impl WaylandLink {
             &pixels,
         ) {
             Ok(()) => log::debug!(
-                "wayland: the cursor is {}x{} at ({}, {})",
+                "wayland: the cursor is {}x{} at ({}, {}), cursor 0x{:x}",
                 image.width,
                 image.height,
                 image.hot_x,
-                image.hot_y
+                image.hot_y,
+                key.map_or(0, |(xid, _)| xid)
             ),
             Err(error) => {
                 log::warn!("wayland: the cursor: {error}");
