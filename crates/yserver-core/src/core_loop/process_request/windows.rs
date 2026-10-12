@@ -2292,6 +2292,7 @@ pub(super) fn handle_map_window(
             send_map_exposures(state, backend, origin, &[window]);
         }
     }
+    set_wm_state_for_server(state, backend, window, WM_STATE_NORMAL)?;
     // Audit #11: Xorg's `miPaintWindow` fires damage on the window's
     // extent when the window becomes viewable (the server-background
     // fill is itself a paint, and DAMAGE hooks every paint).
@@ -2551,6 +2552,7 @@ pub(super) fn handle_unmap_window(
             release_core_grabs_for_unviewable(state, backend);
             // Then WindowsRestructured (`dix/window.c:2871`).
             backend.windows_restructured(state);
+            set_wm_state_for_server(state, backend, window, WM_STATE_WITHDRAWN)?;
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
