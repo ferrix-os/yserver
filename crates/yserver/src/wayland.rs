@@ -21,8 +21,10 @@
 //!   idle one not at all. The compositor's size for a window becomes a
 //!   `ConfigureWindow` of it, its close `WM_DELETE_WINDOW`, and a press on
 //!   a window's own title bar (`_NET_WM_MOVERESIZE`) the compositor's drag.
+//! * **The clipboard** follows X's `CLIPBOARD` and `PRIMARY` both ways
+//!   ([`clipboard`]).
 
-use std::{io, os::fd::RawFd};
+use std::{io, os::fd::RawFd, time::Instant};
 
 use yserver_core::{
     rootless::{Topology, carry_out, move_resize_edges},
@@ -35,6 +37,7 @@ use crate::{
     rootless::{Renderer, RootlessHost},
 };
 
+mod clipboard;
 pub mod toolkit;
 pub mod transport;
 
@@ -58,16 +61,26 @@ const WM_SUPPORTED: &[&str] = &[
 pub struct WaylandHost<T> {
     transport: T,
     topology: Topology<Surface>,
+    /// X's selections and the compositor's clipboard ([`clipboard`]);
+    /// `None` when the compositor has no `ext_data_control_v1`.
+    clipboard: Option<clipboard::Clipboard>,
     wm_name: String,
 }
 
 impl<T: Transport> WaylandHost<T> {
     /// The host on `transport`, connected.
-    pub fn new(transport: T) -> Self {
+    pub fn new(mut transport: T) -> Self {
+        let clipboard = transport
+            .bind_data_control()
+            .then(clipboard::Clipboard::default);
+        if clipboard.is_none() {
+            log::warn!("wayland: the compositor has no ext_data_control_v1; no clipboard");
+        }
         let wm_name = std::env::var("YSERVER_WM_NAME").unwrap_or_else(|_| WM_NAME.to_owned());
         Self {
             transport,
             topology: Topology::new(),
+            clipboard,
             wm_name,
         }
     }
@@ -81,6 +94,11 @@ impl<T: Transport> WaylandHost<T> {
                 height,
             } => self.topology.configured(surface, width, height),
             Event::Close(surface) => self.topology.close_requested(surface),
+            event @ (Event::Selection { .. } | Event::Send { .. } | Event::Cancelled(_)) => {
+                if let Some(clipboard) = self.clipboard.as_mut() {
+                    clipboard.event(&mut self.transport, event);
+                }
+            }
         }
     }
 }
@@ -148,6 +166,9 @@ impl<T: Transport> RootlessHost for WaylandHost<T> {
             self.transport.drag(surface, edges);
         }
         let requests = self.topology.sync(state, &mut self.transport, renderer);
+        if let Some(clipboard) = self.clipboard.as_mut() {
+            clipboard.sync(&mut self.transport, state, renderer);
+        }
         // What the compositor asked of the windows, which only the core,
         // with the state in hand, can carry out.
         carry_out(state, renderer, requests);
@@ -161,5 +182,14 @@ impl<T: Transport> RootlessHost for WaylandHost<T> {
         if let Err(error) = self.transport.flush() {
             log::warn!("wayland: flush: {error}");
         }
+    }
+
+    fn next_wakeup(&self) -> Option<Instant> {
+        // A paste between X and the compositor moves a little each
+        // iteration, through pipes the loop does not poll.
+        self.clipboard
+            .as_ref()
+            .filter(|clipboard| clipboard.busy())
+            .map(|_| Instant::now() + std::time::Duration::from_millis(5))
     }
 }

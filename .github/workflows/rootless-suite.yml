@@ -13,6 +13,8 @@ env:
   CARGO_TERM_COLOR: always
 jobs:
   rootless:
+    # sway 1.10 or later (wlroots 0.19) for ext-data-control, which the
+    # clipboard bridge speaks: 26.04 has 1.11, 24.04 only 1.9.
     runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
@@ -20,12 +22,12 @@ jobs:
       - name: Install packages
         # The build's own (as the CI workflow's), then the compositor and
         # the clients the scenarios run: sway and swaymsg, grim for the
-        # screen, x11-utils for xwininfo, python3-xlib for the probe
-        # windows.
+        # screen, wl-clipboard and xclip for both sides of the clipboard,
+        # x11-utils for xwininfo, python3-xlib for the probe windows.
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libgbm-dev libfontconfig-dev xfonts-base mesa-vulkan-drivers \
-            sway grim x11-utils python3-xlib
+            sway grim wl-clipboard xclip x11-utils python3-xlib
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: Cache cargo
@@ -35,7 +37,7 @@ jobs:
       - name: Versions
         run: |
           sway --version
-          dpkg-query -W mesa-vulkan-drivers
+          dpkg-query -W mesa-vulkan-drivers wl-clipboard xclip
       - name: rootless suite
         run: tools/rootless-suite.sh --binary target/debug/ywayland --out target/rootless-suite/ci
       - name: Drop sockets before upload

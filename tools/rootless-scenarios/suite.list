@@ -6,3 +6,4 @@
 #   timeout= seconds (default 120)
 # Paths are relative to this file.
 toplevel   script=toplevel.sh   needs=python3,xwininfo,grim              timeout=120
+clipboard  script=clipboard.sh  needs=xclip,wl-copy,wl-paste             timeout=120

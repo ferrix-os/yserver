@@ -2,16 +2,37 @@
 //! `libc` only, no libwayland. Its socket is polled by the core loop, and
 //! each readiness is one non-blocking [`Client::dispatch`].
 
-use std::{io, os::fd::RawFd, time::Duration};
+use std::{
+    io,
+    os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd},
+    time::Duration,
+};
 
-use compositor_toolkit::{Client, SurfaceId, ToplevelOptions};
+use compositor_toolkit::{
+    Client, ObjectId, SurfaceId, ToplevelOptions, Value,
+    protocol::ext_data_control::{
+        self as control, ext_data_control_device_v1 as device,
+        ext_data_control_manager_v1 as manager, ext_data_control_offer_v1 as offer,
+        ext_data_control_source_v1 as source,
+    },
+};
 use yserver_core::rootless::{Damage, HostWindows, SizeLimits, ToplevelSpec};
 
-use super::transport::{Event, Screen, Surface, Transport};
+use super::transport::{Event, Offer, Screen, Selection, Source, Surface, Transport};
 
 /// The toolkit's connection.
 pub struct ToolkitTransport {
     client: Client,
+    /// `ext_data_control_v1`, once bound.
+    data: Option<DataControl>,
+}
+
+/// The data-control objects, and the offers the compositor made with the
+/// types each said it has.
+struct DataControl {
+    manager: ObjectId,
+    device: ObjectId,
+    offers: Vec<(ObjectId, Vec<String>)>,
 }
 
 impl ToolkitTransport {
@@ -26,7 +47,7 @@ impl ToolkitTransport {
         let client = Client::connect().map_err(|error| {
             io::Error::new(io::ErrorKind::NotConnected, format!("wayland: {error}"))
         })?;
-        Ok(Self { client })
+        Ok(Self { client, data: None })
     }
 
     fn translate(&mut self, events: Vec<compositor_toolkit::Event>) -> Vec<Event> {
@@ -51,11 +72,92 @@ impl ToolkitTransport {
                 height,
             },
             Tk::CloseRequested(id) => Event::Close(surface(id)),
+            Tk::Object {
+                object,
+                interface,
+                opcode,
+                args,
+            } => return self.data_event(object, interface, opcode, args),
             other => {
                 log::debug!("wayland: {other:?}");
                 return None;
             }
         })
+    }
+
+    /// An event of a data-control object.
+    fn data_event(
+        &mut self,
+        object: ObjectId,
+        interface: &str,
+        opcode: u16,
+        args: Vec<Value>,
+    ) -> Option<Event> {
+        let data = self.data.as_mut()?;
+        if object == data.device {
+            let which = match opcode {
+                device::event::DATA_OFFER => {
+                    if let Some(made) = args.first().and_then(Value::as_object) {
+                        data.offers.push((made, Vec::new()));
+                    }
+                    return None;
+                }
+                device::event::SELECTION => Selection::Clipboard,
+                device::event::PRIMARY_SELECTION => Selection::Primary,
+                device::event::FINISHED => {
+                    log::warn!("wayland: the compositor ended the clipboard's device");
+                    return None;
+                }
+                _ => return None,
+            };
+            let named = args
+                .first()
+                .and_then(Value::as_object)
+                .filter(|named| !named.is_null());
+            let types = named
+                .and_then(|named| data.offers.iter().find(|(made, _)| *made == named))
+                .map(|(_, types)| types.clone())
+                .unwrap_or_default();
+            return Some(Event::Selection {
+                which,
+                offer: named.map(|named| Offer(named.0)),
+                types,
+            });
+        }
+        if let Some((_, types)) = data.offers.iter_mut().find(|(made, _)| *made == object) {
+            if opcode == offer::event::OFFER
+                && let Some(mime) = args.first().and_then(Value::as_str)
+            {
+                types.push(mime.to_owned());
+            }
+            return None;
+        }
+        if interface != control::EXT_DATA_CONTROL_SOURCE_V1.name {
+            return None;
+        }
+        match opcode {
+            source::event::SEND => {
+                let mime = args
+                    .first()
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let Some(Value::Fd(fd)) = args.get(1) else {
+                    return None;
+                };
+                // SAFETY: the toolkit hands each descriptor an event carried
+                // to the program, which owns it from then on; nothing else
+                // closes it.
+                let fd = unsafe { OwnedFd::from_raw_fd(*fd) };
+                Some(Event::Send {
+                    source: Source(object.0),
+                    mime,
+                    fd,
+                })
+            }
+            source::event::CANCELLED => Some(Event::Cancelled(Source(object.0))),
+            _ => None,
+        }
     }
 
     fn other(error: compositor_toolkit::Error) -> io::Error {
@@ -176,5 +278,109 @@ impl Transport for ToolkitTransport {
 
     fn drag(&mut self, surface: Surface, edges: u32) {
         self.client.drag_window(SurfaceId(surface.0), edges);
+    }
+
+    fn bind_data_control(&mut self) -> bool {
+        let client = &mut self.client;
+        let bound = (|| {
+            let seat = client.seat()?;
+            let (manager, _) = client
+                .bind(&control::EXT_DATA_CONTROL_MANAGER_V1, 1, None)
+                .ok()?;
+            let device = client.new_object(&control::EXT_DATA_CONTROL_DEVICE_V1, 1);
+            client
+                .request(
+                    manager,
+                    manager::request::GET_DATA_DEVICE,
+                    &[Value::NewId(device), Value::Object(seat)],
+                )
+                .ok()?;
+            // An offer's types follow the event that makes it in the same
+            // read.
+            client.adopt_new_ids(
+                device,
+                device::event::DATA_OFFER,
+                &control::EXT_DATA_CONTROL_OFFER_V1,
+                1,
+            );
+            Some(DataControl {
+                manager,
+                device,
+                offers: Vec::new(),
+            })
+        })();
+        self.data = bound;
+        self.data.is_some()
+    }
+
+    fn create_source(&mut self, types: &[&str]) -> io::Result<Source> {
+        let manager = self
+            .data
+            .as_ref()
+            .map(|data| data.manager)
+            .ok_or_else(|| io::Error::other("no ext_data_control_v1"))?;
+        let made = self
+            .client
+            .new_object(&control::EXT_DATA_CONTROL_SOURCE_V1, 1);
+        self.client
+            .request(
+                manager,
+                manager::request::CREATE_DATA_SOURCE,
+                &[Value::NewId(made)],
+            )
+            .map_err(Self::other)?;
+        for mime in types {
+            self.client
+                .request(
+                    made,
+                    source::request::OFFER,
+                    &[Value::Str(Some((*mime).to_owned()))],
+                )
+                .map_err(Self::other)?;
+        }
+        Ok(Source(made.0))
+    }
+
+    fn destroy_source(&mut self, held: Source) {
+        let _ = self
+            .client
+            .request(ObjectId(held.0), source::request::DESTROY, &[]);
+    }
+
+    fn set_selection(&mut self, which: Selection, held: Option<Source>) {
+        let Some(device) = self.data.as_ref().map(|data| data.device) else {
+            return;
+        };
+        let opcode = match which {
+            Selection::Clipboard => device::request::SET_SELECTION,
+            Selection::Primary => device::request::SET_PRIMARY_SELECTION,
+        };
+        let _ = self.client.request(
+            device,
+            opcode,
+            &[Value::Object(
+                held.map_or(ObjectId::NULL, |held| ObjectId(held.0)),
+            )],
+        );
+    }
+
+    fn receive(&mut self, held: Offer, mime: &str, fd: BorrowedFd<'_>) -> io::Result<()> {
+        self.client
+            .request(
+                ObjectId(held.0),
+                offer::request::RECEIVE,
+                &[Value::Str(Some(mime.to_owned())), Value::Fd(fd.as_raw_fd())],
+            )
+            .and_then(|()| self.client.flush())
+            .map_err(Self::other)
+    }
+
+    fn release_offer(&mut self, held: Offer) {
+        let _ = self
+            .client
+            .request(ObjectId(held.0), offer::request::DESTROY, &[]);
+        if let Some(data) = self.data.as_mut() {
+            data.offers.retain(|(made, _)| made.0 != held.0);
+        }
     }
 }

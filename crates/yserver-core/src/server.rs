@@ -1032,6 +1032,41 @@ pub struct PresentWindowMsc {
     pub last_raw_msc: u64,
 }
 
+/// A selection event for a window the server owns
+/// ([`ServerState::server_selection_events`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServerSelectionEvent {
+    /// A client's `ConvertSelection` of a selection a server window owns:
+    /// the `SelectionRequest` the owner would be sent.
+    Request {
+        /// The request's time, or 0 for `CurrentTime`.
+        time: u32,
+        /// The server's window that owns the selection.
+        owner: ResourceId,
+        /// The client's window the answer goes to.
+        requestor: ResourceId,
+        /// The selection.
+        selection: AtomId,
+        /// The type asked for.
+        target: AtomId,
+        /// Where on `requestor` to put it; `None` from an obsolete client,
+        /// which means `target`.
+        property: AtomId,
+    },
+    /// The `SelectionNotify` a selection's owner sent a server window that
+    /// asked for it, or the server itself sent when nothing owned it.
+    Notify {
+        /// The server's window that asked.
+        requestor: ResourceId,
+        /// The selection.
+        selection: AtomId,
+        /// The type asked for.
+        target: AtomId,
+        /// Where the answer is on `requestor`; `None` when there is none.
+        property: AtomId,
+    },
+}
+
 /// A window manager request a client sent the root, which a server that
 /// is itself the window manager carries out ([`ServerState::server_wm_requests`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1095,6 +1130,15 @@ pub struct ServerState {
     /// `XFixesSelectionNotify` events (Xorg `xfixes/select.c:89` reads
     /// `selection->lastTimeChanged`).
     pub selections: HashMap<AtomId, (ResourceId, u32)>,
+    /// What the server's own selection windows were sent, for the backend
+    /// that owns them to answer: a rootless server's bridge between X
+    /// selections and another display system's clipboard (yserver's
+    /// `ywayland`). A client has no connection to answer through, so
+    /// the requests a `ConvertSelection` would send the owner, and the
+    /// `SelectionNotify` a `SendEvent` would send the requestor, are queued
+    /// here for the backend to take (`core_loop::process_request`'s
+    /// `convert_selection_for_server` and its siblings).
+    pub server_selection_events: Vec<ServerSelectionEvent>,
     /// Window manager requests clients sent the root while the server says
     /// it is the window manager and lists the request in `_NET_SUPPORTED`
     /// (`core_loop::process_request`'s `announce_window_manager_for_server`),
@@ -1779,6 +1823,7 @@ impl ServerState {
             xkb_clients: HashMap::new(),
             xkb_interests: HashMap::new(),
             selections: HashMap::new(),
+            server_selection_events: Vec::new(),
             server_wm_requests: Vec::new(),
             pointer_root: (0, 0),
             active_pointer_grab: None,

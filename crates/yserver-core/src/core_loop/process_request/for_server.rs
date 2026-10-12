@@ -183,6 +183,30 @@ pub fn close_window_for_server(
     .map(drop)
 }
 
+/// A window of the server's own that can own a selection and be sent one:
+/// an unmapped `InputOnly` child of the root, owned by `SERVER_OWNER`, at
+/// the first free id of the server's range. Made once; an existing one is
+/// given back, and one a server reset took is made again.
+///
+/// A rootless server's bridge to another display system's clipboard
+/// (`crate::rootless`, yserver's `ywayland`) owns X selections with it on that system's
+/// behalf, and asks X clients for theirs with it, as Xwayland does with a
+/// window of its own. What the selection protocol sends it is queued in
+/// [`ServerState::server_selection_events`].
+pub fn selection_window_for_server(
+    state: &mut ServerState,
+    known: Option<ResourceId>,
+) -> ResourceId {
+    if let Some(window) = known
+        && state.resources.window_owner(window) == Some(crate::resources::SERVER_OWNER)
+    {
+        return window;
+    }
+    let window = server_input_only_window(state);
+    debug!("the server's selection window is 0x{:x}", window.0);
+    window
+}
+
 /// A new unmapped `InputOnly` child of the root, owned by `SERVER_OWNER`,
 /// at the first free id of the server's range: nothing to draw, nothing a
 /// client's disconnect takes.
@@ -361,9 +385,62 @@ pub(super) fn set_wm_state_for_server(
     change_property_for_server(state, backend, window, property, property, 32, &data)
 }
 
+/// Make the server's `window` the owner of `selection`, or give it up with
+/// `None`, as a client's `SetSelectionOwner` at `CurrentTime` would: the
+/// previous owner hears `SelectionClear`, and XFIXES subscribers are told.
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn set_selection_owner_for_server(
+    state: &mut ServerState,
+    selection: AtomId,
+    window: Option<ResourceId>,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&window.map_or(0, |window| window.0).to_le_bytes());
+    body.extend_from_slice(&selection.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    handle_set_selection_owner(
+        state,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        &body,
+    )
+    .map(drop)
+}
+
+/// Ask for `selection` as `target`, to be put in `property` on the server's
+/// `requestor`, as a client's `ConvertSelection` at `CurrentTime` would.
+/// The answer is a [`crate::server::ServerSelectionEvent::Notify`].
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn convert_selection_for_server(
+    state: &mut ServerState,
+    requestor: ResourceId,
+    selection: AtomId,
+    target: AtomId,
+    property: AtomId,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(20);
+    for word in [requestor.0, selection.0, target.0, property.0, 0] {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    handle_convert_selection(
+        state,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        &body,
+    )
+    .map(drop)
+}
+
 /// Replace `property` on `window` with `data` of `type` in `format` (8, 16
 /// or 32, `data` in this machine's order), as a client's `ChangeProperty`
-/// would: the window's watchers hear `PropertyNotify`.
+/// would: the window's watchers hear `PropertyNotify`. How the server
+/// answers a `SelectionRequest` it was sent.
 ///
 /// # Errors
 ///
@@ -397,6 +474,47 @@ pub fn change_property_for_server(
     handle_change_property(
         state,
         backend,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        header,
+        &body,
+    )
+    .map(drop)
+}
+
+/// Tell `requestor`'s client the answer to its `ConvertSelection` is in
+/// `property` (`None` for a refusal), as a selection owner's `SendEvent`
+/// of a `SelectionNotify` would.
+///
+/// # Errors
+///
+/// As the request's handler.
+pub fn send_selection_notify_for_server(
+    state: &mut ServerState,
+    time: u32,
+    requestor: ResourceId,
+    selection: AtomId,
+    target: AtomId,
+    property: AtomId,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(40);
+    body.extend_from_slice(&requestor.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let mut event = [0u8; 32];
+    event[0] = 31; // SelectionNotify
+    event[4..8].copy_from_slice(&time.to_le_bytes());
+    event[8..12].copy_from_slice(&requestor.0.to_le_bytes());
+    event[12..16].copy_from_slice(&selection.0.to_le_bytes());
+    event[16..20].copy_from_slice(&target.0.to_le_bytes());
+    event[20..24].copy_from_slice(&property.0.to_le_bytes());
+    body.extend_from_slice(&event);
+    let header = RequestHeader {
+        opcode: 25,
+        data: 0,
+        length_units: 11,
+    };
+    handle_send_event(
+        state,
         crate::resources::SERVER_OWNER,
         SequenceNumber(0),
         header,

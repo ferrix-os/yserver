@@ -12,8 +12,9 @@
 #   tools/rootless-suite.sh --binary target/debug/ywayland
 #   tools/rootless-suite.sh --out target/rootless-suite/ci
 #
-# Needs sway, swaymsg, grim, x11-utils (xwininfo), python3 with
-# python3-xlib, and Mesa's lavapipe. A scenario passes only if it wrote
+# Needs sway (1.10 or later, for ext-data-control), swaymsg, grim,
+# wl-clipboard, xclip, x11-utils (xwininfo), python3 with python3-xlib,
+# and Mesa's lavapipe. A scenario passes only if it wrote
 # RESULT "pass" and ywayland was still alive at the end; a scenario whose
 # needs= names a command that is not installed is a skip, not a pass.
 set -euo pipefail
