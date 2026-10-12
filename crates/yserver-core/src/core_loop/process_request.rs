@@ -1402,13 +1402,65 @@ fn server_manages(state: &ServerState, hint: AtomId) -> bool {
             })
             .unwrap_or_default()
     };
-    let announced = root_word_list("_NET_SUPPORTING_WM_CHECK")
-        .first()
-        .is_some_and(|window| {
-            state.resources.window_owner(ResourceId(*window))
+    server_is_window_manager(state) && root_word_list("_NET_SUPPORTED").contains(&hint.0)
+}
+
+/// Whether the window the root's `_NET_SUPPORTING_WM_CHECK` names is the
+/// server's own (`announce_window_manager_for_server`): whether the server
+/// stands in for the window manager.
+fn server_is_window_manager(state: &ServerState) -> bool {
+    state
+        .atoms
+        .id_for("_NET_SUPPORTING_WM_CHECK")
+        .and_then(|atom| state.resources.window(ROOT_WINDOW)?.properties.get(&atom))
+        .and_then(|value| value.data.get(0..4))
+        .and_then(|data| <[u8; 4]>::try_from(data).ok())
+        .is_some_and(|data| {
+            state
+                .resources
+                .window_owner(ResourceId(u32::from_le_bytes(data)))
                 == Some(crate::resources::SERVER_OWNER)
-        });
-    announced && root_word_list("_NET_SUPPORTED").contains(&hint.0)
+        })
+}
+
+/// ICCCM 4.1.3.1's `WithdrawnState` and `NormalState`, as `WM_STATE` says
+/// them.
+const WM_STATE_WITHDRAWN: u32 = 0;
+const WM_STATE_NORMAL: u32 = 1;
+
+/// Set `WM_STATE` on a top-level `window` its client just mapped
+/// ([`WM_STATE_NORMAL`]) or unmapped ([`WM_STATE_WITHDRAWN`]), as a window
+/// manager does (ICCCM 4.1.3.1 and 4.1.4), when the server stands in for
+/// one ([`server_is_window_manager`]).
+///
+/// A client that finds a window manager may wait for `WM_STATE` to say its
+/// window changed state. Wine's X driver does: until the `PropertyNotify`
+/// of `WM_STATE` comes, with a serial no older than its `MapWindow`'s, it
+/// holds every later change of the window's state and ignores every size
+/// the window is given. With nothing setting it, Wine's notepad kept the
+/// size it asked for and not the size the compositor gave its window.
+/// Xwayland's compositors set it from their X window managers. Called
+/// within the client's request, the notify carries that request's serial.
+fn set_wm_state_for_server(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: ResourceId,
+    wm_state: u32,
+) -> io::Result<()> {
+    let top_level = window != ROOT_WINDOW
+        && state
+            .resources
+            .window(window)
+            .is_some_and(|w| w.parent == ROOT_WINDOW && !w.override_redirect);
+    if !top_level || !server_is_window_manager(state) {
+        return Ok(());
+    }
+    let property = state.atoms.intern("WM_STATE", false);
+    // The state, then the icon window: none.
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&wm_state.to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes());
+    change_property_for_server(state, backend, window, property, property, 32, &data)
 }
 
 /// Make the server's `window` the owner of `selection`, or give it up with
@@ -28009,6 +28061,7 @@ fn handle_map_window(
             let _dropped = emit_expose_subtree_to_state(state, window);
         }
     }
+    set_wm_state_for_server(state, backend, window, WM_STATE_NORMAL)?;
     // Audit #11: Xorg's `miPaintWindow` fires damage on the window's
     // extent when the window becomes viewable (the server-background
     // fill is itself a paint, and DAMAGE hooks every paint).
@@ -28260,6 +28313,7 @@ fn handle_unmap_window(
             release_core_grabs_for_unviewable(state, backend);
             // Then WindowsRestructured (`dix/window.c:2871`).
             backend.windows_restructured(state);
+            set_wm_state_for_server(state, backend, window, WM_STATE_WITHDRAWN)?;
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
@@ -59374,6 +59428,98 @@ mod tests {
         configure_window_for_server(&mut state, &mut backend, window, 0, 480).expect("configure");
         let size = state.resources.window(window).map(|w| (w.width, w.height));
         assert_eq!(size, Some((640, 480)));
+    }
+
+    /// While the server stands in for the window manager, a top-level its
+    /// client maps is given `WM_STATE` `NormalState` and one it unmaps
+    /// `WithdrawnState`, each told to the client in a `PropertyNotify`
+    /// carrying the serial of the request that caused it, which Wine's X
+    /// driver compares with its own. With no window manager announced, the
+    /// server sets nothing, as there would be none to set it.
+    #[test]
+    fn a_top_level_is_given_wm_state_while_the_server_manages() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+        let window = server_helper_window(&mut state);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client 1")
+            .event_masks
+            .insert(window, 0x0040_0000); // PropertyChange
+        let map = |state: &mut ServerState, backend: &mut RecordingBackend, serial: u16| {
+            if let Some(client) = state.clients.get(&1) {
+                client
+                    .last_sequence
+                    .store(serial, std::sync::atomic::Ordering::Relaxed);
+            }
+            handle_map_window(
+                state,
+                backend,
+                None,
+                ClientId(1),
+                SequenceNumber(serial),
+                &window.0.to_le_bytes(),
+            )
+            .expect("MapWindow");
+        };
+        let unmap = |state: &mut ServerState, backend: &mut RecordingBackend, serial: u16| {
+            if let Some(client) = state.clients.get(&1) {
+                client
+                    .last_sequence
+                    .store(serial, std::sync::atomic::Ordering::Relaxed);
+            }
+            handle_unmap_window(
+                state,
+                backend,
+                None,
+                ClientId(1),
+                SequenceNumber(serial),
+                &window.0.to_le_bytes(),
+            )
+            .expect("UnmapWindow");
+        };
+        let wm_state = |state: &ServerState| {
+            state
+                .atoms
+                .id_for("WM_STATE")
+                .and_then(|atom| state.resources.window_property(window, atom))
+                .map(|value| value.data.clone())
+        };
+        // PropertyNotify (28) on the window: its serial, and the atom.
+        let notified = |out: &[u8]| -> Vec<(u16, u32)> {
+            out.chunks(32)
+                .filter(|event| event[0] & 0x7f == 28)
+                .map(|event| {
+                    (
+                        u16::from_le_bytes([event[2], event[3]]),
+                        u32::from_le_bytes(event[8..12].try_into().expect("atom")),
+                    )
+                })
+                .collect()
+        };
+
+        map(&mut state, &mut backend, 3);
+        assert_eq!(wm_state(&state), None, "no window manager, no WM_STATE");
+        unmap(&mut state, &mut backend, 4);
+
+        announce_window_manager_for_server(&mut state, &mut backend, "hyprix", &[])
+            .expect("announce");
+        let atom = state.atoms.intern("WM_STATE", false);
+        let _ = read_all_available(&mut peer);
+        map(&mut state, &mut backend, 7);
+        assert_eq!(wm_state(&state), Some([1, 0, 0, 0, 0, 0, 0, 0].to_vec()));
+        assert_eq!(notified(&read_all_available(&mut peer)), [(7, atom.0)]);
+        let value = state
+            .resources
+            .window_property(window, atom)
+            .expect("WM_STATE");
+        assert_eq!(value.r#type, atom, "of type WM_STATE");
+
+        unmap(&mut state, &mut backend, 9);
+        assert_eq!(wm_state(&state), Some([0; 8].to_vec()));
+        assert_eq!(notified(&read_all_available(&mut peer)), [(9, atom.0)]);
     }
 
     /// Closing a window that speaks `WM_DELETE_WINDOW` asks its client.
