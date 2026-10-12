@@ -20134,46 +20134,6 @@ impl Backend for KmsBackend {
         true
     }
 
-    fn adopt_locked_mods(&mut self, locked: u8) -> bool {
-        use xkbcommon::xkb;
-        let s = &mut self.core.xkb_state.0;
-        let now = s.serialize_mods(xkb::STATE_MODS_LOCKED);
-        if now & 0xff == u32::from(locked) {
-            return false;
-        }
-        let depressed = s.serialize_mods(xkb::STATE_MODS_DEPRESSED);
-        let latched = s.serialize_mods(xkb::STATE_MODS_LATCHED);
-        let _ = s.update_mask(
-            depressed,
-            latched,
-            u32::from(locked),
-            s.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED),
-            s.serialize_layout(xkb::STATE_LAYOUT_LATCHED),
-            s.serialize_layout(xkb::STATE_LAYOUT_LOCKED),
-        );
-        true
-    }
-
-    fn adopt_locked_mods(&mut self, locked: u8) -> bool {
-        use xkbcommon::xkb;
-        let s = &mut self.core.xkb_state.0;
-        let now = s.serialize_mods(xkb::STATE_MODS_LOCKED);
-        if now & 0xff == u32::from(locked) {
-            return false;
-        }
-        let depressed = s.serialize_mods(xkb::STATE_MODS_DEPRESSED);
-        let latched = s.serialize_mods(xkb::STATE_MODS_LATCHED);
-        let _ = s.update_mask(
-            depressed,
-            latched,
-            u32::from(locked),
-            s.serialize_layout(xkb::STATE_LAYOUT_DEPRESSED),
-            s.serialize_layout(xkb::STATE_LAYOUT_LATCHED),
-            s.serialize_layout(xkb::STATE_LAYOUT_LOCKED),
-        );
-        true
-    }
-
     fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
         let s = &self.core.xkb_state.0;
         (
