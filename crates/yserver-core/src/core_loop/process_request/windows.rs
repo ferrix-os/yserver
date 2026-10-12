@@ -52,14 +52,19 @@ pub(super) fn send_window_exposures(
     if region.is_empty() {
         return;
     }
+    // Painted through the window itself, which the backend resolves to
+    // its redirect backing with the content offset a bordered window's
+    // backing has; `host_drawable_target` would name the backing pixmap,
+    // whose origin is the window's outer corner, and put the background
+    // `border_width` up and to the left of the region.
     if paint
         && let Some(bg) = state.resources.window_resolved_background(window)
-        && let Some(target) = state.resources.host_drawable_target(window)
+        && let Some(host) = state.resources.window(window).and_then(|w| w.host_xid)
     {
         for r in region {
             let _ = backend.clear_area(
                 origin,
-                target.host_xid(),
+                host.as_raw(),
                 bg.background_pixel,
                 bg.background_pixmap_host_xid.map(|h| h.as_raw()),
                 r.x,

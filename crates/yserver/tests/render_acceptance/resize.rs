@@ -1348,3 +1348,64 @@ fn bg_none_window_is_seeded_from_its_parent_on_remap() {
         "the remap seeds from the parent"
     );
 }
+
+/// A resize exposes the whole window, and the exposure paints its
+/// background into the redirect backing at the border inset: the ring
+/// stays the border pixel. The background used to go to the backing's
+/// pixmap, whose origin is the window's OUTER corner, so it landed `bw`
+/// up and to the left and painted over the ring's top and left.
+#[test]
+#[ignore = "needs live Vulkan ICD"]
+fn a_resize_keeps_the_border_of_a_redirected_window_with_a_background() {
+    const W: u32 = 0x1470;
+    const BW: usize = 2;
+    let Some(mut f) = ProtoFixture::new() else {
+        eprintln!("skipping: no Vk");
+        return;
+    };
+    let root = yserver_core::resources::ROOT_WINDOW.0;
+    let visual = yserver_core::resources::ROOT_VISUAL.0;
+    // A compositor redirects the root's children.
+    let mut body = Vec::new();
+    body.extend_from_slice(&root.to_le_bytes());
+    body.extend_from_slice(&[1u8, 0, 0, 0]); // CompositeRedirectManual
+    f.req(144, 2, &body);
+    // CWBackPixel (0x02) = white, CWBorderPixel (0x08) = red.
+    or_create_window(
+        &mut f,
+        W,
+        root,
+        24,
+        0,
+        0,
+        100,
+        100,
+        BW as u16,
+        visual,
+        0x0000_000A,
+        &[0x00FF_FFFF, 0x00FF_0000],
+    );
+    wz_map(&mut f, W);
+    wz_configure(&mut f, W, 0x0C, &[160, 120]);
+
+    let (sw, sh, px) = f.backing(W);
+    assert_eq!((sw, sh), (164, 124), "bordered backing extent");
+    let at = |x: usize, y: usize| {
+        let o = (y * sw as usize + x) * 4;
+        [px[o], px[o + 1], px[o + 2], px[o + 3]]
+    };
+    for (x, y) in [(0, 60), (BW - 1, 60), (80, 0), (80, BW - 1)] {
+        assert_eq!(
+            at(x, y),
+            [0x00, 0x00, 0xFF, 0xFF],
+            "the ring keeps the border pixel at ({x},{y})",
+        );
+    }
+    for (x, y) in [(BW, 60), (80, BW), (sw as usize - BW - 1, 60)] {
+        assert_eq!(
+            at(x, y),
+            [0xFF, 0xFF, 0xFF, 0xFF],
+            "the background fills the content at ({x},{y})",
+        );
+    }
+}
