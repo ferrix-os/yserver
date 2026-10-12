@@ -22,8 +22,13 @@
 //!   dropped: the X server repeats a held key itself, per
 //!   `ChangeKeyboardControl`.
 //! * **Focus.** The keyboard entering a window gives its X top-level the
-//!   input focus, as a window manager would; leaving takes it away (focus
-//!   None) and lets go of every key the server still has down.
+//!   input focus, as a window manager would, and offers it `WM_TAKE_FOCUS`
+//!   when it speaks that protocol (Wine activates a window on nothing
+//!   else); leaving takes it away (focus None) and lets go of every key
+//!   the server still has down.
+//! * **Locks.** Caps Lock and Num Lock are the compositor's
+//!   (`wl_keyboard.modifiers`): a lock key pressed while another window
+//!   had the keyboard reaches only the compositor.
 //! * **The cursor** is the X cursor in effect, copied into a buffer and
 //!   given with `wl_pointer.set_cursor` whenever it changes; with none, the
 //!   compositor's arrow.
@@ -38,7 +43,7 @@ use yserver_core::{
             HostInputEvent, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT,
             SYNTH_SCROLL_UP,
         },
-        process_request::set_input_focus_for_server,
+        process_request::{set_input_focus_for_server, take_focus_for_server},
     },
     host_x11::HostKeyEvent,
     resources::ROOT_WINDOW,
@@ -289,7 +294,16 @@ impl WaylandLink {
                     return;
                 };
                 if set_input_focus_for_server(state, Some(window)) {
-                    log::info!("wayland: the keyboard is on window 0x{:x}", window.0);
+                    let offered = take_focus_for_server(state, window);
+                    log::info!(
+                        "wayland: the keyboard is on window 0x{:x}{}",
+                        window.0,
+                        if offered {
+                            ", offered WM_TAKE_FOCUS"
+                        } else {
+                            ""
+                        }
+                    );
                 }
             }
             KeyboardEvent::Leave(_) => {
@@ -316,8 +330,19 @@ impl WaylandLink {
                     self.key(state, backend, keycode, key.pressed);
                 }
             }
-            // The server's XKB state follows the keys themselves.
-            KeyboardEvent::Modifiers(_) => {}
+            // The server's XKB state follows the keys themselves, but for
+            // the locks: Caps Lock pressed while another window had the
+            // keyboard toggled the compositor's and not the server's, and a
+            // VNC viewer toggles it on its own to match the case of a
+            // letter it sends. The compositor's word on them is the truth.
+            KeyboardEvent::Modifiers(modifiers) => {
+                // X's Lock and Mod2, the core bits the toolkit reads them from.
+                let locked = if modifiers.caps_lock { 0x02 } else { 0 }
+                    | if modifiers.num_lock { 0x10 } else { 0 };
+                if backend.adopt_locked_mods(locked) {
+                    log::info!("wayland: the locked modifiers are 0x{locked:02x}");
+                }
+            }
         }
     }
 
