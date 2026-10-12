@@ -267,13 +267,65 @@ pub(super) fn server_manages(state: &ServerState, hint: AtomId) -> bool {
             })
             .unwrap_or_default()
     };
-    let announced = root_word_list("_NET_SUPPORTING_WM_CHECK")
-        .first()
-        .is_some_and(|window| {
-            state.resources.window_owner(ResourceId(*window))
+    server_is_window_manager(state) && root_word_list("_NET_SUPPORTED").contains(&hint.0)
+}
+
+/// Whether the window the root's `_NET_SUPPORTING_WM_CHECK` names is the
+/// server's own (`announce_window_manager_for_server`): whether the server
+/// stands in for the window manager.
+fn server_is_window_manager(state: &ServerState) -> bool {
+    state
+        .atoms
+        .id_for("_NET_SUPPORTING_WM_CHECK")
+        .and_then(|atom| state.resources.window(ROOT_WINDOW)?.properties.get(&atom))
+        .and_then(|value| value.data.get(0..4))
+        .and_then(|data| <[u8; 4]>::try_from(data).ok())
+        .is_some_and(|data| {
+            state
+                .resources
+                .window_owner(ResourceId(u32::from_le_bytes(data)))
                 == Some(crate::resources::SERVER_OWNER)
-        });
-    announced && root_word_list("_NET_SUPPORTED").contains(&hint.0)
+        })
+}
+
+/// ICCCM 4.1.3.1's `WithdrawnState` and `NormalState`, as `WM_STATE` says
+/// them.
+pub(super) const WM_STATE_WITHDRAWN: u32 = 0;
+pub(super) const WM_STATE_NORMAL: u32 = 1;
+
+/// Set `WM_STATE` on a top-level `window` its client just mapped
+/// ([`WM_STATE_NORMAL`]) or unmapped ([`WM_STATE_WITHDRAWN`]), as a window
+/// manager does (ICCCM 4.1.3.1 and 4.1.4), when the server stands in for
+/// one ([`server_is_window_manager`]).
+///
+/// A client that finds a window manager may wait for `WM_STATE` to say its
+/// window changed state. Wine's X driver does: until the `PropertyNotify`
+/// of `WM_STATE` comes, with a serial no older than its `MapWindow`'s, it
+/// holds every later change of the window's state and ignores every size
+/// the window is given. With nothing setting it, Wine's notepad kept the
+/// size it asked for and not the size the compositor gave its window.
+/// Xwayland's compositors set it from their X window managers. Called
+/// within the client's request, the notify carries that request's serial.
+pub(super) fn set_wm_state_for_server(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    window: ResourceId,
+    wm_state: u32,
+) -> io::Result<()> {
+    let top_level = window != ROOT_WINDOW
+        && state
+            .resources
+            .window(window)
+            .is_some_and(|w| w.parent == ROOT_WINDOW && !w.override_redirect);
+    if !top_level || !server_is_window_manager(state) {
+        return Ok(());
+    }
+    let property = state.atoms.intern("WM_STATE", false);
+    // The state, then the icon window: none.
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&wm_state.to_le_bytes());
+    data.extend_from_slice(&0u32.to_le_bytes());
+    change_property_for_server(state, backend, window, property, property, 32, &data)
 }
 
 /// Make the server's `window` the owner of `selection`, or give it up with

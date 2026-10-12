@@ -2415,6 +2415,12 @@ pub(super) fn handle_map_window(
             send_map_exposures(state, backend, origin, &[window]);
         }
     }
+    super::for_server::set_wm_state_for_server(
+        state,
+        backend,
+        window,
+        super::for_server::WM_STATE_NORMAL,
+    )?;
     // Xorg MapWindow ends in WindowsRestructured (`dix/window.c:2695`): the
     // pointer's crossings follow MapNotify and Expose within the request.
     backend.windows_restructured(state);
@@ -2634,6 +2640,12 @@ pub(super) fn handle_unmap_window(
             release_core_grabs_for_unviewable(state, backend);
             // Then WindowsRestructured (`dix/window.c:2871`).
             backend.windows_restructured(state);
+            super::for_server::set_wm_state_for_server(
+                state,
+                backend,
+                window,
+                super::for_server::WM_STATE_WITHDRAWN,
+            )?;
         }
     }
     debug!("client {} #{} UnmapWindow", client_id.0, sequence.0);
