@@ -656,6 +656,16 @@ pub trait Backend {
     fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
         (0, 0, 0, 0)
     }
+    /// Take `locked` as the real modifiers locked now (`Lock` for Caps
+    /// Lock, `Mod2` for Num Lock, ...), keeping what is held and latched.
+    /// A rootless server's display system says which locks are on whenever
+    /// they change and when the keyboard comes back to one of the server's
+    /// windows, and a lock key pressed while another window had the
+    /// keyboard is seen nowhere else. Whether anything changed. Default
+    /// no-op for backends without an XKB keymap.
+    fn adopt_locked_mods(&mut self, _locked: u8) -> bool {
+        false
+    }
     fn composite_opcode(&self) -> Option<u8>;
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32>;
     fn ping(&mut self, origin: Option<OriginContext>) -> io::Result<()>;

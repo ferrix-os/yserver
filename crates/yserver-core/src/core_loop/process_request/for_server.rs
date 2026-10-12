@@ -159,50 +159,9 @@ pub fn close_window_for_server(
     backend: &mut dyn Backend,
     window: ResourceId,
 ) -> io::Result<()> {
-    let delete = state.atoms.id_for("WM_DELETE_WINDOW");
-    let asks = state
-        .atoms
-        .id_for("WM_PROTOCOLS")
-        .zip(delete)
-        .filter(|(protocols, delete)| {
-            state
-                .resources
-                .window(window)
-                .and_then(|w| w.properties.get(protocols))
-                .is_some_and(|value| {
-                    value
-                        .data
-                        .chunks_exact(4)
-                        .any(|atom| atom == delete.0.to_le_bytes())
-                })
-        });
-    if let Some((protocols, delete)) = asks {
-        // SendEvent(propagate = false, destination = the window, no event
-        // mask: to the window's creator), carrying a ClientMessage of
-        // format 32: WM_PROTOCOLS, then WM_DELETE_WINDOW and CurrentTime.
-        let mut body = Vec::with_capacity(40);
-        body.extend_from_slice(&window.0.to_le_bytes());
-        body.extend_from_slice(&0u32.to_le_bytes());
-        let mut event = [0u8; 32];
-        event[0] = 33; // ClientMessage
-        event[1] = 32; // format
-        event[4..8].copy_from_slice(&window.0.to_le_bytes());
-        event[8..12].copy_from_slice(&protocols.0.to_le_bytes());
-        event[12..16].copy_from_slice(&delete.0.to_le_bytes());
-        body.extend_from_slice(&event);
-        let header = RequestHeader {
-            opcode: 25,
-            data: 0,
-            length_units: 11,
-        };
-        return handle_send_event(
-            state,
-            crate::resources::SERVER_OWNER,
-            SequenceNumber(0),
-            header,
-            &body,
-        )
-        .map(drop);
+    if let Some((protocols, delete)) = wm_protocol(state, window, "WM_DELETE_WINDOW") {
+        // CurrentTime: ICCCM 4.2.8.1 asks for none in particular.
+        return send_wm_protocol(state, window, protocols, delete, 0);
     }
     handle_kill_client(
         state,
@@ -210,6 +169,88 @@ pub fn close_window_for_server(
         crate::resources::SERVER_OWNER,
         SequenceNumber(0),
         &window.0.to_le_bytes(),
+    )
+    .map(drop)
+}
+
+/// Offer a top-level the keyboard, as a window manager does once it has
+/// given it the input focus: a `WM_TAKE_FOCUS` `ClientMessage` (ICCCM
+/// 4.1.7) when the window lists that protocol in `WM_PROTOCOLS`, carrying
+/// the time of the last focus change, so that a `SetInputFocus` the client
+/// makes in answer is not older than it. Whether one was sent.
+///
+/// A client of the "globally active" input model -- `WM_TAKE_FOCUS` and
+/// `WM_HINTS` input false, as Wine's X11 driver sets on every window -- takes
+/// the focus only when it is offered so: Wine activates a window on
+/// `WM_TAKE_FOCUS` and ignores a plain `FocusIn`, so a window the keyboard
+/// reached without a click would show the caret of nothing and drop every
+/// key. A rootless server uses this beside `set_input_focus_for_server`
+/// when the display system that shows its top-levels gives one the
+/// keyboard: a Wayland compositor's `wl_keyboard.enter`, for yserver's
+/// Wayland backend.
+pub fn take_focus_for_server(state: &mut ServerState, window: ResourceId) -> bool {
+    let Some((protocols, take_focus)) = wm_protocol(state, window, "WM_TAKE_FOCUS") else {
+        return false;
+    };
+    let time = state.core_focus.time;
+    if let Err(error) = send_wm_protocol(state, window, protocols, take_focus, time) {
+        debug!("WM_TAKE_FOCUS to 0x{:x}: {error}", window.0);
+        return false;
+    }
+    true
+}
+
+/// `WM_PROTOCOLS` and the atom `name`, when `window` lists that protocol.
+fn wm_protocol(state: &ServerState, window: ResourceId, name: &str) -> Option<(AtomId, AtomId)> {
+    let protocols = state.atoms.id_for("WM_PROTOCOLS")?;
+    let protocol = state.atoms.id_for(name)?;
+    state
+        .resources
+        .window(window)
+        .and_then(|w| w.properties.get(&protocols))
+        .is_some_and(|value| {
+            value
+                .data
+                .chunks_exact(4)
+                .any(|atom| atom == protocol.0.to_le_bytes())
+        })
+        .then_some((protocols, protocol))
+}
+
+/// Send `window`'s client the `WM_PROTOCOLS` message `protocol` with
+/// `time`, as a window manager does: SendEvent(propagate = false,
+/// destination = the window, no event mask: to the window's creator),
+/// carrying a `ClientMessage` of format 32: `WM_PROTOCOLS`, then the
+/// protocol and the time.
+fn send_wm_protocol(
+    state: &mut ServerState,
+    window: ResourceId,
+    protocols: AtomId,
+    protocol: AtomId,
+    time: u32,
+) -> io::Result<()> {
+    let mut body = Vec::with_capacity(40);
+    body.extend_from_slice(&window.0.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    let mut event = [0u8; 32];
+    event[0] = 33; // ClientMessage
+    event[1] = 32; // format
+    event[4..8].copy_from_slice(&window.0.to_le_bytes());
+    event[8..12].copy_from_slice(&protocols.0.to_le_bytes());
+    event[12..16].copy_from_slice(&protocol.0.to_le_bytes());
+    event[16..20].copy_from_slice(&time.to_le_bytes());
+    body.extend_from_slice(&event);
+    let header = RequestHeader {
+        opcode: 25,
+        data: 0,
+        length_units: 11,
+    };
+    handle_send_event(
+        state,
+        crate::resources::SERVER_OWNER,
+        SequenceNumber(0),
+        header,
+        &body,
     )
     .map(drop)
 }

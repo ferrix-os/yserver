@@ -255,6 +255,47 @@ fn close_window_for_server_sends_wm_delete_window() {
     );
 }
 
+/// The keyboard reaching a window that speaks `WM_TAKE_FOCUS` offers it
+/// the focus with the time of the focus change; one that does not is
+/// sent nothing.
+#[test]
+fn take_focus_for_server_offers_wm_take_focus() {
+    use crate::properties::{PropertyFormat, PropertyValue};
+
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let window = server_helper_window(&mut state);
+    assert!(
+        !take_focus_for_server(&mut state, window),
+        "no WM_PROTOCOLS, nothing to offer"
+    );
+    let protocols = state.atoms.intern("WM_PROTOCOLS", false);
+    let take_focus = state.atoms.intern("WM_TAKE_FOCUS", false);
+    if let Some(w) = state.resources.window_mut(window) {
+        w.properties.insert(
+            protocols,
+            PropertyValue {
+                r#type: AtomId(4), // ATOM
+                format: PropertyFormat::F32,
+                data: take_focus.0.to_le_bytes().to_vec(),
+            },
+        );
+    }
+    state.core_focus.time = 4242;
+    let _ = read_all_available(&mut peer);
+
+    assert!(take_focus_for_server(&mut state, window));
+    let out = read_all_available(&mut peer);
+    let message = out
+        .chunks(32)
+        .find(|event| event[0] & 0x7f == 33)
+        .expect("a ClientMessage");
+    assert_eq!(&message[4..8], &window.0.to_le_bytes());
+    assert_eq!(&message[8..12], &protocols.0.to_le_bytes());
+    assert_eq!(&message[12..16], &take_focus.0.to_le_bytes());
+    assert_eq!(&message[16..20], &4242u32.to_le_bytes(), "the focus time");
+}
+
 /// Closing a window whose client cannot be asked disconnects it.
 #[test]
 fn close_window_for_server_kills_a_client_that_cannot_be_asked() {
