@@ -22,12 +22,13 @@ jobs:
       - name: Install packages
         # The build's own (as the CI workflow's), then the compositor and
         # the clients the scenarios run: sway and swaymsg, grim for the
-        # screen, wl-clipboard and xclip for both sides of the clipboard,
-        # x11-utils for xwininfo, python3-xlib for the probe windows.
+        # screen, wtype for keys, wl-clipboard and xclip for both sides of
+        # the clipboard, x11-utils for xev and xwininfo, python3-xlib for
+        # the probe windows.
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libgbm-dev libfontconfig-dev xfonts-base mesa-vulkan-drivers \
-            sway grim wl-clipboard xclip x11-utils python3-xlib
+            sway grim wtype wl-clipboard xclip x11-utils python3-xlib
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: Cache cargo
@@ -37,7 +38,7 @@ jobs:
       - name: Versions
         run: |
           sway --version
-          dpkg-query -W mesa-vulkan-drivers wl-clipboard xclip
+          dpkg-query -W mesa-vulkan-drivers wtype wl-clipboard xclip
       - name: rootless suite
         run: tools/rootless-suite.sh --binary target/debug/ywayland --out target/rootless-suite/ci
       - name: Drop sockets before upload

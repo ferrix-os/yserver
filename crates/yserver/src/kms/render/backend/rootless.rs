@@ -1,6 +1,7 @@
 //! What a rootless backend (`crate::rootless`) needs of `KmsBackend`, which
-//! renders for it headless: each top-level's image read back, a RandR output
-//! standing for the host's screen, and the host's keyboard layout.
+//! renders for it headless: each top-level's image read back, the cursor in
+//! effect, a RandR output standing for the host's screen, and the host's
+//! keyboard layout.
 
 use super::*;
 
@@ -135,5 +136,10 @@ impl yserver_core::rootless::RootlessRenderer for KmsBackend {
                 false
             }
         }
+    }
+
+    fn cursor_key(&self) -> Option<(u32, u64)> {
+        let xid = self.effective_cursor_xid?;
+        Some((xid, self.cursor_records.get(&xid)?.version))
     }
 }

@@ -9,9 +9,10 @@
 //! implementing [`Transport`], without a change to anything else.
 //!
 //! A transport is a [`HostWindows`] -- top-levels are `xdg_toplevel`s,
-//! images `wl_shm` buffers -- plus the connection, the compositor's events,
-//! its screen and keyboard layout, the drag of a window, and the clipboard
-//! of `ext_data_control_v1`.
+//! popups `xdg_popup`s placed exactly where X put them, images `wl_shm`
+//! buffers -- plus the connection, the compositor's events, its screen and
+//! keyboard layout, the drag of a window, the cursor, and the clipboard of
+//! `ext_data_control_v1`.
 
 use std::{
     io,
@@ -20,7 +21,7 @@ use std::{
 
 use yserver_core::rootless::HostWindows;
 
-/// A window of the compositor's: a top-level surface.
+/// A window of the compositor's: a top-level or a popup surface.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Surface(pub u32);
 
@@ -65,12 +66,78 @@ pub struct Screen {
     pub refresh_mhz: u32,
 }
 
+/// What the pointer did, in surface-local logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PointerEvent {
+    /// It came onto a surface.
+    Enter {
+        /// Which.
+        surface: Surface,
+        /// Where across.
+        x: f64,
+        /// Where down.
+        y: f64,
+    },
+    /// It left the server's surfaces.
+    Leave,
+    /// It moved.
+    Motion {
+        /// Over which.
+        surface: Surface,
+        /// Where across.
+        x: f64,
+        /// Where down.
+        y: f64,
+    },
+    /// A button went down or up.
+    Button {
+        /// Over which.
+        surface: Surface,
+        /// Where across.
+        x: f64,
+        /// Where down.
+        y: f64,
+        /// The evdev code: `0x110` left, `0x111` right, `0x112` middle.
+        button: u32,
+        /// Down or up.
+        pressed: bool,
+    },
+    /// The wheel, down and right positive, in `wl_pointer.axis` units,
+    /// with the clicks where the compositor counts them (0 where not).
+    Axis {
+        /// Down (positive) or up.
+        vertical: f64,
+        /// Right (positive) or left.
+        horizontal: f64,
+        /// Clicks, vertical then horizontal.
+        discrete: (i32, i32),
+    },
+}
+
+/// What the keyboard did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyboardEvent {
+    /// A surface got the keyboard.
+    Enter(Surface),
+    /// The server's surfaces lost it.
+    Leave,
+    /// A key went down or up, or the client library repeated it.
+    Key {
+        /// The evdev code, as `wl_keyboard.key` carries it.
+        code: u32,
+        /// Down or up.
+        pressed: bool,
+        /// A repeat the client library made, not the compositor's key.
+        repeat: bool,
+    },
+}
+
 /// What the compositor said.
 #[derive(Debug)]
 pub enum Event {
     /// It is ready for another frame of `surface`.
     Frame(Surface),
-    /// It gave a top-level a size.
+    /// It gave a top-level or popup a size.
     Configure {
         /// Which.
         surface: Surface,
@@ -79,8 +146,14 @@ pub enum Event {
         /// Its height.
         height: u32,
     },
+    /// It took a popup away (`xdg_popup.popup_done`).
+    PopupDone(Surface),
     /// It asked to close a top-level (`xdg_toplevel.close`).
     Close(Surface),
+    /// The pointer.
+    Pointer(PointerEvent),
+    /// The keyboard.
+    Keyboard(KeyboardEvent),
     /// A selection now holds `offer`, which can be had as `types`; `None`
     /// for an empty one.
     Selection {
@@ -102,6 +175,20 @@ pub enum Event {
     },
     /// The server's `source` is no longer a selection.
     Cancelled(Source),
+}
+
+/// A cursor's picture: `width` x `height` pixels of premultiplied ARGB8888
+/// (B, G, R, A in memory), `hot` the point of it the pointer is at.
+#[derive(Clone, Copy, Debug)]
+pub struct CursorImage<'a> {
+    /// Its width.
+    pub width: u32,
+    /// Its height.
+    pub height: u32,
+    /// The hot spot.
+    pub hot: (i32, i32),
+    /// The pixels.
+    pub pixels: &'a [u8],
 }
 
 /// A connection to a Wayland compositor, as the backend uses it.
@@ -140,6 +227,14 @@ pub trait Transport: HostWindows<Surface = Surface> {
     /// (`xdg_toplevel.move`, `resize` with `edges`, 0 a move), from the
     /// last press the compositor sent.
     fn drag(&mut self, surface: Surface, edges: u32);
+
+    /// Show `image` for the pointer over the server's surfaces, or the
+    /// compositor's own arrow for `None`.
+    ///
+    /// # Errors
+    ///
+    /// The image could not be given.
+    fn set_cursor(&mut self, image: Option<CursorImage<'_>>) -> io::Result<()>;
 
     /// Bind the compositor's `ext_data_control_v1` for the seat; whether it
     /// has one. [`Event::Selection`], [`Event::Send`] and

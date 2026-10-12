@@ -2,6 +2,8 @@
 """X clients for the rootless scenarios (tools/rootless-suite.sh).
 
     probe.py window NAME CLASS RRGGBB [WxH]   a top-level of one colour
+    probe.py popup X Y WxH RRGGBB             an override-redirect window at
+                                              root (X, Y), as a menu is
 
 Each prints its window's id first, then one line per event it hears:
 `configure WxH` when its size changes, and `closed` when the window manager
@@ -21,16 +23,20 @@ def size(text):
 
 
 def main(argv):
-    if len(argv) < 5 or argv[1] != "window":
+    if len(argv) < 2 or argv[1] not in ("window", "popup"):
         print(__doc__, file=sys.stderr)
         return 2
     dpy = display.Display()
     screen = dpy.screen()
-    name, wm_class, colour = argv[2], argv[3], int(argv[4], 16)
-    width, height = size(argv[5] if len(argv) > 5 else "300x200")
+    if argv[1] == "window":
+        name, wm_class, colour = argv[2], argv[3], int(argv[4], 16)
+        (width, height), at, override = size(argv[5] if len(argv) > 5 else "300x200"), (0, 0), False
+    else:
+        at, (width, height), colour = (int(argv[2]), int(argv[3])), size(argv[4]), int(argv[5], 16)
+        override = True
     window = screen.root.create_window(
-        0,
-        0,
+        at[0],
+        at[1],
         width,
         height,
         0,
@@ -38,12 +44,14 @@ def main(argv):
         X.InputOutput,
         X.CopyFromParent,
         background_pixel=colour,
+        override_redirect=override,
         event_mask=X.ExposureMask | X.StructureNotifyMask,
     )
     delete = dpy.intern_atom("WM_DELETE_WINDOW")
-    window.set_wm_name(name)
-    window.set_wm_class(wm_class.lower(), wm_class)
-    window.set_wm_protocols([delete])
+    if not override:
+        window.set_wm_name(name)
+        window.set_wm_class(wm_class.lower(), wm_class)
+        window.set_wm_protocols([delete])
     window.map()
     dpy.flush()
     print(f"window 0x{window.id:x}", flush=True)

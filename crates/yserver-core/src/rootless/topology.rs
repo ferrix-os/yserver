@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use log::{debug, info, warn};
 use yserver_protocol::x11::{AtomId, ResourceId};
 
-use super::{Damage, HostWindows, RootlessRenderer, ToplevelSpec};
+use super::{Damage, HostWindows, RootlessRenderer, ToplevelSpec, popups::Popups};
 use crate::{
     backend::Backend,
     core_loop::process_request::{
@@ -49,12 +49,12 @@ pub struct SizeLimits {
 /// Where a host window is in drawing it: the frame it waits for and the
 /// image it last showed.
 #[derive(Debug, Default)]
-struct Frames {
+pub(super) struct Frames {
     /// A frame was asked for ([`HostWindows::request_frame`]) and has not
     /// come.
     pending: bool,
     /// The [`RootlessRenderer::image_version`] last drawn.
-    shown: Option<u64>,
+    pub(super) shown: Option<u64>,
     /// The host configured the window since it was last drawn.
     configured: bool,
     /// A hash of each row of the image last handed over, which the next
@@ -92,6 +92,10 @@ pub struct Topology<S> {
     toplevels: HashMap<u32, Toplevel<S>>,
     /// Host XIDs whose title or class changed since the last sync.
     renamed: HashSet<u32>,
+    /// Override-redirect windows as popups ([`super::popups`]).
+    pub(super) popups: Popups<S>,
+    /// The host window the pointer is on, as the host's seat said it.
+    pub(super) pointer: Option<S>,
 }
 
 impl<S> Default for Topology<S> {
@@ -99,6 +103,8 @@ impl<S> Default for Topology<S> {
         Self {
             toplevels: HashMap::new(),
             renamed: HashSet::new(),
+            popups: Popups::default(),
+            pointer: None,
         }
     }
 }
@@ -142,17 +148,19 @@ impl<S: Copy + Eq + std::fmt::Debug> Topology<S> {
         }
     }
 
-    /// The host XID of the X window the host window `surface` shows.
+    /// The host XID of the X window the host window or popup `surface`
+    /// shows.
     #[must_use]
     pub fn host_xid_of(&self, surface: S) -> Option<u32> {
         self.toplevels
             .iter()
             .find(|(_, toplevel)| toplevel.surface == surface)
             .map(|(&host_xid, _)| host_xid)
+            .or_else(|| self.popups.host_xid_of(surface))
     }
 
-    /// The X window the host window `surface` shows, if it still is a child
-    /// of the root.
+    /// The X window the host window or popup `surface` shows, if it still
+    /// is a child of the root.
     #[must_use]
     pub fn window_of(&self, state: &ServerState, surface: S) -> Option<ResourceId> {
         let host_xid = self.host_xid_of(surface)?;
@@ -205,7 +213,10 @@ impl<S: Copy + Eq + std::fmt::Debug> Topology<S> {
         // shows a window whether it floats.
         wanted.sort_by_key(|(_, window)| transient_for(state, window).is_some());
 
+        // Popups go before the windows they hang from, and a child popup
+        // before its parent.
         let kept: HashSet<u32> = wanted.iter().map(|&(host_xid, _)| host_xid).collect();
+        self.popups.retire(state, host, &kept);
 
         self.toplevels.retain(|host_xid, toplevel| {
             let keep = kept.contains(host_xid);
@@ -308,8 +319,18 @@ impl<S: Copy + Eq + std::fmt::Debug> Topology<S> {
                 toplevel.surface,
                 (host_xid, window),
                 &mut toplevel.frames,
+                false,
             );
         }
+        let toplevels: Vec<(u32, S, bool)> = self
+            .toplevels
+            .iter()
+            .map(|(&host_xid, toplevel)| {
+                (host_xid, toplevel.surface, toplevel.frames.shown.is_some())
+            })
+            .collect();
+        self.popups
+            .show(state, host, renderer, &toplevels, self.pointer);
         self.renamed.clear();
         requests
     }
@@ -320,12 +341,16 @@ impl<S: Copy + Eq + std::fmt::Debug> Topology<S> {
             .find(|toplevel| toplevel.surface == surface)
     }
 
-    /// The frames of the window `surface` is.
+    /// The frames of the window or popup `surface` is.
     fn frames_of(&mut self, surface: S) -> Option<&mut Frames> {
-        self.toplevels
+        let Self {
+            toplevels, popups, ..
+        } = self;
+        toplevels
             .values_mut()
             .find(|toplevel| toplevel.surface == surface)
             .map(|toplevel| &mut toplevel.frames)
+            .or_else(|| popups.frames_of(surface))
     }
 }
 
@@ -403,16 +428,22 @@ pub fn move_resize_edges(request: ServerWmRequest) -> Option<u32> {
 /// been shown, at the window's own size: until the X window has taken a
 /// size the host asked for, it shows at the one it has.
 ///
+/// A window with `bordered` is shown with its X border around it: an
+/// override-redirect window, whose border X shows as its own since no
+/// window manager draws one. A top-level's border is not shown, as a window
+/// manager's frame would take its place.
+///
 /// The image is read straight into the host's buffer, and the host is told
 /// only the band of rows that differ from the image before, found by a hash
 /// of each row ([`Frames::rows`]): what X drew is not needed for that, so no
 /// drawing path can be missed.
-fn show<H: HostWindows>(
+pub(super) fn show<H: HostWindows>(
     host: &mut H,
     renderer: &mut dyn RootlessRenderer,
     surface: H::Surface,
     (host_xid, window): (u32, &Window),
     frames: &mut Frames,
+    bordered: bool,
 ) {
     if frames.pending || !host.ready(surface) {
         return;
@@ -421,9 +452,11 @@ fn show<H: HostWindows>(
     if version.is_some() && version == frames.shown && !frames.configured {
         return;
     }
-    // A top-level's border is not shown, as a window manager's frame would
-    // take its place.
-    let (width, height) = (window.width, window.height);
+    let border = if bordered { window.border_width } else { 0 };
+    let (width, height) = (
+        window.width.saturating_add(border.saturating_mul(2)),
+        window.height.saturating_add(border.saturating_mul(2)),
+    );
     let opaque = window.depth != 32;
     let size = (u32::from(width), u32::from(height));
     // Whether the host has this size's image already: a configure since,
@@ -432,7 +465,7 @@ fn show<H: HostWindows>(
         frames.configured || frames.shown.is_none() || frames.rows.len() != usize::from(height);
     let rows = &mut frames.rows;
     let mut fill = |out: &mut [u8]| {
-        if !renderer.read_image_into(host_xid, width, height, 0, out) {
+        if !renderer.read_image_into(host_xid, window.width, window.height, border, out) {
             return None;
         }
         Some(changed_rows(out, size, rows, whole))
@@ -496,7 +529,7 @@ fn row_hash(row: &[u8]) -> u64 {
 
 /// Whether a child of the root is shown as a top-level host window:
 /// viewable, drawing, and not override-redirect (a menu or a tooltip, which
-/// places itself).
+/// is a popup).
 #[must_use]
 pub fn is_toplevel(id: ResourceId, window: &Window) -> bool {
     id != COMPOSITE_OVERLAY_WINDOW
@@ -508,7 +541,7 @@ pub fn is_toplevel(id: ResourceId, window: &Window) -> bool {
 }
 
 /// The child of the root whose host XID is `host_xid`.
-fn root_child_with_host_xid(state: &ServerState, host_xid: u32) -> Option<ResourceId> {
+pub(super) fn root_child_with_host_xid(state: &ServerState, host_xid: u32) -> Option<ResourceId> {
     state
         .resources
         .children(ROOT_WINDOW)
@@ -525,7 +558,7 @@ fn root_child_with_host_xid(state: &ServerState, host_xid: u32) -> Option<Resour
 
 /// The host XID of the window `window` is a dialog of: `WM_TRANSIENT_FOR`
 /// (ICCCM 4.1.2.6), when it names a window that has one.
-fn transient_for(state: &ServerState, window: &Window) -> Option<u32> {
+pub(super) fn transient_for(state: &ServerState, window: &Window) -> Option<u32> {
     let atom = state.atoms.id_for("WM_TRANSIENT_FOR")?;
     let data = window.properties.get(&atom)?.data.get(0..4)?;
     let id = u32::from_le_bytes(data.try_into().ok()?);

@@ -9,13 +9,17 @@
 //!
 //! * which X windows become host windows, and what each is: a top-level of
 //!   its own, with its title, its class, the window it is a dialog of and
-//!   the sizes it may take ([`Topology`]);
+//!   the sizes it may take ([`Topology`]); or a menu, tooltip or drop-down
+//!   placed relative to the host window it belongs to ([`popups`]);
 //! * the image each one shows, read from the window's redirect backing when
 //!   it changed and the host is ready for another frame, and the rows that
 //!   differ from the last one ([`RootlessRenderer`]);
 //! * what the host asks of a window (a size, a close) carried out as a
 //!   window manager's requests would be ([`carry_out`]), and the window
-//!   manager requests clients send the root ([`move_resize_edges`]).
+//!   manager requests clients send the root ([`move_resize_edges`]);
+//! * the host's seat as X input: a position on a host window as a root
+//!   position, the hit test kept to the top-level under the pointer, and
+//!   the keyboard focus following the host's ([`seat`]).
 //!
 //! A host implements [`HostWindows`] -- make, change, draw and destroy its
 //! windows -- and calls the topology from its backend's hooks. Nothing here
@@ -23,10 +27,13 @@
 //!
 //! Each top-level keeps the root position X gave it, wherever the host
 //! shows it, as under Xwayland: the host does not say where it put a
-//! window.
+//! window, and X hit-testing and popup placement then agree with each
+//! other.
 
 use std::io;
 
+pub mod popups;
+pub mod seat;
 mod topology;
 
 pub use topology::{
@@ -60,6 +67,11 @@ pub trait RootlessRenderer {
         border: u16,
         out: &mut [u8],
     ) -> bool;
+
+    /// Which cursor is in effect, as the cursor's XID and a number that
+    /// changes whenever its picture does; `None` for no cursor at all. Its
+    /// picture is [`crate::backend::Backend::get_active_cursor_image`].
+    fn cursor_key(&self) -> Option<(u32, u64)>;
 }
 
 /// What a top-level is made with: everything a host may want to know
@@ -79,6 +91,19 @@ pub struct ToplevelSpec<S> {
     pub limits: SizeLimits,
 }
 
+/// Where a popup hangs from its parent: the outer corner of the X window,
+/// border and all, relative to the parent's content, and its size with
+/// the border. The host must put it exactly there, never move it to fit
+/// the screen: X placed it, and pointer input is translated by where X
+/// thinks it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PopupPlacement {
+    /// Relative to the parent's content.
+    pub at: (i32, i32),
+    /// Border included.
+    pub size: (u16, u16),
+}
+
 /// A host window system, as the topology drives it. `Surface` names one of
 /// its windows.
 pub trait HostWindows {
@@ -92,7 +117,21 @@ pub trait HostWindows {
     /// The host refused.
     fn create_toplevel(&mut self, spec: &ToplevelSpec<Self::Surface>) -> io::Result<Self::Surface>;
 
-    /// Destroy a window.
+    /// Make a popup on `parent`, placed exactly at `placement`.
+    ///
+    /// # Errors
+    ///
+    /// The host refused.
+    fn create_popup(
+        &mut self,
+        parent: Self::Surface,
+        placement: PopupPlacement,
+    ) -> io::Result<Self::Surface>;
+
+    /// Move a popup to `placement`.
+    fn reposition_popup(&mut self, surface: Self::Surface, placement: PopupPlacement);
+
+    /// Destroy a window or popup.
     fn destroy(&mut self, surface: Self::Surface);
 
     /// Retitle a top-level.

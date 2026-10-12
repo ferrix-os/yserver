@@ -168,8 +168,19 @@ pub(super) fn apply_core_input_focus(
         state.debug_client_label(client_id),
         state.debug_window_label(window),
     );
+    apply_core_focus(
+        state,
+        window.0,
+        revert_to,
+        if time == 0 { now } else { time },
+    );
+}
+
+/// Move the core keyboard focus to `to_raw` (0 None, 1 PointerRoot, else a
+/// window), with the FocusOut/FocusIn chain when it changes: what a
+/// SetInputFocus that passed its checks and its timestamp gate does.
+pub(super) fn apply_core_focus(state: &mut ServerState, to_raw: u32, revert_to: u8, time: u32) {
     let from_raw = state.core_focus.raw;
-    let to_raw = window.0;
     if from_raw != to_raw {
         // Xorg SetInputFocus (dix/events.c:4923): the focus transition
         // is reported NotifyWhileGrabbed (3) while a keyboard grab is
@@ -190,7 +201,7 @@ pub(super) fn apply_core_input_focus(
     state.core_focus = crate::server::CoreFocus {
         raw: to_raw,
         revert_to,
-        time: if time == 0 { now } else { time },
+        time,
     };
     // Legacy mirror — the key fanout's `current_focus` and other
     // readers still consult the per-client field; None/PointerRoot

@@ -9,16 +9,24 @@ use std::{
 };
 
 use compositor_toolkit::{
-    Client, ObjectId, SurfaceId, ToplevelOptions, Value,
+    Client, CursorShape, ObjectId, PopupOptions, Rect, SurfaceId, ToplevelOptions, Value,
     protocol::ext_data_control::{
         self as control, ext_data_control_device_v1 as device,
         ext_data_control_manager_v1 as manager, ext_data_control_offer_v1 as offer,
         ext_data_control_source_v1 as source,
     },
 };
-use yserver_core::rootless::{Damage, HostWindows, SizeLimits, ToplevelSpec};
+use yserver_core::rootless::{Damage, HostWindows, PopupPlacement, SizeLimits, ToplevelSpec};
 
-use super::transport::{Event, Offer, Screen, Selection, Source, Surface, Transport};
+use super::transport::{
+    CursorImage, Event, KeyboardEvent, Offer, PointerEvent, Screen, Selection, Source, Surface,
+    Transport,
+};
+
+/// `xdg_positioner.anchor` top left, and `gravity` bottom right.
+const TOP_LEFT: u32 = 5;
+/// See [`TOP_LEFT`].
+const BOTTOM_RIGHT: u32 = 8;
 
 /// The toolkit's connection.
 pub struct ToolkitTransport {
@@ -58,7 +66,7 @@ impl ToolkitTransport {
     }
 
     fn event(&mut self, event: compositor_toolkit::Event) -> Option<Event> {
-        use compositor_toolkit::Event as Tk;
+        use compositor_toolkit::{Event as Tk, KeyboardEvent as Kb, PointerEvent as Pt};
         let surface = |id: SurfaceId| Surface(id.0);
         Some(match event {
             Tk::Frame { surface: id, .. } => Event::Frame(surface(id)),
@@ -71,7 +79,56 @@ impl ToolkitTransport {
                 width,
                 height,
             },
+            Tk::Closed(id) => Event::PopupDone(surface(id)),
             Tk::CloseRequested(id) => Event::Close(surface(id)),
+            Tk::Pointer(pointer) => Event::Pointer(match pointer {
+                Pt::Enter { surface: id, x, y } => PointerEvent::Enter {
+                    surface: surface(id),
+                    x,
+                    y,
+                },
+                Pt::Leave { .. } => PointerEvent::Leave,
+                Pt::Motion { surface: id, x, y } => PointerEvent::Motion {
+                    surface: surface(id),
+                    x,
+                    y,
+                },
+                Pt::Button {
+                    surface: id,
+                    x,
+                    y,
+                    button,
+                    pressed,
+                    ..
+                } => PointerEvent::Button {
+                    surface: surface(id),
+                    x,
+                    y,
+                    button,
+                    pressed,
+                },
+                Pt::Axis {
+                    vertical,
+                    horizontal,
+                    discrete,
+                    ..
+                } => PointerEvent::Axis {
+                    vertical,
+                    horizontal,
+                    discrete,
+                },
+            }),
+            Tk::Keyboard(keyboard) => Event::Keyboard(match keyboard {
+                Kb::Enter(id) => KeyboardEvent::Enter(surface(id)),
+                Kb::Leave(_) => KeyboardEvent::Leave,
+                Kb::Key(key) => KeyboardEvent::Key {
+                    code: key.code,
+                    pressed: key.pressed,
+                    repeat: key.repeat,
+                },
+                // The server's XKB state follows the keys themselves.
+                Kb::Modifiers(_) => return None,
+            }),
             Tk::Object {
                 object,
                 interface,
@@ -165,6 +222,26 @@ impl ToolkitTransport {
     }
 }
 
+/// A popup's positioner: a 1x1 anchor rectangle at its own position on the
+/// parent, growing right and down, never moved by the compositor.
+fn popup_options(placement: PopupPlacement) -> PopupOptions {
+    PopupOptions {
+        size: (i32::from(placement.size.0), i32::from(placement.size.1)),
+        anchor_rect: Rect {
+            x: placement.at.0,
+            y: placement.at.1,
+            width: 1,
+            height: 1,
+        },
+        anchor: TOP_LEFT,
+        gravity: BOTTOM_RIGHT,
+        constraint_adjustment: 0,
+        offset: (0, 0),
+        // An X menu grabs the pointer itself, inside the server.
+        grab: false,
+    }
+}
+
 impl HostWindows for ToolkitTransport {
     type Surface = Surface;
 
@@ -183,6 +260,18 @@ impl HostWindows for ToolkitTransport {
             .toplevel(&options)
             .map(|id| Surface(id.0))
             .map_err(Self::other)
+    }
+
+    fn create_popup(&mut self, parent: Surface, placement: PopupPlacement) -> io::Result<Surface> {
+        self.client
+            .popup(SurfaceId(parent.0), &popup_options(placement))
+            .map(|id| Surface(id.0))
+            .map_err(Self::other)
+    }
+
+    fn reposition_popup(&mut self, surface: Surface, placement: PopupPlacement) {
+        self.client
+            .reposition_popup(SurfaceId(surface.0), &popup_options(placement));
     }
 
     fn destroy(&mut self, surface: Surface) {
@@ -278,6 +367,16 @@ impl Transport for ToolkitTransport {
 
     fn drag(&mut self, surface: Surface, edges: u32) {
         self.client.drag_window(SurfaceId(surface.0), edges);
+    }
+
+    fn set_cursor(&mut self, image: Option<CursorImage<'_>>) -> io::Result<()> {
+        let Some(image) = image else {
+            self.client.set_cursor(CursorShape::default());
+            return Ok(());
+        };
+        self.client
+            .set_cursor_image(image.width, image.height, image.hot, image.pixels)
+            .map_err(Self::other)
     }
 
     fn bind_data_control(&mut self) -> bool {

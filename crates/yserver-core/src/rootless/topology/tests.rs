@@ -8,13 +8,15 @@ use super::*;
 use crate::{
     backend::WindowHandle,
     properties::{PropertyFormat, PropertyValue},
-    rootless::Damage,
+    rootless::{Damage, PopupPlacement},
 };
 
 /// What the host was asked, in order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Call {
     Toplevel(ToplevelSpec<u32>),
+    Popup(u32, PopupPlacement),
+    Reposition(u32, PopupPlacement),
     Destroy(u32),
     Title(u32, String),
     Class(u32, String),
@@ -49,6 +51,15 @@ impl HostWindows for Host {
     fn create_toplevel(&mut self, spec: &ToplevelSpec<u32>) -> io::Result<u32> {
         self.calls.push(Call::Toplevel(spec.clone()));
         Ok(self.make())
+    }
+
+    fn create_popup(&mut self, parent: u32, placement: PopupPlacement) -> io::Result<u32> {
+        self.calls.push(Call::Popup(parent, placement));
+        Ok(self.make())
+    }
+
+    fn reposition_popup(&mut self, surface: u32, placement: PopupPlacement) {
+        self.calls.push(Call::Reposition(surface, placement));
     }
 
     fn destroy(&mut self, surface: u32) {
@@ -125,6 +136,10 @@ impl RootlessRenderer for Images {
             row.fill(if striped { !self.colour } else { self.colour });
         }
         true
+    }
+
+    fn cursor_key(&self) -> Option<(u32, u64)> {
+        None
     }
 }
 
@@ -353,6 +368,90 @@ fn the_hosts_size_and_close_come_back_as_requests() {
         ]
     );
     assert!(sync(&mut topology, &state, &mut host, &mut images).is_empty());
+}
+
+/// An override-redirect window, once the window it belongs to has been
+/// shown, is a popup on that window exactly where X put it, border and
+/// all; it follows its X window's moves, and once the host takes it away
+/// it is not made again until its X window maps anew.
+#[test]
+fn an_override_redirect_window_is_a_popup_where_x_put_it() {
+    let mut state = ServerState::new();
+    let mut host = Host::default();
+    let mut images = images();
+    let mut topology = Topology::new();
+    let _owner = top_level(&mut state, 0x0030_0001, 0x40, (200, 100));
+    sync(&mut topology, &state, &mut host, &mut images);
+    host.ready.push(1);
+    topology.configured(1, 200, 100);
+    sync(&mut topology, &state, &mut host, &mut images);
+    host.take();
+
+    // At (60, 70) on the root with a 1-pixel border; the owner is at
+    // (10, 20).
+    let menu = ResourceId(0x0030_0002);
+    state.resources.create_window(
+        ClientId(CLIENT),
+        CreateWindowRequest {
+            depth: 24,
+            window: menu,
+            parent: ROOT_WINDOW,
+            x: 60,
+            y: 70,
+            width: 30,
+            height: 40,
+            border_width: 1,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    if let Some(w) = state.resources.window_mut(menu) {
+        w.host_xid = Some(WindowHandle::from_raw_for_test(0x41));
+        w.override_redirect = true;
+    }
+    let _ = state.resources.map_window(menu);
+    sync(&mut topology, &state, &mut host, &mut images);
+    let placed = PopupPlacement {
+        at: (49, 49),
+        size: (32, 42),
+    };
+    assert_eq!(host.take(), [Call::Popup(1, placed)]);
+    assert_eq!(topology.host_xid_of(2), Some(0x41));
+
+    host.ready.push(2);
+    topology.configured(2, 32, 42);
+    sync(&mut topology, &state, &mut host, &mut images);
+    assert_eq!(
+        host.take(),
+        [Call::Draw(2, (32, 42), vec![]), Call::Frame(2)],
+        "drawn with its border"
+    );
+
+    if let Some(w) = state.resources.window_mut(menu) {
+        w.x = 70;
+    }
+    sync(&mut topology, &state, &mut host, &mut images);
+    let moved = PopupPlacement {
+        at: (59, 49),
+        ..placed
+    };
+    assert_eq!(host.take(), [Call::Reposition(2, moved)]);
+
+    topology.popup_dismissed(&mut host, 2);
+    assert_eq!(host.take(), [Call::Destroy(2)]);
+    sync(&mut topology, &state, &mut host, &mut images);
+    assert_eq!(host.take(), [], "a dismissed popup stays dismissed");
+
+    let _ = state.resources.unmap_window(menu);
+    sync(&mut topology, &state, &mut host, &mut images);
+    let _ = state.resources.map_window(menu);
+    sync(&mut topology, &state, &mut host, &mut images);
+    assert_eq!(
+        host.take(),
+        [Call::Popup(1, moved)],
+        "made again once mapped anew"
+    );
 }
 
 #[test]

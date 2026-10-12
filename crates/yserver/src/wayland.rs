@@ -23,6 +23,10 @@
 //!   a window's own title bar (`_NET_WM_MOVERESIZE`) the compositor's drag.
 //! * **The clipboard** follows X's `CLIPBOARD` and `PRIMARY` both ways
 //!   ([`clipboard`]).
+//! * **Menus and tooltips**, X's override-redirect windows, are
+//!   `xdg_popup`s where X put them (`yserver_core::rootless::popups`), and
+//!   **the seat** -- keys, pointer, wheel, focus and cursor -- comes into X
+//!   through `yserver_core::rootless::seat` ([`input`]).
 
 use std::{io, os::fd::RawFd, time::Instant};
 
@@ -38,6 +42,7 @@ use crate::{
 };
 
 mod clipboard;
+mod input;
 pub mod toolkit;
 pub mod transport;
 
@@ -61,6 +66,8 @@ const WM_SUPPORTED: &[&str] = &[
 pub struct WaylandHost<T> {
     transport: T,
     topology: Topology<Surface>,
+    /// The seat's state ([`input`]).
+    seat: input::Seat,
     /// X's selections and the compositor's clipboard ([`clipboard`]);
     /// `None` when the compositor has no `ext_data_control_v1`.
     clipboard: Option<clipboard::Clipboard>,
@@ -80,12 +87,13 @@ impl<T: Transport> WaylandHost<T> {
         Self {
             transport,
             topology: Topology::new(),
+            seat: input::Seat::default(),
             clipboard,
             wm_name,
         }
     }
 
-    fn handle(&mut self, event: Event) {
+    fn handle(&mut self, state: &mut ServerState, renderer: &mut dyn Renderer, event: Event) {
         match event {
             Event::Frame(surface) => self.topology.frame_done(surface),
             Event::Configure {
@@ -93,7 +101,18 @@ impl<T: Transport> WaylandHost<T> {
                 width,
                 height,
             } => self.topology.configured(surface, width, height),
+            Event::PopupDone(surface) => {
+                self.topology.popup_dismissed(&mut self.transport, surface);
+            }
             Event::Close(surface) => self.topology.close_requested(surface),
+            Event::Pointer(event) => {
+                self.seat
+                    .pointer(&mut self.topology, state, renderer, event);
+            }
+            Event::Keyboard(event) => {
+                self.seat
+                    .keyboard(&mut self.topology, state, renderer, event);
+            }
             event @ (Event::Selection { .. } | Event::Send { .. } | Event::Cancelled(_)) => {
                 if let Some(clipboard) = self.clipboard.as_mut() {
                     clipboard.event(&mut self.transport, event);
@@ -135,13 +154,9 @@ impl<T: Transport> RootlessHost for WaylandHost<T> {
         (&self.wm_name, WM_SUPPORTED)
     }
 
-    fn dispatch(
-        &mut self,
-        _state: &mut ServerState,
-        _renderer: &mut dyn Renderer,
-    ) -> io::Result<()> {
+    fn dispatch(&mut self, state: &mut ServerState, renderer: &mut dyn Renderer) -> io::Result<()> {
         for event in self.transport.dispatch()? {
-            self.handle(event);
+            self.handle(state, renderer, event);
         }
         Ok(())
     }
@@ -166,6 +181,7 @@ impl<T: Transport> RootlessHost for WaylandHost<T> {
             self.transport.drag(surface, edges);
         }
         let requests = self.topology.sync(state, &mut self.transport, renderer);
+        self.seat.sync_cursor(&mut self.transport, renderer);
         if let Some(clipboard) = self.clipboard.as_mut() {
             clipboard.sync(&mut self.transport, state, renderer);
         }
