@@ -10,9 +10,11 @@
 //! Xorg serves VidMode's read requests even to clients without mode-setting
 //! permission. Yserver mirrors that read surface from the selected RANDR
 //! output: one active mode, monitor/timing information, viewport `(0, 0)`,
-//! and the same gamma ramp exposed through RANDR. Mode-setting and gamma
-//! writes remain disabled; the core dispatcher rejects them with VidMode's
-//! `ClientNotLocal` error, matching the read-only permission model.
+//! and the same gamma ramp exposed through RANDR. A local client's
+//! `SetGamma` and `LockModeSwitch` succeed with nothing applied and its
+//! `SetGammaRamp` is `BadValue`, as Xwayland answers them; mode setting stays
+//! RANDR's, and the core dispatcher rejects it with VidMode's
+//! `ClientNotLocal` error, as it does every write from a remote client.
 //!
 //! Request bodies reach the parsers here already in host byte order —
 //! `request_swap` has swapped them for a big-endian client — so the
@@ -118,6 +120,12 @@ pub fn parse_client_version(body: &[u8]) -> Option<ClientVersion> {
 #[must_use]
 pub fn parse_gamma_screen(body: &[u8]) -> Option<u16> {
     (body.len() == 28).then(|| u16::from_le_bytes([body[0], body[1]]))
+}
+
+/// The screen of a `LockModeSwitch`: `screen(u16), lock(u16)`.
+#[must_use]
+pub fn parse_lock_mode_switch_screen(body: &[u8]) -> Option<u16> {
+    (body.len() == 4).then(|| u16::from_le_bytes([body[0], body[1]]))
 }
 
 #[must_use]
@@ -263,8 +271,9 @@ pub fn encode_get_dot_clocks_reply(
     out
 }
 
-/// `GetGamma` reports per-screen scalar values, not the CRTC LUT. Because
-/// yserver rejects `SetGamma`, the state remains Xorg's identity default.
+/// `GetGamma` reports per-screen scalar values, not the CRTC LUT. `SetGamma`
+/// applies nothing (as Xwayland's), so the state remains Xorg's identity
+/// default.
 #[must_use]
 pub fn encode_get_gamma_reply(byte_order: ClientByteOrder, sequence: SequenceNumber) -> Vec<u8> {
     let mut out = reply_prefix(byte_order, sequence, 0);

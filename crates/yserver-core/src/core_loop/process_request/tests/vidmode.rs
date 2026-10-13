@@ -855,3 +855,37 @@ fn xf86vidmode_mode_line_agrees_with_randr_mode_info() {
     assert_eq!(mode.flags, info.mode_flags);
     assert_eq!(mode.dot_clock, (info.dot_clock + 500) / 1000);
 }
+
+/// A local client, told it may write, has SetGamma and LockModeSwitch
+/// succeed with no reply and nothing applied, as Xwayland answers them,
+/// SetGammaRamp refused with BadValue, and mode setting still refused
+/// with ClientNotLocal; a wrong length is BadLength.
+#[test]
+fn xf86vidmode_local_gamma_writes_answer_as_xwayland() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    state.clients.get_mut(&1).expect("test client").is_local = true;
+    let x = yserver_protocol::x11::xf86vidmode::SET_GAMMA;
+    let mut set_gamma = vec![0u8; 28];
+    set_gamma[4..8].copy_from_slice(&5_000u32.to_le_bytes());
+    assert!(dispatch_vidmode(&mut state, &mut peer, 1, x, &set_gamma).is_empty());
+    let gamma = dispatch_vidmode(&mut state, &mut peer, 2, 16, &[0u8; 28]);
+    assert_eq!(gamma[0], 1, "GetGamma replies");
+    assert_eq!(u32::from_le_bytes(gamma[8..12].try_into().unwrap()), 10_000);
+    assert!(dispatch_vidmode(&mut state, &mut peer, 3, 5, &[0, 0, 1, 0]).is_empty());
+    let short = dispatch_vidmode(&mut state, &mut peer, 4, x, &[0u8; 4]);
+    assert_vidmode_error(&short, x11::error::BAD_LENGTH, x);
+    let ramp = dispatch_vidmode(&mut state, &mut peer, 5, 18, &[0u8; 8]);
+    assert_vidmode_error(&ramp, x11::error::BAD_VALUE, 18);
+    for (seq, minor) in [2u8, 3, 7, 8, 10, 12].into_iter().enumerate() {
+        #[allow(clippy::cast_possible_truncation)]
+        let seq = seq as u16 + 10;
+        let reply = dispatch_vidmode(&mut state, &mut peer, seq, minor, &[]);
+        assert_vidmode_error(
+            &reply,
+            crate::nested::XF86VIDMODE_FIRST_ERROR
+                + yserver_protocol::x11::xf86vidmode::CLIENT_NOT_LOCAL,
+            minor,
+        );
+    }
+}

@@ -478,19 +478,67 @@ pub(super) fn handle_xf86vidmode_request(
             };
             return write_vidmode_reply(state, client_id, &reply);
         }
-        // Yserver is Unix-socket-only, so these clients are physically local.
-        // We nevertheless expose Xorg's coherent non-local/read-only VidMode
-        // policy: RANDR owns all writes, permissions omit WRITE, and known
-        // write minors fail with the matching extension error.
+        // A local client is told it may write (GetPermissions), so the gamma
+        // and lock writes answer as Xwayland's vidmode hooks do
+        // (hw/xwayland/xwayland-vidmode.c): SetGamma and LockModeSwitch are
+        // "unsupported for now, but pretend it works" and succeed with
+        // nothing applied, so GetGamma still reads 1.0; SetGammaRamp returns
+        // FALSE, which Xext/vidmode.c answers with BadValue. Wine's X driver
+        // sets the gamma through SetGamma with no error handler, and an
+        // error there ended the program that asked.
+        x11vm::SET_GAMMA | x11vm::LOCK_MODE_SWITCH => {
+            let screen = if header.data == x11vm::SET_GAMMA {
+                x11vm::parse_gamma_screen(body)
+            } else {
+                x11vm::parse_lock_mode_switch_screen(body)
+            };
+            let Some(screen) = screen else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    XF86VIDMODE_MAJOR_OPCODE,
+                );
+            };
+            if let Err((code, bad_value)) = vidmode_screen_number(u32::from(screen)) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    bad_value,
+                    u16::from(header.data),
+                    XF86VIDMODE_MAJOR_OPCODE,
+                );
+            }
+        }
+        x11vm::SET_GAMMA_RAMP => {
+            let code = if body.len() < 4 {
+                x11::error::BAD_LENGTH
+            } else {
+                x11::error::BAD_VALUE
+            };
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                0,
+                u16::from(header.data),
+                XF86VIDMODE_MAJOR_OPCODE,
+            );
+        }
+        // Mode setting stays RANDR's: these fail with the extension's
+        // ClientNotLocal error, as for a client Xorg does not let write.
         x11vm::MOD_MODE_LINE
         | x11vm::SWITCH_MODE
-        | x11vm::LOCK_MODE_SWITCH
         | x11vm::ADD_MODE_LINE
         | x11vm::DELETE_MODE_LINE
         | x11vm::SWITCH_TO_MODE
-        | x11vm::SET_VIEW_PORT
-        | x11vm::SET_GAMMA
-        | x11vm::SET_GAMMA_RAMP => {
+        | x11vm::SET_VIEW_PORT => {
             return emit_x11_error_with_minor(
                 state,
                 client_id,
