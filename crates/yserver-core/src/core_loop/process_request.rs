@@ -16703,19 +16703,67 @@ fn handle_xf86vidmode_request(
             };
             return write_vidmode_reply(state, client_id, &reply);
         }
-        // Yserver is Unix-socket-only, so these clients are physically local.
-        // We nevertheless expose Xorg's coherent non-local/read-only VidMode
-        // policy: RANDR owns all writes, permissions omit WRITE, and known
-        // write minors fail with the matching extension error.
+        // A local client is told it may write (GetPermissions), so the gamma
+        // and lock writes answer as Xwayland's vidmode hooks do
+        // (hw/xwayland/xwayland-vidmode.c): SetGamma and LockModeSwitch are
+        // "unsupported for now, but pretend it works" and succeed with
+        // nothing applied, so GetGamma still reads 1.0; SetGammaRamp returns
+        // FALSE, which Xext/vidmode.c answers with BadValue. Wine's X driver
+        // sets the gamma through SetGamma with no error handler, and an
+        // error there ended the program that asked.
+        x11vm::SET_GAMMA | x11vm::LOCK_MODE_SWITCH => {
+            let screen = if header.data == x11vm::SET_GAMMA {
+                x11vm::parse_gamma_screen(body)
+            } else {
+                x11vm::parse_lock_mode_switch_screen(body)
+            };
+            let Some(screen) = screen else {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    x11::error::BAD_LENGTH,
+                    0,
+                    u16::from(header.data),
+                    XF86VIDMODE_MAJOR_OPCODE,
+                );
+            };
+            if let Err((code, bad_value)) = vidmode_screen_number(u32::from(screen)) {
+                return emit_x11_error_with_minor(
+                    state,
+                    client_id,
+                    sequence,
+                    code,
+                    bad_value,
+                    u16::from(header.data),
+                    XF86VIDMODE_MAJOR_OPCODE,
+                );
+            }
+        }
+        x11vm::SET_GAMMA_RAMP => {
+            let code = if body.len() < 4 {
+                x11::error::BAD_LENGTH
+            } else {
+                x11::error::BAD_VALUE
+            };
+            return emit_x11_error_with_minor(
+                state,
+                client_id,
+                sequence,
+                code,
+                0,
+                u16::from(header.data),
+                XF86VIDMODE_MAJOR_OPCODE,
+            );
+        }
+        // Mode setting stays RANDR's: these fail with the extension's
+        // ClientNotLocal error, as for a client Xorg does not let write.
         x11vm::MOD_MODE_LINE
         | x11vm::SWITCH_MODE
-        | x11vm::LOCK_MODE_SWITCH
         | x11vm::ADD_MODE_LINE
         | x11vm::DELETE_MODE_LINE
         | x11vm::SWITCH_TO_MODE
-        | x11vm::SET_VIEW_PORT
-        | x11vm::SET_GAMMA
-        | x11vm::SET_GAMMA_RAMP => {
+        | x11vm::SET_VIEW_PORT => {
             return emit_x11_error_with_minor(
                 state,
                 client_id,
@@ -49783,6 +49831,40 @@ mod tests {
             put_u32(&mut body, 24, mode.flags, byte_order);
         }
         body
+    }
+
+    /// A local client, told it may write, has SetGamma and LockModeSwitch
+    /// succeed with no reply and nothing applied, as Xwayland answers them,
+    /// SetGammaRamp refused with BadValue, and mode setting still refused
+    /// with ClientNotLocal; a wrong length is BadLength.
+    #[test]
+    fn xf86vidmode_local_gamma_writes_answer_as_xwayland() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        state.clients.get_mut(&1).expect("test client").is_local = true;
+        let x = yserver_protocol::x11::xf86vidmode::SET_GAMMA;
+        let mut set_gamma = vec![0u8; 28];
+        set_gamma[4..8].copy_from_slice(&5_000u32.to_le_bytes());
+        assert!(dispatch_vidmode(&mut state, &mut peer, 1, x, &set_gamma).is_empty());
+        let gamma = dispatch_vidmode(&mut state, &mut peer, 2, 16, &[0u8; 28]);
+        assert_eq!(gamma[0], 1, "GetGamma replies");
+        assert_eq!(u32::from_le_bytes(gamma[8..12].try_into().unwrap()), 10_000);
+        assert!(dispatch_vidmode(&mut state, &mut peer, 3, 5, &[0, 0, 1, 0]).is_empty());
+        let short = dispatch_vidmode(&mut state, &mut peer, 4, x, &[0u8; 4]);
+        assert_vidmode_error(&short, x11::error::BAD_LENGTH, x);
+        let ramp = dispatch_vidmode(&mut state, &mut peer, 5, 18, &[0u8; 8]);
+        assert_vidmode_error(&ramp, x11::error::BAD_VALUE, 18);
+        for (seq, minor) in [2u8, 3, 7, 8, 10, 12].into_iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation)]
+            let seq = seq as u16 + 10;
+            let reply = dispatch_vidmode(&mut state, &mut peer, seq, minor, &[]);
+            assert_vidmode_error(
+                &reply,
+                crate::nested::XF86VIDMODE_FIRST_ERROR
+                    + yserver_protocol::x11::xf86vidmode::CLIENT_NOT_LOCAL,
+                minor,
+            );
+        }
     }
 
     /// Known writes must use the same Xorg non-local branch advertised by

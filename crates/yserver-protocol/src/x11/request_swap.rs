@@ -212,8 +212,20 @@ const fn xf86vidmode_request_swap_table(minor: u8) -> Option<&'static [FieldEntr
     Some(match minor {
         // QueryVersion (0) has an empty body. ValidateModeLine (9) stays
         // unswapped for its version-aware parser. Rejected write requests are
-        // not inspected.
-        1 | 4 | 6 | 11 | 13 | 16 | 19 | 20 => SCREEN,
+        // not inspected. SetGamma (15) is read for its screen alone, its
+        // values never applied.
+        1 | 4 | 6 | 11 | 13 | 15 | 16 | 19 | 20 => SCREEN,
+        // LockModeSwitch: screen(u16), lock(u16).
+        5 => &[
+            Fixed {
+                offset: 0,
+                kind: U16,
+            },
+            Fixed {
+                offset: 2,
+                kind: U16,
+            },
+        ],
         // GetGammaRamp: screen(u16), size(u16).
         17 => &[
             Fixed {
