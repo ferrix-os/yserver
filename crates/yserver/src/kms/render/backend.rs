@@ -28470,6 +28470,11 @@ impl Backend for KmsBackend {
                                 (PresentBatchWait::Fd(fd), Some(signal))
                             }
                             Ok(None) => (PresentBatchWait::Ready, Some(signal)),
+                            // No `VK_KHR_external_semaphore_fd`: polling is
+                            // the way, not a fault.
+                            Err(ash::vk::Result::ERROR_EXTENSION_NOT_PRESENT) => {
+                                (PresentBatchWait::Poll, Some(signal))
+                            }
                             Err(e) => {
                                 log::warn!(
                                     "enqueue_present_completion: vkGetSemaphoreFdKHR(SYNC_FD) failed: {e:?}; \

@@ -356,7 +356,15 @@ impl PresentCompletionSignal {
         std::mem::replace(&mut self.semaphore, vk::Semaphore::null())
     }
 
+    /// # Errors
+    ///
+    /// `ERROR_EXTENSION_NOT_PRESENT` on a device without
+    /// `VK_KHR_external_semaphore_fd`, whose caller polls the submission's
+    /// fence instead.
     pub(crate) fn export_sync_file_fd(&self) -> Result<Option<OwnedFd>, vk::Result> {
+        if !self.vk.external_semaphore_fd_enabled {
+            return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
+        }
         let info = vk::SemaphoreGetFdInfoKHR::default()
             .semaphore(self.semaphore)
             .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
@@ -370,7 +378,14 @@ fn create_present_completion_signal(
 ) -> Result<PresentCompletionSignal, vk::Result> {
     let mut export_info = vk::ExportSemaphoreCreateInfo::default()
         .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-    let create_info = vk::SemaphoreCreateInfo::default().push_next(&mut export_info);
+    // Without `VK_KHR_external_semaphore_fd` the semaphore is a plain one,
+    // which the submission still signals; `export_sync_file_fd` says it
+    // cannot be exported.
+    let create_info = if vk.external_semaphore_fd_enabled {
+        vk::SemaphoreCreateInfo::default().push_next(&mut export_info)
+    } else {
+        vk::SemaphoreCreateInfo::default()
+    };
     let semaphore = unsafe { vk.device.create_semaphore(&create_info, None)? };
     Ok(PresentCompletionSignal { vk, semaphore })
 }
@@ -5100,6 +5115,7 @@ impl PlatformBackend {
         let sync_fd = match signal.export_sync_file_fd() {
             Ok(Some(fd)) => fd,
             Ok(None) => return,
+            Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT) => return,
             Err(e) => {
                 log::warn!("glx-tfp: export_sync_file for write-fence publish failed: {e:?}");
                 return;

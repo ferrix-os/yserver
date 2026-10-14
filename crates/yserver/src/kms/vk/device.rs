@@ -168,6 +168,12 @@ pub struct VkContext {
     pub(crate) drm_physical_devices: Vec<VulkanDrmPhysicalDevice>,
     pub device: ash::Device,
     pub external_semaphore_fd: ash::khr::external_semaphore_fd::Device,
+    /// Whether `VK_KHR_external_semaphore_fd` is enabled on the device. Every
+    /// driver with a DRM device has it; lavapipe without the kernel's
+    /// `sync_file` (Ferrix) does not, and there a call through
+    /// `external_semaphore_fd` panics in ash for want of the function.
+    /// Present completions then fall back to polling their fence.
+    pub(crate) external_semaphore_fd_enabled: bool,
     pub external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
     pub image_drm_format_modifier_ext: Option<ash::ext::image_drm_format_modifier::Device>,
     /// True when `VK_EXT_image_drm_format_modifier` is enabled on the
@@ -563,6 +569,8 @@ impl VkContext {
             .contains(vk::QueueFlags::COMPUTE);
         let external_semaphore_fd =
             ash::khr::external_semaphore_fd::Device::new(&instance, &device);
+        let external_semaphore_fd_enabled =
+            device_extension_names.contains(&ash::khr::external_semaphore_fd::NAME);
         let external_memory_fd_supported =
             device_extension_names.contains(&ash::khr::external_memory_fd::NAME);
         let external_memory_fd = if external_memory_fd_supported {
@@ -618,6 +626,7 @@ impl VkContext {
             drm_physical_devices,
             device,
             external_semaphore_fd,
+            external_semaphore_fd_enabled,
             external_memory_fd,
             image_drm_format_modifier_ext,
             image_drm_format_modifier,

@@ -2946,6 +2946,11 @@ impl RenderEngine {
                             Some(signal) => match signal.export_sync_file_fd() {
                                 Ok(Some(fd)) => (PresentBatchWait::Fd(fd), Some(signal)),
                                 Ok(None) => (PresentBatchWait::Ready, Some(signal)),
+                                // No `VK_KHR_external_semaphore_fd`: polling
+                                // is the way, not a fault.
+                                Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT) => {
+                                    (PresentBatchWait::Poll, Some(signal))
+                                }
                                 Err(e) => {
                                     log::warn!(
                                         "B.3 close_open_frame: vkGetSemaphoreFdKHR(SYNC_FD) \

@@ -40,6 +40,9 @@ pub(crate) fn import_optional_sync_file(
     vk: &VkContext,
     fd: Option<OwnedFd>,
 ) -> Result<vk::Semaphore, vk::Result> {
+    if !vk.external_semaphore_fd_enabled {
+        return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
+    }
     let create_info = vk::SemaphoreCreateInfo::default();
     let semaphore = unsafe { vk.device.create_semaphore(&create_info, None)? };
     let raw = optional_sync_file_raw(fd.as_ref().map(AsRawFd::as_raw_fd));
@@ -79,6 +82,9 @@ fn optional_sync_file_raw(fd: Option<RawFd>) -> RawFd {
 /// ownership transfers to the caller (Vulkan's internal copy is
 /// disjoint from this fd).
 pub fn export_sync_file(vk: &VkContext, semaphore: vk::Semaphore) -> Result<OwnedFd, vk::Result> {
+    if !vk.external_semaphore_fd_enabled {
+        return Err(vk::Result::ERROR_EXTENSION_NOT_PRESENT);
+    }
     let info = vk::SemaphoreGetFdInfoKHR::default()
         .semaphore(semaphore)
         .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
