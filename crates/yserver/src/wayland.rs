@@ -66,8 +66,8 @@
 //! SetInputFocus for the keyboard's enter and leave.
 //!
 //! The root's RandR output has a Present clock of its own ([`clock`]): an
-//! MSC each frame the compositor shows, and each refresh period between
-//! them. `KmsBackend` answers the core's Present clock questions for the
+//! MSC each refresh period of the compositor's screen, drawn or not, which
+//! the compositor's frames follow rather than set. `KmsBackend` answers the core's Present clock questions for the
 //! output's CRTC from it (`present_get_ust_msc`, the arming calls, and
 //! `next_wakeup` for a wake that is armed).
 //!
@@ -229,8 +229,8 @@ impl WaylandLink {
         let refresh = first_refresh_mhz(&client);
         let clock = clock::FrameClock::new(clock::monotonic_us(), refresh);
         log::info!(
-            "wayland: the Present clock runs at {} us an MSC, the compositor's {} mHz",
-            clock.period(),
+            "wayland: the Present clock runs at {} ns an MSC, the compositor's {} mHz",
+            clock.period_ns(),
             refresh
         );
         Ok(Self {
@@ -327,8 +327,9 @@ impl WaylandLink {
                 if let Some(frames) = self.frames_of(surface) {
                     frames.pending = false;
                 }
-                // The compositor's refresh, seen: the Present clock's MSC.
-                self.clock.frame(clock::monotonic_us());
+                // The Present clock does not follow the frame: the
+                // compositor drew it when this server's commit came, after
+                // the MSC it shows began ([`clock`]).
             }
             Event::Configure {
                 surface,
