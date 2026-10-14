@@ -460,6 +460,14 @@ impl Platform for PlatformBackend {
     }
 
     fn present_scanout_blackout(b: &KmsBackend) -> bool {
+        // A client of a compositor has no KMS output to be dark, and its
+        // Present clock runs regardless (`crate::wayland`'s `clock`):
+        // parked completions wait for their MSC rather than being flushed
+        // at the one the clock is in.
+        #[cfg(feature = "wayland")]
+        if b.pstate.wayland.is_some() {
+            return false;
+        }
         !(b.scanout_allowed() && b.kms_outputs_active)
     }
 
