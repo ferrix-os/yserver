@@ -266,6 +266,48 @@ mod tests {
     }
 
     #[test]
+    fn a_client_paced_by_the_msc_measures_one_refresh_however_late_it_is_woken() {
+        // What moved the clock before it kept its own period: a client
+        // waits for the next MSC each frame, the core comes round late by
+        // its own latency, the client draws, and the frame it drew comes
+        // back from the compositor later still. None of it moves the
+        // clock: each MSC the client is told of is the one after the last,
+        // one refresh after it, as Xorg's `present_fake` would say, and a
+        // stall misses the MSCs it lasted.
+        let start = 2_000_000;
+        let mut clock = FrameClock::new(start, HZ75);
+        let mut now = start;
+        let mut last = clock.sample(now);
+        for frame in 1..=750_u64 {
+            assert!(clock.arm(now), "frame {frame}: nothing was armed");
+            let wake = clock.wake().expect("armed");
+            // Woken 0 to 3 ms late, or every 250th frame 50 ms late: a
+            // stall of 3.75 MSCs, which with the drawing after it still
+            // ends inside the MSC it reached.
+            let stall = if frame % 250 == 0 { 50_000 } else { 0 };
+            let late = if stall > 0 {
+                0
+            } else {
+                (frame * 7_919) % 3_000
+            };
+            now = wake + late + stall;
+            clock.expire(now);
+            assert_eq!(clock.wake(), None, "frame {frame}: the wake was spent");
+            let told = clock.sample(now);
+            let missed = told.0 - last.0 - 1;
+            assert_eq!(missed, if stall > 0 { 3 } else { 0 }, "frame {frame}");
+            let step = (told.1 - last.1) / (missed + 1);
+            assert!(
+                (13_334..=13_335).contains(&step),
+                "frame {frame}: an MSC of {step} us"
+            );
+            last = told;
+            // Drawing and handing the frame over: 2.4 ms more.
+            now += 2_400;
+        }
+    }
+
+    #[test]
     fn the_monotonic_clock_moves_forward() {
         let first = monotonic_us();
         let second = monotonic_us();
