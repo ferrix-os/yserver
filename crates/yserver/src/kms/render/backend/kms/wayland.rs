@@ -28,6 +28,40 @@ impl KmsBackend {
         Ok(())
     }
 
+    /// The Wayland link, when `crtc_id` is its RandR output's CRTC, whose
+    /// Present clock is the link's (`crate::wayland`'s `clock`) rather than
+    /// a kernel's.
+    pub(in crate::kms::render::backend) fn wayland_present_clock(
+        &self,
+        crtc_id: u32,
+    ) -> Option<&crate::wayland::WaylandLink> {
+        self.pstate
+            .wayland
+            .as_ref()
+            .filter(|_| self.is_wayland_present_crtc(crtc_id))
+    }
+
+    /// As [`Self::wayland_present_clock`], to arm its wake.
+    pub(in crate::kms::render::backend) fn wayland_present_clock_mut(
+        &mut self,
+        crtc_id: u32,
+    ) -> Option<&mut crate::wayland::WaylandLink> {
+        if self.is_wayland_present_crtc(crtc_id) {
+            self.pstate.wayland.as_mut()
+        } else {
+            None
+        }
+    }
+
+    pub(in crate::kms::render::backend) fn is_wayland_present_crtc(&self, crtc_id: u32) -> bool {
+        crtc_id != 0
+            && self.pstate.wayland.is_some()
+            && self
+                .pstate
+                .wayland_randr_ids
+                .is_some_and(|(_, wayland_crtc, _)| wayland_crtc == crtc_id)
+    }
+
     /// The Wayland backend's RandR topology: one connected output,
     /// `WAYLAND-1`, covering the virtual screen, which is the compositor's
     /// screen (`attach_wayland`). The X screen's size is derived from the

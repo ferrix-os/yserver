@@ -336,14 +336,20 @@ impl Platform for PlatformBackend {
 
     fn next_wakeup(b: &KmsBackend) -> Option<std::time::Instant> {
         let scanout = KmsBackend::backend_scanout_next_wakeup(b);
-        // A paste between X and the compositor moves a little each
-        // iteration, through pipes the loop does not poll.
         #[cfg(feature = "wayland")]
-        if let Some(link) = b.pstate.wayland.as_ref()
-            && link.clipboard_busy()
-        {
-            let clipboard = std::time::Instant::now() + std::time::Duration::from_millis(5);
-            return Some(scanout.map_or(clipboard, |at| at.min(clipboard)));
+        if let Some(link) = b.pstate.wayland.as_ref() {
+            // A paste between X and the compositor moves a little each
+            // iteration, through pipes the loop does not poll.
+            let clipboard = link
+                .clipboard_busy()
+                .then(|| std::time::Instant::now() + std::time::Duration::from_millis(5));
+            // The Wayland Present clock's next MSC, while Present work
+            // waits on it.
+            let present_clock = link.present_clock_wake();
+            return [scanout, clipboard, present_clock]
+                .into_iter()
+                .flatten()
+                .min();
         }
         scanout
     }
@@ -430,6 +436,11 @@ impl Platform for PlatformBackend {
     }
 
     fn present_absolute_vblank_arm_supported(b: &KmsBackend, crtc_id: u32) -> bool {
+        // The Wayland Present clock wakes the loop at any MSC asked of it.
+        #[cfg(feature = "wayland")]
+        if b.is_wayland_present_crtc(crtc_id) {
+            return true;
+        }
         KmsBackend::backend_present_present_absolute_vblank_arm_supported(b, crtc_id)
     }
 
@@ -438,6 +449,13 @@ impl Platform for PlatformBackend {
         randr_crtc_id: u32,
         targets: &[u64],
     ) -> io::Result<usize> {
+        // The Wayland Present clock comes round at each MSC while armed,
+        // which covers every target.
+        #[cfg(feature = "wayland")]
+        if let Some(link) = b.wayland_present_clock_mut(randr_crtc_id) {
+            link.arm_present_clock();
+            return Ok(targets.len());
+        }
         KmsBackend::backend_present_arm_present_absolute_vblank(b, randr_crtc_id, targets)
     }
 
@@ -750,6 +768,10 @@ impl Platform for PlatformBackend {
     }
 
     fn present_get_ust_msc(b: &KmsBackend, crtc_id: u32) -> (u64, u64) {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = b.wayland_present_clock(crtc_id) {
+            return link.present_clock();
+        }
         KmsBackend::backend_present_present_get_ust_msc(b, crtc_id)
     }
 
@@ -757,6 +779,15 @@ impl Platform for PlatformBackend {
         b: &KmsBackend,
         crtc_id: u32,
     ) -> yserver_core::backend::PresentClockSample {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = b.wayland_present_clock(crtc_id) {
+            let (msc, ust) = link.present_clock();
+            return yserver_core::backend::PresentClockSample {
+                msc,
+                ust,
+                source: yserver_core::backend::PresentClockSource::BackendVblank,
+            };
+        }
         KmsBackend::backend_present_present_get_completion_clock(b, crtc_id)
     }
 
@@ -765,6 +796,12 @@ impl Platform for PlatformBackend {
         crtc_id: u32,
         target_mscs: &[u64],
     ) -> std::io::Result<usize> {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = b.wayland_present_clock_mut(crtc_id) {
+            return Ok(usize::from(
+                !target_mscs.is_empty() && link.arm_present_clock(),
+            ));
+        }
         b.arm_idle_vblanks_ioctl(crtc_id, target_mscs)
     }
 
@@ -773,6 +810,12 @@ impl Platform for PlatformBackend {
         crtc_id: u32,
         target_mscs: &[u64],
     ) -> std::io::Result<usize> {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = b.wayland_present_clock_mut(crtc_id) {
+            return Ok(usize::from(
+                !target_mscs.is_empty() && link.arm_present_clock(),
+            ));
+        }
         KmsBackend::backend_present_arm_present_completion_idle_vblanks(b, crtc_id, target_mscs)
     }
 
