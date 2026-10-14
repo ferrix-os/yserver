@@ -65,6 +65,12 @@
 //! `set_input_focus_for_server` in `process_request.rs`, the server's own
 //! SetInputFocus for the keyboard's enter and leave.
 //!
+//! The root's RandR output has a Present clock of its own ([`clock`]): an
+//! MSC each frame the compositor shows, and each refresh period between
+//! them. `KmsBackend` answers the core's Present clock questions for the
+//! output's CRTC from it (`present_get_ust_msc`, the arming calls, and
+//! `next_wakeup` for a wake that is armed).
+//!
 //! The clipboard's core pieces are `ServerState::server_selection_events`,
 //! where what the selection protocol sends the server's own window is
 //! queued, and the server's own selection requests in `process_request.rs`
@@ -110,6 +116,7 @@ pub enum Request {
 }
 
 mod clipboard;
+mod clock;
 mod input;
 mod popups;
 pub use input::CursorSource;
@@ -199,6 +206,8 @@ pub struct WaylandLink {
     /// directions ([`clipboard`]); `None` when the compositor has no
     /// `ext_data_control_v1`.
     clipboard: Option<clipboard::Clipboard>,
+    /// The Present clock of the root's RandR output ([`clock`]).
+    clock: clock::FrameClock,
 }
 
 impl WaylandLink {
@@ -217,7 +226,15 @@ impl WaylandLink {
         if clipboard.is_none() {
             log::warn!("wayland: the compositor has no ext_data_control_v1; no clipboard");
         }
+        let refresh = first_refresh_mhz(&client);
+        let clock = clock::FrameClock::new(clock::monotonic_us(), refresh);
+        log::info!(
+            "wayland: the Present clock runs at {} us an MSC, the compositor's {} mHz",
+            clock.period(),
+            refresh
+        );
         Ok(Self {
+            clock,
             clipboard,
             client,
             toplevels: HashMap::new(),
@@ -256,13 +273,31 @@ impl WaylandLink {
     /// there is no screen or it gave no rate.
     #[must_use]
     pub fn screen_refresh_hz(&self) -> Option<u32> {
-        let output = self
-            .client
-            .outputs()
-            .into_iter()
-            .find(|output| output.done)?;
-        let hz = (output.refresh_mhz + 500) / 1000;
+        let hz = (first_refresh_mhz(&self.client) + 500) / 1000;
         u32::try_from(hz).ok().filter(|&hz| hz > 0)
+    }
+
+    /// The Present clock's `(msc, ust)` now ([`clock`]): what a kernel's
+    /// last vblank is to a server on a DRM card.
+    #[must_use]
+    pub fn present_clock(&self) -> (u64, u64) {
+        self.clock.sample(clock::monotonic_us())
+    }
+
+    /// Present work waits on a later MSC: have the core loop come round
+    /// when the next one begins. Whether a wake was newly armed; `false`
+    /// when one already is.
+    pub fn arm_present_clock(&mut self) -> bool {
+        self.clock.arm(clock::monotonic_us())
+    }
+
+    /// When the core loop must come round for the Present clock, if a wake
+    /// is armed.
+    #[must_use]
+    pub fn present_clock_wake(&self) -> Option<std::time::Instant> {
+        let wake = self.clock.wake()?;
+        let now = clock::monotonic_us();
+        Some(std::time::Instant::now() + Duration::from_micros(wake.saturating_sub(now)))
     }
 
     /// Read what the compositor sent, without blocking, and act on it.
@@ -292,6 +327,8 @@ impl WaylandLink {
                 if let Some(frames) = self.frames_of(surface) {
                     frames.pending = false;
                 }
+                // The compositor's refresh, seen: the Present clock's MSC.
+                self.clock.frame(clock::monotonic_us());
             }
             Event::Configure {
                 surface,
@@ -441,6 +478,13 @@ impl WaylandLink {
     /// top-levels, and hand over each image that changed and whose last
     /// frame the compositor has shown. Once per loop iteration.
     pub fn sync(&mut self, state: &ServerState, images: &mut dyn WindowImages) {
+        // The Present clock's armed wake is spent once the loop has come
+        // round for it (the core arms again for what still waits), and it
+        // follows the screen's rate.
+        let now = clock::monotonic_us();
+        self.clock.expire(now);
+        self.clock.set_refresh(now, first_refresh_mhz(&self.client));
+
         let mut wanted: Vec<(u32, &Window)> = state
             .resources
             .children(ROOT_WINDOW)
@@ -583,6 +627,17 @@ impl WaylandLink {
             log::warn!("wayland: flush: {error}");
         }
     }
+}
+
+/// The refresh of the compositor's first described screen, in millihertz;
+/// 0 when there is none or it gave no rate.
+fn first_refresh_mhz(client: &Client) -> u64 {
+    client
+        .outputs()
+        .into_iter()
+        .find(|output| output.done)
+        .and_then(|output| u64::try_from(output.refresh_mhz).ok())
+        .unwrap_or(0)
 }
 
 /// Hand the compositor `window`'s image when it changed and its last frame

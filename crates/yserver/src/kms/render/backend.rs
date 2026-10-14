@@ -8956,6 +8956,38 @@ impl KmsBackend {
         }
     }
 
+    /// The Wayland link, when `crtc_id` is its RandR output's CRTC, whose
+    /// Present clock is the link's (`crate::wayland`'s `clock`) rather than
+    /// a kernel's.
+    #[cfg(feature = "wayland")]
+    fn wayland_present_clock(&self, crtc_id: u32) -> Option<&crate::wayland::WaylandLink> {
+        self.wayland
+            .as_ref()
+            .filter(|_| self.is_wayland_present_crtc(crtc_id))
+    }
+
+    /// As [`Self::wayland_present_clock`], to arm its wake.
+    #[cfg(feature = "wayland")]
+    fn wayland_present_clock_mut(
+        &mut self,
+        crtc_id: u32,
+    ) -> Option<&mut crate::wayland::WaylandLink> {
+        if self.is_wayland_present_crtc(crtc_id) {
+            self.wayland.as_mut()
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "wayland")]
+    fn is_wayland_present_crtc(&self, crtc_id: u32) -> bool {
+        crtc_id != 0
+            && self.wayland.is_some()
+            && self
+                .wayland_randr_ids
+                .is_some_and(|(_, wayland_crtc, _)| wayland_crtc == crtc_id)
+    }
+
     /// The Wayland backend's RandR topology: one connected output,
     /// `WAYLAND-1`, covering the virtual screen, which is the compositor's
     /// screen (`attach_wayland`). The X screen's size is derived from the
@@ -20646,9 +20678,19 @@ impl Backend for KmsBackend {
             .map(|_| now + std::time::Duration::from_millis(5));
         #[cfg(not(feature = "wayland"))]
         let clipboard_deadline = None;
+        // The Wayland Present clock's next MSC, while Present work waits
+        // on it.
+        #[cfg(feature = "wayland")]
+        let present_clock_deadline = self
+            .wayland
+            .as_ref()
+            .and_then(crate::wayland::WaylandLink::present_clock_wake);
+        #[cfg(not(feature = "wayland"))]
+        let present_clock_deadline = None;
         scene_deadline
             .into_iter()
             .chain(present_deadline)
+            .chain(present_clock_deadline)
             .chain(clipboard_deadline)
             .chain(rescan_deadline)
             // Not gated on `allow_kms_timers`: `maybe_composite` closes the
@@ -21480,6 +21522,11 @@ impl Backend for KmsBackend {
     }
 
     fn present_absolute_vblank_arm_supported(&self, crtc_id: u32) -> bool {
+        // The Wayland Present clock wakes the loop at any MSC asked of it.
+        #[cfg(feature = "wayland")]
+        if self.is_wayland_present_crtc(crtc_id) {
+            return true;
+        }
         self.present_crtc_key(crtc_id).is_some_and(|key| {
             !self
                 .crtc_queue_sequence_unsupported_devices
@@ -21492,6 +21539,13 @@ impl Backend for KmsBackend {
         randr_crtc_id: u32,
         targets: &[u64],
     ) -> io::Result<usize> {
+        // The Wayland Present clock comes round at each MSC while armed,
+        // which covers every target.
+        #[cfg(feature = "wayland")]
+        if let Some(link) = self.wayland_present_clock_mut(randr_crtc_id) {
+            link.arm_present_clock();
+            return Ok(targets.len());
+        }
         let Some(crtc_key) = self.present_crtc_key(randr_crtc_id) else {
             return Ok(0);
         };
@@ -28514,6 +28568,10 @@ impl Backend for KmsBackend {
     }
 
     fn present_get_ust_msc(&self, crtc_id: u32) -> (u64, u64) {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = self.wayland_present_clock(crtc_id) {
+            return link.present_clock();
+        }
         self.present_crtc_key(crtc_id).map_or((0, 0), |crtc_key| {
             self.platform.present_get_ust_msc(crtc_key)
         })
@@ -28523,6 +28581,15 @@ impl Backend for KmsBackend {
         &self,
         crtc_id: u32,
     ) -> yserver_core::backend::PresentClockSample {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = self.wayland_present_clock(crtc_id) {
+            let (msc, ust) = link.present_clock();
+            return yserver_core::backend::PresentClockSample {
+                msc,
+                ust,
+                source: yserver_core::backend::PresentClockSource::BackendVblank,
+            };
+        }
         self.present_crtc_key(crtc_id).map_or(
             yserver_core::backend::PresentClockSample {
                 msc: 0,
@@ -28534,6 +28601,12 @@ impl Backend for KmsBackend {
     }
 
     fn arm_idle_vblanks(&mut self, crtc_id: u32, target_mscs: &[u64]) -> std::io::Result<usize> {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = self.wayland_present_clock_mut(crtc_id) {
+            return Ok(usize::from(
+                !target_mscs.is_empty() && link.arm_present_clock(),
+            ));
+        }
         self.arm_idle_vblanks_ioctl(crtc_id, target_mscs)
     }
 
@@ -28542,6 +28615,12 @@ impl Backend for KmsBackend {
         crtc_id: u32,
         target_mscs: &[u64],
     ) -> std::io::Result<usize> {
+        #[cfg(feature = "wayland")]
+        if let Some(link) = self.wayland_present_clock_mut(crtc_id) {
+            return Ok(usize::from(
+                !target_mscs.is_empty() && link.arm_present_clock(),
+            ));
+        }
         let Some(crtc_key) = self.present_crtc_key(crtc_id) else {
             return Ok(0);
         };
