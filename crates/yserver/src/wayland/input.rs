@@ -27,10 +27,27 @@
 //! * **The cursor** is the X cursor in effect, copied into a buffer and
 //!   given with `wl_pointer.set_cursor` whenever it changes; with none, the
 //!   compositor's arrow.
+//! * **The input's time** (Ferrix's `docs/GAME-PATH.md` §4.7): where the
+//!   compositor serves `zwp_relative_pointer_v1`, the server asks for one
+//!   on the seat's pointer. Its `relative_motion` carries the time the
+//!   input was stamped with when the device reported it, in microseconds of
+//!   `CLOCK_MONOTONIC` (hyprix sends the input core's stamp), and the
+//!   device's own distance. The pointer motion it comes before is handed to
+//!   X with that time, as server milliseconds, and that distance as XI2's
+//!   raw motion; with `YSERVER_INPUT_AGES=1` the server logs
+//!   `input-age stamp <us> xtime <ms> age <us>` as it does, which the
+//!   latency probe pairs with the compositor's and its own.
 
 use std::collections::BTreeSet;
 
-use compositor_toolkit::{CursorShape, Event, KeyboardEvent, PointerEvent, SurfaceId};
+use compositor_toolkit::protocol::core::{WL_POINTER, wl_seat};
+use compositor_toolkit::protocol::relative_pointer::{
+    ZWP_RELATIVE_POINTER_MANAGER_V1, ZWP_RELATIVE_POINTER_V1, zwp_relative_pointer_manager_v1,
+    zwp_relative_pointer_v1,
+};
+use compositor_toolkit::{
+    Client, CursorShape, Event, KeyboardEvent, ObjectId, PointerEvent, SurfaceId, Value,
+};
 use yserver_core::{
     backend::{ActiveCursorImage, Backend},
     core_loop::{
@@ -51,6 +68,12 @@ use super::WaylandLink;
 /// How much `wl_pointer.axis` scroll is one wheel click, where the
 /// compositor does not count clicks itself.
 const SCROLL_PER_CLICK: f64 = 10.0;
+
+/// The oldest a relative motion's time may be and still be taken as the
+/// input's: a compositor whose `relative_motion` time is not
+/// `CLOCK_MONOTONIC` gives a time that is far from now, and then the motion
+/// is handed to X at the server's time instead.
+const OLDEST_STAMP_US: u64 = 10_000_000;
 
 /// What the renderer knows of the cursor in effect.
 pub trait CursorSource {
@@ -80,6 +103,21 @@ pub(super) struct Seat {
     /// The cursor last given to the compositor ([`CursorSource::cursor_key`]);
     /// the outer `None` before the first.
     cursor: Option<Option<(u32, u64)>>,
+    /// The compositor's `zwp_relative_pointer_manager_v1`, where it serves
+    /// one.
+    relative_manager: Option<ObjectId>,
+    /// The `zwp_relative_pointer_v1` on a pointer of the server's own, once
+    /// asked for.
+    relative: Option<ObjectId>,
+    /// Whether the seat has had a pointer, which is when one may be asked
+    /// for.
+    pointed: bool,
+    /// The relative motion since a pointer motion was last handed to X: the
+    /// latest one's time in microseconds of `CLOCK_MONOTONIC`, and the
+    /// distance summed.
+    moved: Option<(u64, f64, f64)>,
+    /// Whether each motion's age is logged (`YSERVER_INPUT_AGES=1`).
+    ages: bool,
 }
 
 impl Seat {
@@ -87,13 +125,107 @@ impl Seat {
     /// back to the caller.
     pub(super) fn take(&mut self, event: Event) -> Option<Event> {
         match event {
-            Event::Keyboard(_) | Event::Pointer(_) => {
+            Event::Keyboard(_) => {
+                self.queue.push(event);
+                None
+            }
+            Event::Pointer(_) => {
+                self.pointed = true;
+                self.queue.push(event);
+                None
+            }
+            // In order with the pointer's own events: a relative motion
+            // comes before the pointer motion it belongs to.
+            Event::Object { object, .. } if Some(object) == self.relative => {
                 self.queue.push(event);
                 None
             }
             other => Some(other),
         }
     }
+
+    /// Bind the compositor's relative pointer manager, where it has one,
+    /// and read whether ages are to be logged.
+    pub(super) fn bind_relative(&mut self, client: &mut Client) {
+        self.relative_manager = client
+            .bind(&ZWP_RELATIVE_POINTER_MANAGER_V1, 1, None)
+            .ok()
+            .map(|(manager, _)| manager);
+        if self.relative_manager.is_none() {
+            log::info!("wayland: no zwp_relative_pointer_manager_v1; input is stamped on arrival");
+        }
+        self.ages = std::env::var("YSERVER_INPUT_AGES").is_ok_and(|value| value == "1");
+    }
+
+    /// Ask for the relative pointer once the seat has a pointer: on a
+    /// `wl_pointer` of the server's own, since the client runtime keeps its
+    /// own to itself. The compositor sends relative motion to every relative
+    /// pointer of the client the pointer is over, whichever `wl_pointer` it
+    /// was made on; the second pointer's own events are not read.
+    pub(super) fn ask_relative(&mut self, client: &mut Client) {
+        let (None, true, Some(manager), Some(seat)) = (
+            self.relative,
+            self.pointed,
+            self.relative_manager,
+            client.seat(),
+        ) else {
+            return;
+        };
+        let pointer = client.new_object(&WL_POINTER, 1);
+        let id = client.new_object(&ZWP_RELATIVE_POINTER_V1, 1);
+        let asked = client
+            .request(
+                seat,
+                wl_seat::request::GET_POINTER,
+                &[Value::NewId(pointer)],
+            )
+            .and_then(|()| {
+                client.request(
+                    manager,
+                    zwp_relative_pointer_manager_v1::request::GET_RELATIVE_POINTER,
+                    &[Value::NewId(id), Value::Object(pointer)],
+                )
+            });
+        match asked {
+            Ok(()) => self.relative = Some(id),
+            Err(error) => {
+                log::warn!("wayland: the relative pointer: {error}");
+                self.relative_manager = None;
+            }
+        }
+    }
+
+    /// One `relative_motion`: its time, and its distance before any
+    /// acceleration, added to what is waiting for the next pointer motion.
+    fn relative_motion(&mut self, opcode: u16, args: &[Value]) {
+        if opcode != zwp_relative_pointer_v1::event::RELATIVE_MOTION {
+            return;
+        }
+        let (Some(high), Some(low)) = (
+            args.first().and_then(Value::as_uint),
+            args.get(1).and_then(Value::as_uint),
+        ) else {
+            return;
+        };
+        let fixed = |at: usize| match args.get(at) {
+            Some(Value::Fixed(value)) => *value,
+            _ => 0.0,
+        };
+        let stamp = (u64::from(high) << 32) | u64::from(low);
+        let (_, dx, dy) = self.moved.unwrap_or((0, 0.0, 0.0));
+        self.moved = Some((stamp, dx + fixed(4), dy + fixed(5)));
+    }
+}
+
+/// The X time of an input stamped `stamp` (microseconds of
+/// `CLOCK_MONOTONIC`) when it is `now`: the server's time less the input's
+/// age. `None` for a stamp from the future or more than
+/// [`OLDEST_STAMP_US`] old, which is not this clock's.
+fn x_time(stamp: u64, now: u64, server_ms: u32) -> Option<u32> {
+    let age = now
+        .checked_sub(stamp)
+        .filter(|age| *age <= OLDEST_STAMP_US)?;
+    Some(server_ms.wrapping_sub(u32::try_from(age / 1000).ok()?))
 }
 
 impl WaylandLink {
@@ -142,6 +274,7 @@ impl WaylandLink {
             match event {
                 Event::Pointer(event) => self.pointer_event(state, backend, event),
                 Event::Keyboard(event) => self.keyboard_event(state, backend, event),
+                Event::Object { opcode, args, .. } => self.seat.relative_motion(opcode, &args),
                 _ => {}
             }
         }
@@ -261,20 +394,42 @@ impl WaylandLink {
 
     /// Tell X the pointer is at [`Seat::at`], which also recomputes the
     /// window it is in and sends the crossings.
-    fn move_pointer(&self, state: &mut ServerState, backend: &mut dyn Backend) {
+    ///
+    /// With the relative motion that came before it, the motion is handed on
+    /// with that motion's time and its distance (the module's comment).
+    fn move_pointer(&mut self, state: &mut ServerState, backend: &mut dyn Backend) {
         let (x, y) = self.seat.at;
+        let now = super::clock::monotonic_us();
+        let server = crate::clock::server_time_ms();
+        let stamped = self
+            .seat
+            .moved
+            .take()
+            .and_then(|(stamp, dx, dy)| Some((stamp, x_time(stamp, now, server)?, dx, dy)));
+        #[allow(clippy::cast_possible_truncation)]
+        let (time, dx, dy) = stamped.map_or((server, 0, 0), |(_, time, dx, dy)| {
+            (time, dx.round() as i32, dy.round() as i32)
+        });
         yserver_core::core_loop::handle_host_input(
             state,
             backend,
             HostInputEvent::PointerMotion {
                 x,
                 y,
-                time: crate::clock::server_time_ms(),
+                time,
                 relative: false,
-                dx: 0,
-                dy: 0,
+                dx,
+                dy,
             },
         );
+        if self.seat.ages
+            && let Some((stamp, ..)) = stamped
+        {
+            log::info!(
+                "input-age stamp {stamp} xtime {time} age {}",
+                super::clock::monotonic_us().saturating_sub(stamp)
+            );
+        }
     }
 
     fn keyboard_event(
@@ -460,6 +615,35 @@ mod tests {
         assert!((residue - 1.0).abs() < 1e-9);
         assert_eq!(clicks(&mut residue, -21.0, 0), -2, "up");
         assert_eq!(clicks(&mut residue, 0.0, -3), -3);
+    }
+
+    #[test]
+    fn an_inputs_x_time_is_the_servers_less_its_age() {
+        assert_eq!(x_time(1_000_000, 1_004_400, 500), Some(496));
+        assert_eq!(x_time(1_000_000, 1_000_000, 0), Some(0));
+        assert_eq!(x_time(1_000_000, 999_000, 500), None, "from the future");
+        assert_eq!(x_time(1, 20_000_000, 500), None, "not this clock");
+    }
+
+    #[test]
+    fn relative_motions_add_up_and_keep_the_latest_time() {
+        let mut seat = Seat::default();
+        let motion = |high: u32, low: u32, dx: f64| {
+            [
+                Value::Uint(high),
+                Value::Uint(low),
+                Value::Fixed(dx * 2.0),
+                Value::Fixed(0.0),
+                Value::Fixed(dx),
+                Value::Fixed(-1.0),
+            ]
+        };
+        let at = zwp_relative_pointer_v1::event::RELATIVE_MOTION;
+        seat.relative_motion(at, &motion(0, 10, 3.0));
+        seat.relative_motion(at, &motion(1, 20, 4.0));
+        assert_eq!(seat.moved, Some(((1 << 32) | 20, 7.0, -2.0)));
+        seat.relative_motion(at + 1, &motion(0, 30, 1.0));
+        assert_eq!(seat.moved, Some(((1 << 32) | 20, 7.0, -2.0)));
     }
 
     #[test]
