@@ -132,7 +132,7 @@ impl WaylandLink {
                 .iter_mut()
                 .find(|popup| popup.host_xid == host_xid)
             {
-                let _ = show(
+                show(
                     client,
                     images,
                     popup.surface,
