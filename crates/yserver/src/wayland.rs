@@ -223,6 +223,8 @@ impl WaylandLink {
             io::Error::new(io::ErrorKind::NotConnected, format!("wayland: {error}"))
         })?;
         let clipboard = clipboard::Clipboard::bind(&mut client);
+        let mut seat = input::Seat::default();
+        seat.bind_relative(&mut client);
         if clipboard.is_none() {
             log::warn!("wayland: the compositor has no ext_data_control_v1; no clipboard");
         }
@@ -239,7 +241,7 @@ impl WaylandLink {
             client,
             toplevels: HashMap::new(),
             renamed: HashSet::new(),
-            seat: input::Seat::default(),
+            seat,
             requests: Vec::new(),
             popups: Vec::new(),
             dismissed: HashSet::new(),
@@ -315,6 +317,7 @@ impl WaylandLink {
         for event in events {
             self.handle(event);
         }
+        self.seat.ask_relative(&mut self.client);
         Ok(())
     }
 
