@@ -37,6 +37,11 @@
 //!   raw motion; with `YSERVER_INPUT_AGES=1` the server logs
 //!   `input-age stamp <us> xtime <ms> age <us>` as it does, which the
 //!   latency probe pairs with the compositor's and its own.
+//! * **A game's pointer lock** ([`super::lock`]): a game that grabs the
+//!   pointer, hides the cursor and warps the pointer to its window's centre
+//!   gets the compositor's `zwp_locked_pointer_v1` on its window, and while
+//!   it is in force each relative motion moves X's pointer by its distance,
+//!   one X motion a motion, from where X has the pointer.
 
 use std::collections::BTreeSet;
 
@@ -44,6 +49,10 @@ use compositor_toolkit::{
     Client, CursorShape, Event, KeyboardEvent, ObjectId, PointerEvent, SurfaceId, Value,
     protocol::{
         core::{WL_POINTER, wl_seat},
+        pointer_constraints::{
+            ZWP_LOCKED_POINTER_V1, ZWP_POINTER_CONSTRAINTS_V1, zwp_locked_pointer_v1,
+            zwp_pointer_constraints_v1,
+        },
         relative_pointer::{
             ZWP_RELATIVE_POINTER_MANAGER_V1, ZWP_RELATIVE_POINTER_V1,
             zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
@@ -65,7 +74,10 @@ use yserver_core::{
 };
 use yserver_protocol::x11::ResourceId;
 
-use super::WaylandLink;
+use super::{
+    WaylandLink,
+    lock::{self, Held, Scene, Verdict},
+};
 
 /// How much `wl_pointer.axis` scroll is one wheel click, where the
 /// compositor does not count clicks itself.
@@ -85,6 +97,11 @@ pub trait CursorSource {
 
     /// The cursor in effect.
     fn cursor_image(&self) -> Option<ActiveCursorImage>;
+
+    /// A client hid the cursor (XFIXES `HideCursor`).
+    fn cursor_hidden(&self) -> bool {
+        false
+    }
 }
 
 /// The seat's state between loop iterations.
@@ -102,9 +119,10 @@ pub(super) struct Seat {
     keys: BTreeSet<u8>,
     /// Scroll that is not yet a whole click: down, right.
     scroll: (f64, f64),
-    /// The cursor last given to the compositor ([`CursorSource::cursor_key`]);
-    /// the outer `None` before the first.
-    cursor: Option<Option<(u32, u64)>>,
+    /// The cursor last given to the compositor ([`CursorSource::cursor_key`])
+    /// and whether a client hid it ([`CursorSource::cursor_hidden`]); `None`
+    /// before the first.
+    cursor: Option<(Option<(u32, u64)>, bool)>,
     /// The compositor's `zwp_relative_pointer_manager_v1`, where it serves
     /// one.
     relative_manager: Option<ObjectId>,
@@ -120,6 +138,34 @@ pub(super) struct Seat {
     moved: Option<(u64, f64, f64)>,
     /// Whether each motion's age is logged (`YSERVER_INPUT_AGES=1`).
     ages: bool,
+    /// The `wl_pointer` of the server's own the relative pointer was made
+    /// on, which a lock names.
+    own_pointer: Option<ObjectId>,
+    /// The compositor's `zwp_pointer_constraints_v1`, where it serves one
+    /// and locking is not turned off (`YSERVER_POINTER_LOCK=0`).
+    constraints: Option<ObjectId>,
+    /// The lock the server holds ([`super::lock`]).
+    lock: Option<Lock>,
+    /// The compositor's window the keyboard is on.
+    keyboard: Option<SurfaceId>,
+    /// Where the last `WarpPointer` since the lock was last looked at put
+    /// the pointer, in root coordinates.
+    warped: Option<(i32, i32)>,
+    /// The cursor in effect shows nothing: XFIXES `HideCursor`, or every
+    /// pixel of it transparent.
+    hidden: bool,
+    /// What is left of a locked motion's distance after its whole pixels:
+    /// the pointer's and the raw motion's, across and down.
+    residue: [f64; 4],
+}
+
+/// A `zwp_locked_pointer_v1` the server asked for.
+#[derive(Debug)]
+struct Lock {
+    object: ObjectId,
+    held: Held,
+    /// The compositor said `locked` and not `unlocked` since.
+    active: bool,
 }
 
 impl Seat {
@@ -138,7 +184,10 @@ impl Seat {
             }
             // In order with the pointer's own events: a relative motion
             // comes before the pointer motion it belongs to.
-            Event::Object { object, .. } if Some(object) == self.relative => {
+            Event::Object { object, .. }
+                if Some(object) == self.relative
+                    || self.lock.as_ref().is_some_and(|lock| lock.object == object) =>
+            {
                 self.queue.push(event);
                 None
             }
@@ -157,6 +206,17 @@ impl Seat {
             log::info!("wayland: no zwp_relative_pointer_manager_v1; input is stamped on arrival");
         }
         self.ages = std::env::var("YSERVER_INPUT_AGES").is_ok_and(|value| value == "1");
+        if std::env::var("YSERVER_POINTER_LOCK").is_ok_and(|value| value == "0") {
+            log::info!("wayland: YSERVER_POINTER_LOCK=0; a game's pointer is never locked");
+            return;
+        }
+        self.constraints = client
+            .bind(&ZWP_POINTER_CONSTRAINTS_V1, 1, None)
+            .ok()
+            .map(|(constraints, _)| constraints);
+        if self.constraints.is_none() {
+            log::info!("wayland: no zwp_pointer_constraints_v1; a game's pointer is not locked");
+        }
     }
 
     /// Ask for the relative pointer once the seat has a pointer: on a
@@ -189,12 +249,37 @@ impl Seat {
                 )
             });
         match asked {
-            Ok(()) => self.relative = Some(id),
+            Ok(()) => {
+                self.relative = Some(id);
+                self.own_pointer = Some(pointer);
+            }
             Err(error) => {
                 log::warn!("wayland: the relative pointer: {error}");
                 self.relative_manager = None;
             }
         }
+    }
+
+    /// Whether the compositor holds the pointer still for the server now.
+    fn locked(&self) -> bool {
+        self.lock.as_ref().is_some_and(|lock| lock.active)
+    }
+
+    /// The compositor's word on the lock: `locked` or `unlocked`.
+    fn lock_event(&mut self, opcode: u16) {
+        let Some(lock) = self.lock.as_mut() else {
+            return;
+        };
+        let active = opcode == zwp_locked_pointer_v1::event::LOCKED;
+        if active != lock.active {
+            log::info!(
+                "wayland: the compositor {} the pointer on window 0x{:x}",
+                if active { "locked" } else { "unlocked" },
+                lock.held.window.0
+            );
+        }
+        lock.active = active;
+        self.residue = [0.0; 4];
     }
 
     /// One `relative_motion`: its time, and its distance before any
@@ -276,6 +361,18 @@ impl WaylandLink {
             match event {
                 Event::Pointer(event) => self.pointer_event(state, backend, event),
                 Event::Keyboard(event) => self.keyboard_event(state, backend, event),
+                Event::Object { object, opcode, .. }
+                    if self
+                        .seat
+                        .lock
+                        .as_ref()
+                        .is_some_and(|lock| lock.object == object) =>
+                {
+                    self.seat.lock_event(opcode);
+                }
+                Event::Object { opcode, args, .. } if self.seat.locked() => {
+                    self.locked_motion(state, backend, opcode, &args);
+                }
                 Event::Object { opcode, args, .. } => self.seat.relative_motion(opcode, &args),
                 _ => {}
             }
@@ -343,6 +440,9 @@ impl WaylandLink {
                 state.pointer_scope = PointerScope::Nowhere;
                 self.move_pointer(state, backend);
             }
+            // A held pointer does not move; X's moves by the relative
+            // motion ([`Self::locked_motion`]).
+            PointerEvent::Motion { .. } if self.seat.locked() => {}
             PointerEvent::Motion { surface, x, y } => {
                 if let Some(at) = self.root_position(state, surface, x, y) {
                     self.seat.at = at;
@@ -357,7 +457,8 @@ impl WaylandLink {
                 pressed,
                 ..
             } => {
-                if let Some(at) = self.root_position(state, surface, x, y)
+                if !self.seat.locked()
+                    && let Some(at) = self.root_position(state, surface, x, y)
                     && at != self.seat.at
                 {
                     self.seat.at = at;
@@ -436,6 +537,199 @@ impl WaylandLink {
         }
     }
 
+    /// A relative motion while the compositor holds the pointer: X's
+    /// pointer moves by its distance from where X has it, which after a
+    /// game's warp is its window's centre, with its unaccelerated distance
+    /// as `XInput2`'s raw motion, one X motion for each.
+    fn locked_motion(
+        &mut self,
+        state: &mut ServerState,
+        backend: &mut dyn Backend,
+        opcode: u16,
+        args: &[Value],
+    ) {
+        if opcode != zwp_relative_pointer_v1::event::RELATIVE_MOTION {
+            return;
+        }
+        let uint = |at: usize| args.get(at).and_then(Value::as_uint).unwrap_or(0);
+        let fixed = |at: usize| match args.get(at) {
+            Some(Value::Fixed(value)) => *value,
+            _ => 0.0,
+        };
+        let stamp = (u64::from(uint(0)) << 32) | u64::from(uint(1));
+        let [across, down, raw_across, raw_down] = &mut self.seat.residue;
+        let (dx, dy) = (lock::whole(across, fixed(2)), lock::whole(down, fixed(3)));
+        let (raw_dx, raw_dy) = (
+            lock::whole(raw_across, fixed(4)),
+            lock::whole(raw_down, fixed(5)),
+        );
+        let (x, y) = state.pointer_root;
+        let (x, y) = (i32::from(x) + dx, i32::from(y) + dy);
+        let server = crate::clock::server_time_ms();
+        let time = x_time(stamp, super::clock::monotonic_us(), server).unwrap_or(server);
+        self.seat.moved = None;
+        yserver_core::core_loop::handle_host_input(
+            state,
+            backend,
+            HostInputEvent::PointerMotion {
+                x,
+                y,
+                time,
+                relative: true,
+                dx: raw_dx,
+                dy: raw_dy,
+                motion_delta: None,
+                origin: HOST_INPUT,
+            },
+        );
+        self.seat.at = (
+            i32::from(state.pointer_root.0),
+            i32::from(state.pointer_root.1),
+        );
+        if self.seat.ages {
+            log::info!(
+                "input-age stamp {stamp} xtime {time} age {} locked",
+                super::clock::monotonic_us().saturating_sub(stamp)
+            );
+        }
+    }
+
+    /// X moved its pointer to root position (`x`, `y`) for a client's
+    /// `WarpPointer`, which may be a game's warp to its window's centre.
+    pub fn pointer_warped(&mut self, x: i32, y: i32) {
+        self.seat.warped = Some((x, y));
+    }
+
+    /// The top-level X window `window` is, or is inside.
+    fn toplevel_of(state: &ServerState, window: ResourceId) -> Option<ResourceId> {
+        let mut current = window;
+        for _ in 0..256 {
+            match state.resources.parent_of(current) {
+                Some(parent) if parent == ROOT_WINDOW => return Some(current),
+                Some(parent) if parent != current => current = parent,
+                _ => return None,
+            }
+        }
+        None
+    }
+
+    /// Whether root position `at` is inside X window `window`.
+    fn inside(state: &ServerState, window: ResourceId, (x, y): (i32, i32)) -> bool {
+        let Some(found) = state.resources.window(window) else {
+            return false;
+        };
+        let (left, top) = state.resources.window_absolute_position(window);
+        (left..left + i32::from(found.width)).contains(&x)
+            && (top..top + i32::from(found.height)).contains(&y)
+    }
+
+    /// Lock the pointer for a game, or let it go ([`super::lock`]). Once per
+    /// loop iteration, after the cursor is synced.
+    pub fn sync_lock(&mut self, state: &ServerState) {
+        let warped = self.seat.warped.take();
+        let (Some(constraints), Some(pointer)) = (self.seat.constraints, self.seat.own_pointer)
+        else {
+            return;
+        };
+        let pointer_on = self
+            .seat
+            .pointer
+            .and_then(|surface| self.window_of(state, surface));
+        let keyboard_on = self
+            .seat
+            .keyboard
+            .and_then(|surface| self.window_of(state, surface));
+        let grab = state
+            .active_pointer_grab
+            .as_ref()
+            .filter(|grab| !grab.implicit);
+        let confined_to = (grab.is_some() && state.pointer_confine_to.0 != 0)
+            .then(|| Self::toplevel_of(state, state.pointer_confine_to))
+            .flatten();
+        let held = self.seat.lock.as_ref().map(|lock| lock.held);
+        let at = (
+            i32::from(state.pointer_root.0),
+            i32::from(state.pointer_root.1),
+        );
+        let scene = Scene {
+            hidden: self.seat.hidden,
+            pointer_on,
+            keyboard_on,
+            grabbed: grab.is_some(),
+            confined_to,
+            warped_into: warped
+                .zip(pointer_on)
+                .filter(|&(at, window)| Self::inside(state, window, at))
+                .map(|(_, window)| window),
+            inside_held: held.is_some_and(|held| Self::inside(state, held.window, at)),
+        };
+        match lock::decide(&scene, held) {
+            Verdict::Stay => {}
+            Verdict::Lock(held) => self.lock(constraints, pointer, held),
+            Verdict::Release(why) => self.unlock(why),
+        }
+    }
+
+    /// Ask the compositor to hold the pointer still on `held`'s window.
+    fn lock(&mut self, constraints: ObjectId, pointer: ObjectId, held: Held) {
+        let Some(surface) = self
+            .toplevels
+            .values()
+            .find(|toplevel| toplevel.window == held.window)
+            .and_then(|toplevel| self.client.surface_object(toplevel.surface))
+        else {
+            return;
+        };
+        let object = self.client.new_object(&ZWP_LOCKED_POINTER_V1, 1);
+        let asked = self.client.request(
+            constraints,
+            zwp_pointer_constraints_v1::request::LOCK_POINTER,
+            &[
+                Value::NewId(object),
+                Value::Object(surface),
+                Value::Object(pointer),
+                Value::Object(ObjectId::NULL),
+                Value::Uint(zwp_pointer_constraints_v1::lifetime::PERSISTENT),
+            ],
+        );
+        match asked {
+            Ok(()) => {
+                log::info!(
+                    "wayland: a game holds the pointer; asked to lock it on window 0x{:x}{}",
+                    held.window.0,
+                    if held.grabbed { " (grabbed)" } else { "" }
+                );
+                self.seat.residue = [0.0; 4];
+                self.seat.lock = Some(Lock {
+                    object,
+                    held,
+                    active: false,
+                });
+            }
+            Err(error) => {
+                log::warn!("wayland: locking the pointer: {error}");
+                self.seat.constraints = None;
+            }
+        }
+    }
+
+    /// Let the lock go, telling why.
+    fn unlock(&mut self, why: &str) {
+        let Some(lock) = self.seat.lock.take() else {
+            return;
+        };
+        log::info!(
+            "wayland: the pointer lock on window 0x{:x} is let go: {why}",
+            lock.held.window.0
+        );
+        if let Err(error) =
+            self.client
+                .request(lock.object, zwp_locked_pointer_v1::request::DESTROY, &[])
+        {
+            log::warn!("wayland: letting the pointer go: {error}");
+        }
+    }
+
     fn keyboard_event(
         &mut self,
         state: &mut ServerState,
@@ -444,6 +738,7 @@ impl WaylandLink {
     ) {
         match event {
             KeyboardEvent::Enter(surface) => {
+                self.seat.keyboard = Some(surface);
                 let Some(window) = self.window_of(state, surface) else {
                     return;
                 };
@@ -452,6 +747,7 @@ impl WaylandLink {
                 }
             }
             KeyboardEvent::Leave(_) => {
+                self.seat.keyboard = None;
                 for keycode in std::mem::take(&mut self.seat.keys) {
                     self.key(state, backend, keycode, false);
                 }
@@ -505,14 +801,27 @@ impl WaylandLink {
     /// last given. Once per loop iteration.
     pub fn sync_cursor(&mut self, cursors: &dyn CursorSource) {
         let key = cursors.cursor_key();
-        if self.seat.cursor == Some(key) {
+        let hidden_by_client = cursors.cursor_hidden();
+        if self.seat.cursor == Some((key, hidden_by_client)) {
             return;
         }
-        self.seat.cursor = Some(key);
+        self.seat.cursor = Some((key, hidden_by_client));
+        if hidden_by_client {
+            self.seat.hidden = true;
+            self.client.hide_cursor();
+            return;
+        }
         let Some(image) = key.and_then(|_| cursors.cursor_image()) else {
+            self.seat.hidden = false;
             self.client.set_cursor(CursorShape::default());
             return;
         };
+        // A cursor with nothing to show, as a game hides it with.
+        self.seat.hidden = lock::transparent(&image.bgra_bytes);
+        if self.seat.hidden {
+            self.client.hide_cursor();
+            return;
+        }
         let pixels = premultiplied(&image.bgra_bytes);
         match self.client.set_cursor_image(
             u32::from(image.width),

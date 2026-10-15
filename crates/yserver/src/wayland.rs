@@ -30,7 +30,8 @@
 //! class, what a window rule matches. Both follow the properties.
 //!
 //! The seat -- keys, pointer, wheel, focus and cursor -- is [`input`]'s,
-//! and the clipboard, X's selections both ways, [`clipboard`]'s.
+//! a game's pointer lock [`lock`]'s, and the clipboard, X's selections both
+//! ways, [`clipboard`]'s.
 //!
 //! Not yet: override-redirect windows (menus, as popups), and the
 //! compositor's own size and close for a window (docs/YSERVER.md, Y5).
@@ -53,8 +54,10 @@
 //! * `Backend::poll_deferred_input` calls `KmsBackend::sync_wayland` once
 //!   per loop iteration: the server's own redirect of the root's children
 //!   (`yserver_core`'s `redirect_subwindows_for_server`), then
-//!   [`WaylandLink::sync`], [`WaylandLink::sync_cursor`] and
-//!   [`WaylandLink::sync_clipboard`];
+//!   [`WaylandLink::sync`], [`WaylandLink::sync_cursor`],
+//!   [`WaylandLink::sync_lock`] and [`WaylandLink::sync_clipboard`];
+//! * `KmsBackend::warp_pointer_root` tells [`WaylandLink::pointer_warped`]
+//!   of a client's `WarpPointer`;
 //! * `Backend::on_window_property_changed` calls
 //!   [`WaylandLink::property_changed`];
 //! * `impl WindowImages for KmsBackend` reads a window back, and
@@ -118,6 +121,7 @@ pub enum Request {
 mod clipboard;
 mod clock;
 mod input;
+mod lock;
 mod popups;
 pub use input::CursorSource;
 

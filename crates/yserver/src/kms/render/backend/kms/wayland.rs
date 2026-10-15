@@ -183,6 +183,7 @@ impl KmsBackend {
             link.wm_request(state, request);
         }
         link.sync_cursor(self);
+        link.sync_lock(state);
         let requests = link.take_requests();
         link.sync_clipboard(state, self);
         self.pstate.wayland = Some(link);
@@ -232,6 +233,10 @@ impl crate::wayland::CursorSource for KmsBackend {
 
     fn cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
         yserver_core::backend::Backend::get_active_cursor_image(self)
+    }
+
+    fn cursor_hidden(&self) -> bool {
+        self.cursor_hidden
     }
 }
 

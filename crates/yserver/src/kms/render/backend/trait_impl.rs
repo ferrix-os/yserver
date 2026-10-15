@@ -1897,6 +1897,7 @@ impl<P: Platform> Backend for XBackend<P> {
     }
 
     fn warp_pointer_root(&mut self, state: &mut ServerState, x: i32, y: i32) {
+        P::pointer_warp_requested(self, state, x, y);
         Self::backend_pointer_warp_pointer_root(self, state, x, y)
     }
 

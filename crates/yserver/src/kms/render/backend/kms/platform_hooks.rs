@@ -590,6 +590,18 @@ impl Platform for PlatformBackend {
     }
 
     #[cfg(feature = "wayland")]
+    fn pointer_warp_requested(b: &mut KmsBackend, state: &ServerState, x: i32, y: i32) {
+        // A client's warp, not a grab's confine pulling the pointer in,
+        // which may be a game's to its window's centre (`crate::wayland`'s
+        // pointer lock).
+        if !state.confine_warp_active
+            && let Some(link) = b.pstate.wayland.as_mut()
+        {
+            link.pointer_warped(x, y);
+        }
+    }
+
+    #[cfg(feature = "wayland")]
     fn on_window_property_changed(
         b: &mut KmsBackend,
         state: &ServerState,
