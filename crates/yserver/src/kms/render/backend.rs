@@ -14642,6 +14642,7 @@ impl KmsBackend {
         self.core.pending_pointer_events.push(ev);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn emit_crossing(
         &mut self,
         host_xid: u32,
@@ -14650,13 +14651,14 @@ impl KmsBackend {
         crossing_mode: u8,
         child: u32,
         state: u16,
+        time: u32,
     ) {
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
             kind,
             host_xid,
             detail,
-            time: crate::clock::server_time_ms(),
+            time,
             root_x: self.core.cursor_x as i16,
             root_y: self.core.cursor_y as i16,
             event_x,
@@ -14671,13 +14673,14 @@ impl KmsBackend {
         self.emit_pointer(ev);
     }
 
-    fn emit_motion_only(&mut self, host_xid: u32, mask: u16, raw_dx: i32, raw_dy: i32) {
+    fn emit_motion_only(&mut self, host_xid: u32, mask: u16, raw: (i32, i32), time: u32) {
+        let (raw_dx, raw_dy) = raw;
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
             kind: PointerEventKind::MotionNotify,
             host_xid,
             detail: 0,
-            time: crate::clock::server_time_ms(),
+            time,
             root_x: self.core.cursor_x as i16,
             root_y: self.core.cursor_y as i16,
             event_x,
@@ -14695,7 +14698,14 @@ impl KmsBackend {
     /// Spec-correct Normal-mode crossing chain for a top-level
     /// transition. Direct v1 port (kms/backend.rs:6630-6695) —
     /// the body only touches KmsCore + nested-resource look-ups.
-    fn update_pointer_window(&mut self, server_state: &ServerState, new_xid: u32, mask: u16) {
+    /// The crossings carry `time`, the motion's that caused them.
+    fn update_pointer_window(
+        &mut self,
+        server_state: &ServerState,
+        new_xid: u32,
+        mask: u16,
+        time: u32,
+    ) {
         if self.core.prev_pointer_window == Some(new_xid) {
             log::trace!(
                 target: "yserver::kms::render::pointer",
@@ -14749,7 +14759,7 @@ impl KmsBackend {
                     "upw: emit_crossing host=0x{win_host_xid:x} kind={:?} detail={} child={:#x}",
                     kind, ev.detail, ev.child.0
                 );
-                self.emit_crossing(win_host_xid, kind, ev.detail, 0, ev.child.0, mask);
+                self.emit_crossing(win_host_xid, kind, ev.detail, 0, ev.child.0, mask, time);
             }
         } else {
             log::trace!(
@@ -14760,9 +14770,9 @@ impl KmsBackend {
             // First-motion bootstrap or unmapped host_xid —
             // fall back to a single Leave/Enter with detail=0.
             if let Some(prev) = prev_host {
-                self.emit_crossing(prev, PointerEventKind::LeaveNotify, 0, 0, 0, mask);
+                self.emit_crossing(prev, PointerEventKind::LeaveNotify, 0, 0, 0, mask, time);
             }
-            self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, 0, 0, mask);
+            self.emit_crossing(new_xid, PointerEventKind::EnterNotify, 0, 0, 0, mask, time);
         }
         self.core.prev_pointer_window = Some(new_xid);
         // Stage 5 Phase A: cross-in may change the effective cursor
@@ -14770,7 +14780,13 @@ impl KmsBackend {
         self.refresh_effective_cursor();
     }
 
-    fn dispatch_motion_event(&mut self, server_state: &ServerState, raw_dx: i32, raw_dy: i32) {
+    fn dispatch_motion_event(
+        &mut self,
+        server_state: &ServerState,
+        raw_dx: i32,
+        raw_dy: i32,
+        time: u32,
+    ) {
         // Fall back to the root container so root-window subscribers
         // (e16's right-click-desktop menu, fvwm3's root bindings) can
         // see motion when the cursor is over the wallpaper.
@@ -14781,8 +14797,8 @@ impl KmsBackend {
             "dispatch_motion: cursor=({},{}) → host_xid=0x{host_xid:x}",
             self.core.cursor_x, self.core.cursor_y
         );
-        self.update_pointer_window(server_state, host_xid, mask);
-        self.emit_motion_only(host_xid, mask, raw_dx, raw_dy);
+        self.update_pointer_window(server_state, host_xid, mask, time);
+        self.emit_motion_only(host_xid, mask, (raw_dx, raw_dy), time);
     }
 
     /// Every live CRTC's root rectangle (its footprint at its origin).
@@ -14807,6 +14823,9 @@ impl KmsBackend {
         self.warp_pointer_root(state, nx, ny);
     }
 
+    /// `time` is the motion's X time: the device's stamp where the input
+    /// has one (`HostInputEvent::PointerMotion::time`), else the server's.
+    #[allow(clippy::too_many_arguments)]
     fn process_pointer_absolute(
         &mut self,
         server_state: &mut ServerState,
@@ -14815,6 +14834,7 @@ impl KmsBackend {
         relative: bool,
         raw_dx: i32,
         raw_dy: i32,
+        time: u32,
     ) {
         // Apply active-grab confinement before hit-testing and crossing
         // generation.  The core fanout also clamps as a backend-independent
@@ -14947,7 +14967,7 @@ impl KmsBackend {
         }
         let prev = server_state.barrier_bypass;
         server_state.barrier_bypass = prev || !relative;
-        self.dispatch_motion_event(server_state, raw_dx, raw_dy);
+        self.dispatch_motion_event(server_state, raw_dx, raw_dy, time);
         server_state.barrier_bypass = prev;
         if confined && let Some(ctrl) = &self.input_thread_control {
             // The libinput thread accumulates relative deltas independently.
@@ -15076,6 +15096,7 @@ impl KmsBackend {
                     press_mode,
                     ev.child.0,
                     post_state,
+                    time,
                 );
             }
         }
@@ -20322,12 +20343,22 @@ impl Backend for KmsBackend {
             HostInputEvent::PointerMotion {
                 x,
                 y,
-                time: _,
+                time,
                 relative,
                 dx,
                 dy,
             } => {
-                self.process_pointer_absolute(state, x as f32, y as f32, relative, dx, dy);
+                // The motion's own time, which the Wayland link stamps with
+                // the device's (Ferrix GAME-PATH.md 4.7) and the libinput
+                // thread with the server's as it read the event; 0 (an
+                // XTEST fake, whose time field is a delay) is the server's
+                // now, as Xorg's GetPointerEvents stamps it.
+                let time = if time == 0 {
+                    crate::clock::server_time_ms()
+                } else {
+                    time
+                };
+                self.process_pointer_absolute(state, x as f32, y as f32, relative, dx, dy, time);
             }
             HostInputEvent::PointerButton {
                 button,
@@ -29057,21 +29088,30 @@ impl Backend for KmsBackend {
         {
             link.pointer_warped(x, y);
         }
-        // Route through the absolute-motion input path: updates the
-        // tracked cursor (and HW cursor plane) and fans out the
-        // motion/crossing events WarpPointer is specified to generate
-        // ("as if the user had instantaneously moved the pointer").
-        self.on_host_input(
+        // Route through the absolute-motion path: updates the tracked
+        // cursor (and HW cursor plane) and fans out the motion/crossing
+        // events WarpPointer is specified to generate ("as if the user had
+        // instantaneously moved the pointer"), but no XI2 raw motion: a
+        // warp is not the device's (Xorg's miPointerMove passes
+        // POINTER_NORAW; `warp_pointer_event_fanout_to_state`).
+        #[allow(clippy::cast_precision_loss)]
+        self.process_pointer_absolute(
             state,
-            yserver_core::core_loop::HostInputEvent::PointerMotion {
-                x,
-                y,
-                time: 0,
-                relative: false,
-                dx: 0,
-                dy: 0,
-            },
+            x as f32,
+            y as f32,
+            false,
+            0,
+            0,
+            crate::clock::server_time_ms(),
         );
+        let pending = std::mem::take(&mut self.core.pending_pointer_events);
+        let xid_map = self.core.xid_map.clone();
+        for ev in pending {
+            let _dropped =
+                yserver_core::core_loop::pointer_fanout::warp_pointer_event_fanout_to_state(
+                    state, self, &xid_map, ev,
+                );
+        }
         // Resync the direct-mode input thread's cursor accumulator to the
         // warped position (and drop any coalesced delta). Without this the
         // libinput thread keeps integrating from its stale position, so a
@@ -29094,7 +29134,7 @@ impl Backend for KmsBackend {
             return;
         }
         let mask = self.serialize_modifiers() | self.core.button_mask;
-        self.update_pointer_window(state, host_xid, mask);
+        self.update_pointer_window(state, host_xid, mask, crate::clock::server_time_ms());
         let pending = std::mem::take(&mut self.core.pending_pointer_events);
         let xid_map = self.core.xid_map.clone();
         for mut ev in pending {
@@ -38802,6 +38842,57 @@ mod tests {
         assert_eq!(kinds, vec![13, 2, 3, 2, 14, 3]);
     }
 
+    /// A warp moves the pointer with an XI2 Motion and no RawMotion: Xorg's
+    /// `ProcWarpPointer` reaches `miPointerMove`, whose `GetPointerEvents`
+    /// passes `POINTER_NORAW`. A motion from the device has both, and both
+    /// carry the time it came with (the Wayland link's device stamp), not
+    /// the time the server read it.
+    #[test]
+    fn a_warp_has_no_raw_motion_and_a_motion_keeps_its_time() {
+        use yserver_core::{
+            core_loop::HostInputEvent, resources::ROOT_WINDOW, server::ServerState,
+        };
+        let mut b = KmsBackend::for_tests();
+        let mut state = ServerState::new();
+        let mut peer = kbd_map_client_id(&mut state, 9);
+        state
+            .clients
+            .get_mut(&9)
+            .unwrap()
+            .xi2_masks
+            .insert((ROOT_WINDOW, 1), (1 << 6) | (1 << 17));
+
+        b.warp_pointer_root(&mut state, 40, 30);
+        let warp: Vec<_> = xi2_events(&kbd_map_drain(&mut peer))
+            .iter()
+            .map(|e| e.0)
+            .collect();
+        assert_eq!(warp, vec![6], "a warp's Motion, and no RawMotion");
+
+        b.on_host_input(
+            &mut state,
+            HostInputEvent::PointerMotion {
+                x: 49,
+                y: 30,
+                time: 4242,
+                relative: true,
+                dx: 9,
+                dy: 0,
+            },
+        );
+        let moved = xi2_events(&kbd_map_drain(&mut peer));
+        let kinds: Vec<_> = moved.iter().map(|e| e.0).collect();
+        assert_eq!(
+            kinds,
+            vec![17, 6],
+            "the device's RawMotion, then its Motion"
+        );
+        assert!(
+            moved.iter().all(|e| e.4 == 4242),
+            "both with the motion's time: {moved:?}"
+        );
+    }
+
     /// RECORD records an autorepeat as Xorg generates it: a press flagged
     /// in the sequence field and no release (`record-probe repeat l` on
     /// Xvfb: `02260000`, then presses with seqfield 1, then `03260000`).
@@ -39301,11 +39392,11 @@ mod tests {
         let mut b = KmsBackend::for_tests();
         let mut state = ServerState::new();
         // Inside extent.
-        b.process_pointer_absolute(&mut state, 100.0, 200.0, true, 0, 0);
+        b.process_pointer_absolute(&mut state, 100.0, 200.0, true, 0, 0, 1);
         assert_eq!(b.core.cursor_x, 100.0);
         assert_eq!(b.core.cursor_y, 200.0);
         // Past extent → clamped to (extent - 1).
-        b.process_pointer_absolute(&mut state, 5000.0, 5000.0, true, 0, 0);
+        b.process_pointer_absolute(&mut state, 5000.0, 5000.0, true, 0, 0, 1);
         assert_eq!(b.core.cursor_x, 799.0);
         assert_eq!(b.core.cursor_y, 599.0);
     }
@@ -39383,7 +39474,7 @@ mod tests {
         b.core.cursor_y = 150.0;
         b.core.prev_pointer_window = Some(GAME_HOST);
 
-        b.process_pointer_absolute(&mut state, 220.0, 150.0, true, 21, 0);
+        b.process_pointer_absolute(&mut state, 220.0, 150.0, true, 21, 0, 1);
 
         assert_eq!((b.core.cursor_x, b.core.cursor_y), (199.0, 150.0));
         assert_eq!(state.pointer_root, (199, 150));
@@ -39418,7 +39509,7 @@ mod tests {
         let mut state = ServerState::new();
         // Point on monitor 1 (x=4000 is past output[0]'s 800-wide
         // fixture extent but well within the 5120 union extent).
-        b.process_pointer_absolute(&mut state, 4000.0, 1000.0, true, 0, 0);
+        b.process_pointer_absolute(&mut state, 4000.0, 1000.0, true, 0, 0, 1);
         assert_eq!(
             b.core.cursor_x, 4000.0,
             "pointer must be able to cross past the first output's \
@@ -39427,7 +39518,7 @@ mod tests {
         );
         assert_eq!(b.core.cursor_y, 1000.0);
         // Past the union extent → clamped to (union - 1).
-        b.process_pointer_absolute(&mut state, 9999.0, 9999.0, true, 0, 0);
+        b.process_pointer_absolute(&mut state, 9999.0, 9999.0, true, 0, 0, 1);
         assert_eq!(b.core.cursor_x, 5119.0);
         assert_eq!(b.core.cursor_y, 1439.0);
     }
@@ -47168,7 +47259,7 @@ mod tests {
                 .collect()
         };
         b.core.prev_pointer_window = Some(app);
-        b.update_pointer_window(&state, cow.0, 0);
+        b.update_pointer_window(&state, cow.0, 0, 1);
         assert_eq!(
             crossings(&mut b),
             vec![
@@ -47176,7 +47267,7 @@ mod tests {
                 (PointerEventKind::EnterNotify, cow.0, 3),
             ],
         );
-        b.update_pointer_window(&state, app, 0);
+        b.update_pointer_window(&state, app, 0, 1);
         assert_eq!(
             crossings(&mut b),
             vec![

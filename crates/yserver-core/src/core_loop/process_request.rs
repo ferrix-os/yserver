@@ -11197,12 +11197,15 @@ fn dispatch_fake_input_with_body(
             // relative fake moves the sprite by the delta from its current
             // position, unaccelerated (XTEST doesn't set POINTER_ACCELERATE);
             // the backend clips to the screen. The delta also rides as the
-            // raw relative motion, so XI2 RawMotion reports it.
+            // raw relative motion, so XI2 RawMotion reports it. FakeInput's
+            // time is a delay, not a stamp: the motion goes with time 0,
+            // which the backend stamps with its now, as Xorg's
+            // GetPointerEvents does.
             let motion = if fi.detail == 0 {
                 HostInputEvent::PointerMotion {
                     x: i32::from(fi.root_x),
                     y: i32::from(fi.root_y),
-                    time: fi.time,
+                    time: 0,
                     relative: false,
                     dx: 0,
                     dy: 0,
@@ -11213,7 +11216,7 @@ fn dispatch_fake_input_with_body(
                 HostInputEvent::PointerMotion {
                     x: i32::from(x) + dx,
                     y: i32::from(y) + dy,
-                    time: fi.time,
+                    time: 0,
                     relative: true,
                     dx,
                     dy,

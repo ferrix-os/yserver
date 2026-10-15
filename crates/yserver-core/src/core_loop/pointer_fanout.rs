@@ -58,7 +58,35 @@ pub fn pointer_event_fanout_to_state(
         handle_grabs,
         is_replay,
         is_replay,
+        false,
         &mut info,
+    );
+    implicit_pointer_grab_lifecycle(state, &event, &info);
+    if !info.queued {
+        release_passive_grab_on_button_release(state, event.kind);
+    }
+    dropped
+}
+
+/// Fan out the events of a warp: `WarpPointer`, a confine grab pulling the
+/// pointer in, or the pointer moved onto a CRTC after a layout change.
+///
+/// As [`pointer_event_fanout_to_state`], except that no XI2 raw event is
+/// generated. A raw event describes the device, and a warp did not come
+/// from one: Xorg's `ProcWarpPointer` (and `CheckPhysLimits`) call
+/// `SetCursorPosition(..., TRUE)`, which `miPointerWarpCursor` turns into
+/// `miPointerMove`, whose `GetPointerEvents` passes `POINTER_NORAW`; and
+/// `fill_pointer_events` (dix/getevents.c) makes no raw event under that
+/// flag. RECORD still sees the motion, as before.
+pub fn warp_pointer_event_fanout_to_state(
+    state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
+    xid_map: &HostXidMap,
+    event: HostPointerEvent,
+) -> Vec<ClientId> {
+    let mut info = ImplicitGrabFanoutInfo::default();
+    let dropped = pointer_event_fanout_to_state_inner(
+        state, backend, xid_map, event, true, false, false, true, &mut info,
     );
     implicit_pointer_grab_lifecycle(state, &event, &info);
     if !info.queued {
@@ -81,7 +109,7 @@ pub fn replay_frozen_pointer_event_to_state(
 ) -> Vec<ClientId> {
     let mut info = ImplicitGrabFanoutInfo::default();
     let dropped = pointer_event_fanout_to_state_inner(
-        state, backend, xid_map, event, false, false, true, &mut info,
+        state, backend, xid_map, event, false, false, true, false, &mut info,
     );
     implicit_pointer_grab_lifecycle(state, &event, &info);
     if !info.queued {
@@ -204,6 +232,7 @@ fn pointer_event_fanout_to_state_inner(
     handle_grabs: bool,
     is_replay: bool,
     suppress_raw: bool,
+    warp: bool,
     info: &mut ImplicitGrabFanoutInfo,
 ) -> Vec<ClientId> {
     // SetPointerMapping: physical button → logical button before any
@@ -1534,7 +1563,11 @@ fn pointer_event_fanout_to_state_inner(
     }
 
     // XI2 raw events.
-    if !suppress_raw && let Some(raw_evtype) = xi2_raw_evtype {
+    // None for a warp ([`warp_pointer_event_fanout_to_state`]).
+    if !suppress_raw
+        && !warp
+        && let Some(raw_evtype) = xi2_raw_evtype
+    {
         let extras = fanout_event_to_clients(state, &xi2_raw_targets, |buf, seq, order| {
             x11::encode_xi2_raw_event(
                 buf,
@@ -4047,6 +4080,68 @@ mod tests {
             u16::from_le_bytes([bytes[off + 20], bytes[off + 21]]),
             XI2_SLAVE_POINTER_DEVICE_ID,
             "sourceid must match the originating slave pointer"
+        );
+    }
+
+    /// The XI2 event types of a stream of GenericEvents.
+    fn xi2_evtypes(bytes: &[u8]) -> Vec<u16> {
+        let mut evtypes = Vec::new();
+        let mut off = 0usize;
+        while off + 32 <= bytes.len() {
+            if bytes[off] == 35 {
+                evtypes.push(u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]));
+                let length =
+                    u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+                off += 32 + length * 4;
+            } else {
+                off += 32;
+            }
+        }
+        evtypes
+    }
+
+    #[test]
+    fn a_warp_moves_the_pointer_with_no_raw_motion() {
+        // Xorg: WarpPointer -> miPointerMove -> GetPointerEvents with
+        // POINTER_NORAW; raw events come only from the device.
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let mut peer = install_client(&mut state, 1);
+        state
+            .clients
+            .get_mut(&1)
+            .expect("client")
+            .xi2_masks
+            .insert((ROOT_WINDOW, 0), (1 << 6) | (1 << 17));
+        let dropped = warp_pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            motion_event(),
+        );
+        assert!(dropped.is_empty());
+        let evtypes = xi2_evtypes(&read_all_available(&mut peer));
+        assert!(evtypes.contains(&6), "the warp's XI_Motion: {evtypes:?}");
+        assert!(!evtypes.contains(&17), "no XI_RawMotion: {evtypes:?}");
+
+        // A motion from the device has its raw event.
+        let mut device = motion_event();
+        device.root_x += 1;
+        device.event_x += 1;
+        device.raw_dx = 1;
+        let dropped = pointer_event_fanout_to_state(
+            &mut state,
+            &mut backend,
+            &HostXidMap::new(),
+            device,
+            true,
+            false,
+        );
+        assert!(dropped.is_empty());
+        let evtypes = xi2_evtypes(&read_all_available(&mut peer));
+        assert!(
+            evtypes.contains(&17),
+            "the device's XI_RawMotion: {evtypes:?}"
         );
     }
 
