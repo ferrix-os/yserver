@@ -8930,6 +8930,7 @@ impl KmsBackend {
             link.wm_request(state, request);
         }
         link.sync_cursor(self);
+        link.sync_lock(state);
         let requests = link.take_requests();
         link.sync_clipboard(state, self);
         self.wayland = Some(link);
@@ -19999,6 +20000,10 @@ impl crate::wayland::CursorSource for KmsBackend {
     fn cursor_image(&self) -> Option<yserver_core::backend::ActiveCursorImage> {
         Backend::get_active_cursor_image(self)
     }
+
+    fn cursor_hidden(&self) -> bool {
+        self.cursor_hidden
+    }
 }
 
 /// Each top-level's image for the Wayland backend: the window read through
@@ -29043,6 +29048,15 @@ impl Backend for KmsBackend {
     }
 
     fn warp_pointer_root(&mut self, state: &mut ServerState, x: i32, y: i32) {
+        // A client's warp, not a grab's confine pulling the pointer in,
+        // which may be a game's to its window's centre (`crate::wayland`'s
+        // pointer lock).
+        #[cfg(feature = "wayland")]
+        if !state.confine_warp_active
+            && let Some(link) = self.wayland.as_mut()
+        {
+            link.pointer_warped(x, y);
+        }
         // Route through the absolute-motion input path: updates the
         // tracked cursor (and HW cursor plane) and fans out the
         // motion/crossing events WarpPointer is specified to generate
