@@ -189,6 +189,7 @@ fn pointer_source_routing_kms_preserves_origin_and_drops_unknown_before_cursor_m
         0,
         0,
         InputOrigin::Physical(source),
+        1,
     );
     assert_eq!((backend.core.cursor_x, backend.core.cursor_y), (21.0, 31.0));
     let emitted = std::mem::take(&mut backend.core.pending_pointer_events);
@@ -416,6 +417,7 @@ fn process_pointer_absolute_clamps_to_output() {
         0,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        1,
     );
     assert_eq!(b.core.cursor_x, 100.0);
     assert_eq!(b.core.cursor_y, 200.0);
@@ -428,6 +430,7 @@ fn process_pointer_absolute_clamps_to_output() {
         0,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        1,
     );
     assert_eq!(b.core.cursor_x, 799.0);
     assert_eq!(b.core.cursor_y, 599.0);
@@ -514,6 +517,7 @@ fn confined_motion_does_not_cross_into_window_below() {
         21,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        1,
     );
 
     assert_eq!((b.core.cursor_x, b.core.cursor_y), (199.0, 150.0));
@@ -557,6 +561,7 @@ fn process_pointer_absolute_uses_union_fb_extent_for_multi_output() {
         0,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        1,
     );
     assert_eq!(
         b.core.cursor_x, 4000.0,
@@ -574,6 +579,7 @@ fn process_pointer_absolute_uses_union_fb_extent_for_multi_output() {
         0,
         0,
         yserver_core::core_loop::InputOrigin::XTest(4),
+        1,
     );
     assert_eq!(b.core.cursor_x, 5119.0);
     assert_eq!(b.core.cursor_y, 1439.0);
@@ -1397,4 +1403,56 @@ fn kms_pointer_authority_integrates_physical_relative_motion_in_kms() {
     assert_eq!(floating_position.1, 300.0);
     assert!(backend.core.pending_pointer_events.is_empty());
     assert_eq!(state.sync_pending.len(), 2);
+}
+
+/// A warp moves the pointer with an XI2 Motion and no RawMotion: Xorg's
+/// `ProcWarpPointer` reaches `miPointerMove`, whose `GetPointerEvents`
+/// passes `POINTER_NORAW`. A motion from the device has both, and both
+/// carry the time it came with (the Wayland link's device stamp), not
+/// the time the server read it.
+#[test]
+fn a_warp_has_no_raw_motion_and_a_motion_keeps_its_time() {
+    use yserver_core::{core_loop::HostInputEvent, resources::ROOT_WINDOW, server::ServerState};
+    let mut b = KmsBackend::for_tests();
+    let mut state = ServerState::new();
+    let mut peer = kbd_map_client_id(&mut state, 9);
+    state
+        .clients
+        .get_mut(&9)
+        .unwrap()
+        .xi2_masks
+        .insert((ROOT_WINDOW, 1), (1 << 6) | (1 << 17));
+
+    b.warp_pointer_root(&mut state, 40, 30);
+    let warp: Vec<_> = xi2_events(&kbd_map_drain(&mut peer))
+        .iter()
+        .map(|e| e.0)
+        .collect();
+    assert_eq!(warp, vec![6], "a warp's Motion, and no RawMotion");
+
+    b.on_host_input(
+        &mut state,
+        HostInputEvent::PointerMotion {
+            x: 49,
+            y: 30,
+            time: 4242,
+            relative: true,
+            dx: 9,
+            dy: 0,
+            motion_delta: None,
+            // As the Wayland link hands its input on.
+            origin: yserver_core::core_loop::InputOrigin::NestedHost,
+        },
+    );
+    let moved = xi2_events(&kbd_map_drain(&mut peer));
+    let kinds: Vec<_> = moved.iter().map(|e| e.0).collect();
+    assert_eq!(
+        kinds,
+        vec![17, 6],
+        "the device's RawMotion, then its Motion"
+    );
+    assert!(
+        moved.iter().all(|e| e.4 == 4242),
+        "both with the motion's time: {moved:?}"
+    );
 }

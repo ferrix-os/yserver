@@ -327,6 +327,7 @@ impl<P: Platform> XBackend<P> {
         crossing_mode: u8,
         child: u32,
         state: u16,
+        time: u32,
     ) {
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
@@ -334,7 +335,7 @@ impl<P: Platform> XBackend<P> {
             kind,
             host_xid,
             detail,
-            time: crate::clock::server_time_ms(),
+            time,
             root_x: self.core.cursor_x as i16,
             root_y: self.core.cursor_y as i16,
             event_x,
@@ -354,16 +355,17 @@ impl<P: Platform> XBackend<P> {
         origin: yserver_core::core_loop::InputOrigin,
         host_xid: u32,
         mask: u16,
-        raw_dx: i32,
-        raw_dy: i32,
+        raw: (i32, i32),
+        time: u32,
     ) {
+        let (raw_dx, raw_dy) = raw;
         let (event_x, event_y) = self.event_relative_coords(host_xid);
         let ev = HostPointerEvent {
             origin,
             kind: PointerEventKind::MotionNotify,
             host_xid,
             detail: 0,
-            time: crate::clock::server_time_ms(),
+            time,
             root_x: self.core.cursor_x as i16,
             root_y: self.core.cursor_y as i16,
             event_x,
@@ -419,12 +421,14 @@ impl<P: Platform> XBackend<P> {
     /// Spec-correct Normal-mode crossing chain for a top-level
     /// transition. Direct v1 port (kms/backend.rs:6630-6695) —
     /// the body only touches KmsCore + nested-resource look-ups.
+    /// The crossings carry `time`, the motion's that caused them.
     pub(in crate::kms::render::backend) fn update_pointer_window(
         &mut self,
         server_state: &ServerState,
         new_xid: u32,
         mask: u16,
         origin: yserver_core::core_loop::InputOrigin,
+        time: u32,
     ) {
         if self.core.prev_pointer_window == Some(new_xid) {
             log::trace!(
@@ -471,7 +475,16 @@ impl<P: Platform> XBackend<P> {
                     "upw: emit_crossing host=0x{win_host_xid:x} kind={:?} detail={} child={:#x}",
                     kind, ev.detail, ev.child.0
                 );
-                self.emit_crossing(origin, win_host_xid, kind, ev.detail, 0, ev.child.0, mask);
+                self.emit_crossing(
+                    origin,
+                    win_host_xid,
+                    kind,
+                    ev.detail,
+                    0,
+                    ev.child.0,
+                    mask,
+                    time,
+                );
             }
         } else {
             log::trace!(
@@ -482,7 +495,16 @@ impl<P: Platform> XBackend<P> {
             // First-motion bootstrap or unmapped host_xid —
             // fall back to a single Leave/Enter with detail=0.
             if let Some(prev) = prev_host {
-                self.emit_crossing(origin, prev, PointerEventKind::LeaveNotify, 0, 0, 0, mask);
+                self.emit_crossing(
+                    origin,
+                    prev,
+                    PointerEventKind::LeaveNotify,
+                    0,
+                    0,
+                    0,
+                    mask,
+                    time,
+                );
             }
             self.emit_crossing(
                 origin,
@@ -492,6 +514,7 @@ impl<P: Platform> XBackend<P> {
                 0,
                 0,
                 mask,
+                time,
             );
         }
         self.core.prev_pointer_window = Some(new_xid);
@@ -506,6 +529,7 @@ impl<P: Platform> XBackend<P> {
         raw_dx: i32,
         raw_dy: i32,
         origin: yserver_core::core_loop::InputOrigin,
+        time: u32,
     ) {
         // Fall back to the root container so root-window subscribers
         // (e16's right-click-desktop menu, fvwm3's root bindings) can
@@ -517,8 +541,8 @@ impl<P: Platform> XBackend<P> {
             "dispatch_motion: cursor=({},{}) → host_xid=0x{host_xid:x}",
             self.core.cursor_x, self.core.cursor_y
         );
-        self.update_pointer_window(server_state, host_xid, mask, origin);
-        self.emit_motion_only(origin, host_xid, mask, raw_dx, raw_dy);
+        self.update_pointer_window(server_state, host_xid, mask, origin, time);
+        self.emit_motion_only(origin, host_xid, mask, (raw_dx, raw_dy), time);
     }
 
     /// Every live CRTC's root rectangle (its footprint at its origin).
@@ -550,6 +574,9 @@ impl<P: Platform> XBackend<P> {
         self.warp_pointer_root(state, nx, ny);
     }
 
+    /// `time` is the motion's X time: the device's stamp where the input
+    /// has one (`HostInputEvent::PointerMotion::time`), else the server's.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::kms::render::backend) fn process_pointer_absolute(
         &mut self,
         server_state: &mut ServerState,
@@ -559,6 +586,7 @@ impl<P: Platform> XBackend<P> {
         raw_dx: i32,
         raw_dy: i32,
         origin: yserver_core::core_loop::InputOrigin,
+        time: u32,
     ) {
         // Apply active-grab confinement before hit-testing and crossing
         // generation.  The core fanout also clamps as a backend-independent
@@ -658,7 +686,7 @@ impl<P: Platform> XBackend<P> {
         let prev = server_state.barrier_bypass;
         server_state.barrier_bypass = prev || !relative;
         self.core.pending_motion_barrier_bypass = !relative;
-        self.dispatch_motion_event(server_state, raw_dx, raw_dy, origin);
+        self.dispatch_motion_event(server_state, raw_dx, raw_dy, origin, time);
         server_state.barrier_bypass = prev;
     }
 
@@ -841,6 +869,7 @@ impl<P: Platform> XBackend<P> {
                     press_mode,
                     ev.child.0,
                     post_state,
+                    time,
                 );
             }
         }
@@ -854,23 +883,37 @@ impl<P: Platform> XBackend<P> {
         x: i32,
         y: i32,
     ) {
-        // Route through the absolute-motion input path: updates the
-        // tracked cursor (and HW cursor plane) and fans out the
-        // motion/crossing events WarpPointer is specified to generate
-        // ("as if the user had instantaneously moved the pointer").
-        self.on_host_input(
+        // Route through the absolute-motion path: updates the tracked
+        // cursor (and HW cursor plane) and fans out the motion/crossing
+        // events WarpPointer is specified to generate ("as if the user had
+        // instantaneously moved the pointer"), but no XI2 raw motion: a
+        // warp is not the device's (Xorg's miPointerMove passes
+        // POINTER_NORAW; `warp_pointer_event_fanout_to_state`).
+        #[allow(clippy::cast_precision_loss)]
+        self.process_pointer_absolute(
             state,
-            yserver_core::core_loop::HostInputEvent::PointerMotion {
-                origin: yserver_core::core_loop::InputOrigin::NestedHost,
-                x,
-                y,
-                time: 0,
-                relative: false,
-                dx: 0,
-                dy: 0,
-                motion_delta: None,
-            },
+            x as f32,
+            y as f32,
+            false,
+            0,
+            0,
+            yserver_core::core_loop::InputOrigin::NestedHost,
+            crate::clock::server_time_ms(),
         );
+        // As `on_host_input`'s drain: the absolute motion's barrier
+        // bypass holds until its queued events reach the fanout.
+        let previous_barrier_bypass = state.barrier_bypass;
+        state.barrier_bypass =
+            previous_barrier_bypass || std::mem::take(&mut self.core.pending_motion_barrier_bypass);
+        let pending = std::mem::take(&mut self.core.pending_pointer_events);
+        let xid_map = self.core.xid_map.clone();
+        for ev in pending {
+            let _dropped =
+                yserver_core::core_loop::pointer_fanout::warp_pointer_event_fanout_to_state(
+                    state, self, &xid_map, ev,
+                );
+        }
+        state.barrier_bypass = previous_barrier_bypass;
         #[allow(clippy::cast_possible_truncation)]
         let (warped_x, warped_y) = (self.core.cursor_x as i32, self.core.cursor_y as i32);
         P::host_pointer_warped(self, warped_x, warped_y);

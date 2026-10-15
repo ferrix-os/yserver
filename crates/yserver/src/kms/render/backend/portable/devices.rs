@@ -455,12 +455,23 @@ impl<P: Platform> XBackend<P> {
                 origin,
                 x,
                 y,
+                time,
                 relative,
                 dx,
                 dy,
                 motion_delta,
                 ..
             } => {
+                // The motion's own time, which the Wayland link stamps with
+                // the device's and the libinput thread with the server's as
+                // it read the event; 0 (an XTEST fake, whose time field is a
+                // delay) is the server's now, as Xorg's GetPointerEvents
+                // stamps it.
+                let time = if time == 0 {
+                    crate::clock::server_time_ms()
+                } else {
+                    time
+                };
                 if let Some(device_id) =
                     yserver_core::core_loop::pointer_fanout::floating_pointer_device_id(
                         state, origin,
@@ -526,10 +537,11 @@ impl<P: Platform> XBackend<P> {
                             dx,
                             dy,
                             origin,
+                            time,
                         );
                     } else {
                         self.process_pointer_absolute(
-                            state, x as f32, y as f32, relative, dx, dy, origin,
+                            state, x as f32, y as f32, relative, dx, dy, origin, time,
                         );
                     }
                 }

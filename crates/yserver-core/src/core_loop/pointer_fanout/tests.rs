@@ -6021,3 +6021,64 @@ fn a_grabbed_press_names_the_grab_windows_child_under_the_pointer() {
         "the root's child under the pointer, not its child's child"
     );
 }
+
+/// The XI2 event types of a stream of GenericEvents.
+fn xi2_evtypes(bytes: &[u8]) -> Vec<u16> {
+    let mut evtypes = Vec::new();
+    let mut off = 0usize;
+    while off + 32 <= bytes.len() {
+        if bytes[off] == 35 {
+            evtypes.push(u16::from_le_bytes([bytes[off + 8], bytes[off + 9]]));
+            let length = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap()) as usize;
+            off += 32 + length * 4;
+        } else {
+            off += 32;
+        }
+    }
+    evtypes
+}
+
+#[test]
+fn a_warp_moves_the_pointer_with_no_raw_motion() {
+    // Xorg: WarpPointer -> miPointerMove -> GetPointerEvents with
+    // POINTER_NORAW; raw events come only from the device.
+    let mut state = ServerState::new();
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    let mut peer = install_client(&mut state, 1);
+    state
+        .clients
+        .get_mut(&1)
+        .expect("client")
+        .xi2_masks
+        .insert((ROOT_WINDOW, 0), (1 << 6) | (1 << 17));
+    let dropped = warp_pointer_event_fanout_to_state(
+        &mut state,
+        &mut backend,
+        &HostXidMap::new(),
+        motion_event(),
+    );
+    assert!(dropped.is_empty());
+    let evtypes = xi2_evtypes(&read_all_available(&mut peer));
+    assert!(evtypes.contains(&6), "the warp's XI_Motion: {evtypes:?}");
+    assert!(!evtypes.contains(&17), "no XI_RawMotion: {evtypes:?}");
+
+    // A motion from the device has its raw event.
+    let mut device = motion_event();
+    device.root_x += 1;
+    device.event_x += 1;
+    device.raw_dx = 1;
+    let dropped = pointer_event_fanout_to_state(
+        &mut state,
+        &mut backend,
+        &HostXidMap::new(),
+        device,
+        true,
+        false,
+    );
+    assert!(dropped.is_empty());
+    let evtypes = xi2_evtypes(&read_all_available(&mut peer));
+    assert!(
+        evtypes.contains(&17),
+        "the device's XI_RawMotion: {evtypes:?}"
+    );
+}

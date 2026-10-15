@@ -2559,6 +2559,7 @@ impl<P: Platform> XBackend<P> {
             host_xid,
             mask,
             yserver_core::core_loop::InputOrigin::NestedHost,
+            crate::clock::server_time_ms(),
         );
         let pending = std::mem::take(&mut self.core.pending_pointer_events);
         let xid_map = self.core.xid_map.clone();
