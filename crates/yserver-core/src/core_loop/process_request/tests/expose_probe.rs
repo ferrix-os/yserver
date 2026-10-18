@@ -700,3 +700,54 @@ fn damage_notifies_follow_the_damage_list_order() {
         ]
     );
 }
+
+/// A window whose background waits for the backing its map allocates is
+/// painted, once the backing exists, where its map exposures paint: its
+/// content less its viewable children (ClipByChildren). Painted whole, it
+/// covered the children in the backing they share, borders included, and a
+/// child's own deferred paint is its background alone.
+#[test]
+fn a_deferred_background_leaves_the_childrens_area_alone() {
+    let mut p = Probe::new();
+    p.redirect_subwindows(ROOT_WINDOW.0);
+    let w = p.create("W", ROOT_WINDOW.0, (0, 0, 178, 178), Bg::Pixel(0xFF_FFFF));
+    let c = p.create("C", w, (10, 10, 50, 50), Bg::Pixel(0xFF_FFFF));
+    p.map(c);
+    p.map(w);
+    let host = p
+        .state
+        .resources
+        .window(ResourceId(w))
+        .and_then(|w| w.host_xid)
+        .expect("W's host")
+        .as_raw();
+    let rects: Vec<(i16, i16, u16, u16)> = p
+        .backend
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            RecordedCall::PaintWindowBackgroundRect {
+                host_xid,
+                x,
+                y,
+                width,
+                height,
+            } if *host_xid == host => Some((*x, *y, *width, *height)),
+            _ => None,
+        })
+        .collect();
+    assert!(!rects.is_empty(), "W's background is painted");
+    let overlaps_child = |&(x, y, w, h): &(i16, i16, u16, u16)| {
+        let (x, y, w, h) = (i32::from(x), i32::from(y), i32::from(w), i32::from(h));
+        x < 60 && x + w > 10 && y < 60 && y + h > 10
+    };
+    assert!(
+        !rects.iter().any(overlaps_child),
+        "nothing of W's paint covers C: {rects:?}"
+    );
+    let area: u32 = rects
+        .iter()
+        .map(|&(_, _, w, h)| u32::from(w) * u32::from(h))
+        .sum();
+    assert_eq!(area, 178 * 178 - 50 * 50, "all of W but C: {rects:?}");
+}
