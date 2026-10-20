@@ -117,6 +117,11 @@ pub(crate) fn open_headless(
     Ok(Some(OpenedRenderNode { fd, node }))
 }
 
+/// Whether `YSERVER_DRI_RENDER_NODE` names a render node.
+pub(crate) fn render_node_named() -> bool {
+    explicit_render_node_path().is_some()
+}
+
 fn explicit_render_node_path() -> Option<PathBuf> {
     let path = PathBuf::from(env::var_os(RENDER_NODE_ENV)?);
     (!path.as_os_str().is_empty()).then_some(path)
