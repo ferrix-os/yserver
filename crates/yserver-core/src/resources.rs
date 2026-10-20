@@ -1865,8 +1865,25 @@ impl ResourceTable {
                 owner,
                 host_xid: None,
                 composite_name: false,
+                shm_source: None,
             },
         );
+    }
+
+    /// Tie pixmap `id` to the shared-memory segment its contents live in.
+    pub fn set_pixmap_shm_source(&mut self, id: ResourceId, source: ShmPixmapSource) {
+        if let Some(p) = self.pixmaps.get_mut(&id.0) {
+            p.shm_source = Some(source);
+        }
+    }
+
+    /// A detached segment: the pixmaps made in it keep their last contents.
+    pub fn forget_shm_segment(&mut self, shmseg: u32) {
+        for p in self.pixmaps.values_mut() {
+            if p.shm_source.is_some_and(|source| source.shmseg == shmseg) {
+                p.shm_source = None;
+            }
+        }
     }
 
     /// Mark `id` as a `NameWindowPixmap` name: it owns one alias ref on its host backing.
@@ -3562,6 +3579,19 @@ pub struct Pixmap {
     pub host_xid: Option<crate::backend::PixmapHandle>,
     /// A `NameWindowPixmap` name: owns one alias ref on its backing (Xorg `compext.c:260`).
     pub composite_name: bool,
+    /// A MIT-SHM `CreatePixmap`'s segment and offset: the pixmap's contents
+    /// are that memory, which its client writes at any time, so the backing
+    /// is filled from it again whenever the pixmap is read (Present, copies).
+    /// `None` once the segment is detached: the pixmap keeps what it last had.
+    pub shm_source: Option<ShmPixmapSource>,
+}
+
+/// Where a shared-memory pixmap's contents live: a client's attached
+/// segment, by its `shmseg` id, from `offset`, in Z format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShmPixmapSource {
+    pub shmseg: u32,
+    pub offset: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -3941,6 +3971,7 @@ mod tests {
                 owner,
                 host_xid: Some(PixmapHandle::from_raw_for_test(0xb01)),
                 composite_name: false,
+                shm_source: None,
             },
         );
 
@@ -3987,6 +4018,7 @@ mod tests {
                 owner,
                 host_xid: Some(PixmapHandle::from_raw_for_test(0xa01)),
                 composite_name: false,
+                shm_source: None,
             },
         );
 

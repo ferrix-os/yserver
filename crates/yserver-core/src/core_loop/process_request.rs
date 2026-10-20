@@ -9889,10 +9889,15 @@ fn handle_mit_shm_request(
             // SAFETY: geteuid/getegid take no arguments and cannot fail.
             let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
             #[allow(clippy::cast_possible_truncation)]
+            // Shared pixmaps: a MIT-SHM pixmap is filled from its segment
+            // whenever it is read (`refresh_shm_pixmap`), so what the
+            // client wrote is what a Present or a copy of it shows. Mesa's
+            // software Vulkan WSI presents through them, rather than
+            // sending every frame as a PutImage.
             let reply = shm::encode_query_version_reply(
                 byte_order,
                 sequence,
-                false,
+                true,
                 euid as u16,
                 egid as u16,
             );
@@ -9976,7 +9981,23 @@ fn handle_mit_shm_request(
         }
         shm::DETACH => {
             if let Some(shmseg) = shm::parse_detach(body) {
-                state.mit_shm_segments.remove(&shmseg);
+                if state.mit_shm_segments.remove(&shmseg).is_none() {
+                    // Xorg's VERIFY_SHMSEG: BadShmSeg, the extension's
+                    // first error. Mesa's WSI tells a local server by this
+                    // answer to a Detach of segment 0 (a remote one has no
+                    // MIT-SHM and answers BadRequest).
+                    const BAD_SHM_SEG: u8 = 168;
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        BAD_SHM_SEG,
+                        shmseg,
+                        u16::from(minor),
+                        MIT_SHM_MAJOR_OPCODE,
+                    );
+                }
+                state.resources.forget_shm_segment(shmseg);
             }
         }
         shm::CREATE_PIXMAP => {
@@ -10192,7 +10213,54 @@ fn handle_mit_shm_create_pixmap(
             .set_pixmap_host_xid(ResourceId(req.pid), xid);
         debug_assert!(updated, "pixmap was just inserted above");
     }
+    state.resources.set_pixmap_shm_source(
+        ResourceId(req.pid),
+        crate::resources::ShmPixmapSource {
+            shmseg: req.shmseg,
+            offset: req.offset,
+        },
+    );
     Ok(RequestOutcome::Handled)
+}
+
+/// Fill a MIT-SHM pixmap's backing from its segment, as it is about to be
+/// read: the client writes the segment directly, and the backing is a
+/// renderer image, not that memory. Nothing for any other pixmap.
+fn refresh_shm_pixmap(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    pixmap: ResourceId,
+) {
+    let Some(p) = state.resources.pixmap(pixmap) else {
+        return;
+    };
+    let (Some(source), Some(host_xid)) = (p.shm_source, p.host_xid) else {
+        return;
+    };
+    let Some(len) = zpixmap_expected_len(p.width, p.height, p.depth) else {
+        return;
+    };
+    let Some(segment) = state.mit_shm_segments.get(&source.shmseg) else {
+        return;
+    };
+    let start = source.offset as usize;
+    let Some(bytes) = segment.as_slice().get(start..start.saturating_add(len)) else {
+        return;
+    };
+    let _ = backend.clear_clip_rectangles(origin);
+    if let Err(err) = backend.put_image(
+        origin,
+        host_xid.as_raw(),
+        p.depth,
+        p.width,
+        p.height,
+        0,
+        0,
+        bytes,
+    ) {
+        log::warn!("MIT-SHM pixmap 0x{:x}: refresh from its segment failed: {err}", pixmap.0);
+    }
 }
 
 fn handle_mit_shm_put_image(
@@ -13488,6 +13556,7 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
+            refresh_shm_pixmap(state, backend, origin, ResourceId(req.pixmap));
             // Phase 4.2.3: wait_fence / idle_fence are accepted. The
             // dispatcher mirrors the result onto state.sync_fences via
             // the XSync resource table for QueryFence / TriggerFence.
@@ -13894,6 +13963,7 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
+            refresh_shm_pixmap(state, backend, origin, ResourceId(req.pixmap));
             let acquire_known = req.acquire_syncobj != 0
                 && backend.dri3_syncobj_owned(client_id, req.acquire_syncobj);
             if !acquire_known {
@@ -30472,6 +30542,7 @@ fn handle_copy_area(
     if request.width == 0 || request.height == 0 {
         return Ok(RequestOutcome::Handled);
     }
+    refresh_shm_pixmap(state, backend, origin, request.src);
     debug!(
         "client {} #{} CopyArea src=0x{:x} dst=0x{:x} gc=0x{:x} src=({},{}) dst=({},{}) {}x{}",
         client_id.0,
@@ -35469,6 +35540,121 @@ mod tests {
             },
         );
         b
+    }
+
+    fn shm_request(
+        state: &mut ServerState,
+        backend: &mut RecordingBackend,
+        sequence: u16,
+        minor: u8,
+        body: &[u8],
+    ) {
+        #[allow(clippy::cast_possible_truncation)]
+        let length_units = 1 + (body.len() / 4) as u32;
+        process_request(
+            state,
+            backend,
+            ClientId(1),
+            SequenceNumber(sequence),
+            RequestHeader {
+                opcode: 130,
+                data: minor,
+                length_units,
+            },
+            body,
+            None,
+        )
+        .expect("MIT-SHM dispatch");
+    }
+
+    fn put_images_into(backend: &RecordingBackend, host_xid: u32) -> usize {
+        backend
+            .calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    crate::backend::recording::RecordedCall::PutImage { host_xid: xid, .. }
+                        if *xid == host_xid
+                )
+            })
+            .count()
+    }
+
+    /// Mesa's software Vulkan WSI presents through MIT-SHM only when the
+    /// server says it has shared pixmaps, and only when a Detach of segment 0
+    /// is an error other than BadRequest (`wsi_x11_connection_init`).
+    #[test]
+    fn mit_shm_offers_shared_pixmaps_and_refuses_an_unknown_segment() {
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        shm_request(&mut state, &mut backend, 1, 0, &[]);
+        let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(reply[0], 1, "ShmQueryVersion replies");
+        assert_eq!(reply[1], 1, "shared pixmaps are offered");
+        assert_eq!(reply[16], 2, "in Z format");
+
+        shm_request(&mut state, &mut backend, 2, 2, &0u32.to_le_bytes());
+        let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+        assert_eq!(reply.len(), 32);
+        assert_eq!(reply[0], 0, "an error");
+        assert_eq!(reply[1], 168, "BadShmSeg, MIT-SHM's first error");
+        assert_eq!(reply[10], 130);
+    }
+
+    /// A shared pixmap is the client's memory: what the client writes after
+    /// CreatePixmap is what a read of the pixmap gives, until the segment
+    /// is detached.
+    #[test]
+    fn mit_shm_pixmap_is_filled_from_its_segment_when_read_until_detached() {
+        const PIXMAP: u32 = 0x0020_0001;
+        const SHMSEG: u32 = 0x0020_0003;
+        let mut state = ServerState::new();
+        let mut peer = install_client(&mut state, 1);
+        let mut backend = RecordingBackend::new();
+
+        let fd = unsafe { libc::memfd_create(c"mit-shm-shared-pixmap".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0, "memfd_create failed");
+        assert_eq!(unsafe { libc::ftruncate(fd, 64) }, 0, "ftruncate failed");
+        let segment = crate::server::MitShmSegment::from_fd(ClientId(1), fd, false)
+            .expect("map test SHM segment");
+        state.mit_shm_segments.insert(SHMSEG, segment);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&PIXMAP.to_le_bytes());
+        body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&4u16.to_le_bytes());
+        body.extend_from_slice(&[24, 0, 0, 0]);
+        body.extend_from_slice(&SHMSEG.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes());
+        shm_request(&mut state, &mut backend, 1, 5, &body);
+        let host = state
+            .resources
+            .pixmap(ResourceId(PIXMAP))
+            .and_then(|p| p.host_xid)
+            .expect("the shared pixmap has a backing")
+            .as_raw();
+        assert_eq!(put_images_into(&backend, host), 1, "filled once at CreatePixmap");
+
+        refresh_shm_pixmap(&state, &mut backend, None, ResourceId(PIXMAP));
+        assert_eq!(put_images_into(&backend, host), 2, "filled again as it is read");
+
+        shm_request(&mut state, &mut backend, 2, 2, &SHMSEG.to_le_bytes());
+        assert!(
+            read_all_or_buffered(&mut state, 1, &mut peer).is_empty(),
+            "a known segment detaches without an error"
+        );
+        refresh_shm_pixmap(&state, &mut backend, None, ResourceId(PIXMAP));
+        assert_eq!(
+            put_images_into(&backend, host),
+            2,
+            "a detached segment's pixmap keeps what it had"
+        );
     }
 
     #[test]
