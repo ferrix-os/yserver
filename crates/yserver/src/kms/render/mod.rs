@@ -37,5 +37,6 @@ pub(crate) mod target;
 pub(crate) mod telemetry;
 pub(crate) mod transform_intermediate;
 pub(crate) mod upload_arena;
+pub(crate) mod wl_direct;
 
 pub use backend::KmsBackend;

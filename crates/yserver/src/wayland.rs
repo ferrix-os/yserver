@@ -120,9 +120,11 @@ pub enum Request {
 
 mod clipboard;
 mod clock;
+mod direct;
 mod input;
 mod lock;
 mod popups;
+pub use direct::DirectFrame;
 pub use input::CursorSource;
 
 /// What the link needs of the renderer: each top-level's image, by the
@@ -145,6 +147,24 @@ pub trait WindowImages {
         border: u16,
         out: &mut [u8],
     ) -> bool;
+
+    /// The window's frame when it is a client's whole-window DRI3 buffer
+    /// its backing is owed rather than holds (`kms/render/wl_direct.rs`):
+    /// what can be handed to the compositor as it is ([`direct`]).
+    fn direct_frame(&mut self, _host_xid: u32) -> Option<DirectFrame> {
+        None
+    }
+
+    /// The client's buffer of [`DirectFrame::generation`], a descriptor of
+    /// its own.
+    fn direct_fd(&self, _generation: u64) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
+
+    /// The generations of client buffers that went since asked last.
+    fn take_freed_direct(&mut self) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// Where a window of the compositor's is in drawing it: the frame callback
@@ -160,6 +180,8 @@ struct Frames {
     /// A hash of each row of the image last handed over, which the next
     /// is compared with to say which rows changed.
     rows: Vec<u64>,
+    /// The [`DirectFrame::serial`] last shown as the client's own buffer.
+    direct: Option<u64>,
 }
 
 /// A top-level X window as the compositor's window.
@@ -212,6 +234,9 @@ pub struct WaylandLink {
     clipboard: Option<clipboard::Clipboard>,
     /// The Present clock of the root's RandR output ([`clock`]).
     clock: clock::FrameClock,
+    /// Zero-copy windows ([`direct`]); `None` when the compositor takes
+    /// no dmabufs.
+    direct: Option<direct::Direct>,
 }
 
 impl WaylandLink {
@@ -227,6 +252,7 @@ impl WaylandLink {
             io::Error::new(io::ErrorKind::NotConnected, format!("wayland: {error}"))
         })?;
         let clipboard = clipboard::Clipboard::bind(&mut client);
+        let direct = direct::Direct::bind(&mut client);
         let mut seat = input::Seat::default();
         seat.bind_relative(&mut client);
         if clipboard.is_none() {
@@ -240,6 +266,7 @@ impl WaylandLink {
             refresh
         );
         Ok(Self {
+            direct,
             clock,
             clipboard,
             client,
@@ -250,6 +277,13 @@ impl WaylandLink {
             popups: Vec::new(),
             dismissed: HashSet::new(),
         })
+    }
+
+    /// Whether a whole-window present can be handed to the compositor as
+    /// the client's buffer ([`direct`]).
+    #[must_use]
+    pub const fn takes_dmabufs(&self) -> bool {
+        self.direct.is_some()
     }
 
     /// The socket, for the core loop's poller.
@@ -364,6 +398,15 @@ impl WaylandLink {
             } if self.clipboard.as_mut().is_some_and(|clipboard| {
                 clipboard.event(&mut self.client, object, opcode, args)
             }) => {}
+            Event::Object {
+                object,
+                opcode,
+                ref args,
+                ..
+            } if self
+                .direct
+                .as_mut()
+                .is_some_and(|direct| direct.event(&mut self.client, object, opcode, args)) => {}
             other => log::debug!("wayland: {other:?}"),
         }
     }
@@ -486,6 +529,10 @@ impl WaylandLink {
     /// top-levels, and hand over each image that changed and whose last
     /// frame the compositor has shown. Once per loop iteration.
     pub fn sync(&mut self, state: &ServerState, images: &mut dyn WindowImages) {
+        let freed = images.take_freed_direct();
+        if let Some(direct) = self.direct.as_mut() {
+            direct.forget(&mut self.client, freed);
+        }
         // The Present clock's armed wake is spent once the loop has come
         // round for it (the core arms again for what still waits), and it
         // follows the screen's rate.
@@ -615,14 +662,26 @@ impl WaylandLink {
                 self.requests.push(Request::Close { window: window.id });
             }
 
-            show(
-                &mut self.client,
-                images,
-                toplevel.surface,
-                (host_xid, window),
-                &mut toplevel.frames,
-                false,
-            );
+            let direct = self.direct.as_mut().is_some_and(|direct| {
+                direct.show(
+                    &mut self.client,
+                    images,
+                    state,
+                    toplevel.surface,
+                    (host_xid, window),
+                    &mut toplevel.frames,
+                )
+            });
+            if !direct {
+                show(
+                    &mut self.client,
+                    images,
+                    toplevel.surface,
+                    (host_xid, window),
+                    &mut toplevel.frames,
+                    false,
+                );
+            }
         }
         self.show_popups(state, images);
         self.renamed.clear();

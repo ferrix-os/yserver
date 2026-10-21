@@ -1680,6 +1680,10 @@ pub struct KmsBackend {
     /// XID: each pixmap is filled from its mapping as it is read
     /// ([`Dri3Mapped`]).
     pub(crate) dri3_mapped: HashMap<u32, Dri3Mapped>,
+    /// Zero-copy presents to the Wayland compositor: the DRI3 buffers it
+    /// can be handed and the window backings owed a present
+    /// ([`super::wl_direct`]).
+    pub(crate) wl_direct: super::wl_direct::WlDirect,
     /// Highest-priority sprite override for an active pointer grab
     /// (Xorg `ActivatePointerGrab`). When `Some(h)`, host cursor
     /// handle `h` is displayed regardless of the per-window cursor
@@ -5457,6 +5461,7 @@ impl KmsBackend {
             default_cursor_xid: None,
             effective_cursor_xid: None,
             dri3_mapped: HashMap::new(),
+            wl_direct: super::wl_direct::WlDirect::default(),
             grab_cursor_override: None,
             cursor_hidden: false,
             displayed_cursor_pending: None,
@@ -6478,6 +6483,7 @@ impl KmsBackend {
             default_cursor_xid: None,
             effective_cursor_xid: None,
             dri3_mapped: HashMap::new(),
+            wl_direct: super::wl_direct::WlDirect::default(),
             grab_cursor_override: None,
             cursor_hidden: false,
             displayed_cursor_pending: None,
@@ -20056,6 +20062,7 @@ impl crate::wayland::WindowImages for KmsBackend {
         let Some(target) = self.resolve_paint_target(host_xid) else {
             return false;
         };
+        self.wl_direct_settle(target.backing_id());
         let depth = target.x11_depth();
         if depth != 24 && depth != 32 {
             return false;
@@ -20119,6 +20126,144 @@ impl crate::wayland::WindowImages for KmsBackend {
                 false
             }
         }
+    }
+
+    fn direct_frame(&mut self, host_xid: u32) -> Option<crate::wayland::DirectFrame> {
+        let backing = self.resolve_paint_target(host_xid)?.backing_id();
+        let owed = *self.wl_direct.owed.get(&backing)?;
+        // The window presented to may have gone, and its backing's id been
+        // reused: then the entry is stale.
+        if self
+            .resolve_paint_target(owed.dst)
+            .map(super::target::PaintTarget::backing_id)
+            != Some(backing)
+        {
+            let _ = self.wl_direct.owed.remove(&backing);
+            return None;
+        }
+        let layout = self.wl_direct.layouts.get(&owed.src)?;
+        Some(crate::wayland::DirectFrame {
+            generation: layout.generation,
+            serial: owed.serial,
+            dst_host_xid: owed.dst,
+            width: owed.width,
+            height: owed.height,
+            offset: layout.offset,
+            stride: layout.stride,
+            depth: layout.depth,
+        })
+    }
+
+    fn direct_fd(&self, generation: u64) -> Option<std::os::fd::OwnedFd> {
+        self.wl_direct
+            .layouts
+            .values()
+            .find(|layout| layout.generation == generation)
+            .and_then(|layout| layout.fd.try_clone().ok())
+    }
+
+    fn take_freed_direct(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.wl_direct.freed)
+    }
+}
+
+/// Zero-copy presents to the Wayland compositor ([`super::wl_direct`]).
+impl KmsBackend {
+    /// Make the copy a direct present to `backing` skipped: the presented
+    /// pixmap, filled from its buffer, into the window, as
+    /// `execute_present_pixmap_copy` would have. Nothing when nothing is
+    /// owed.
+    pub(crate) fn wl_direct_settle(&mut self, backing: DrawableId) {
+        let Some(owed) = self.wl_direct.owed.remove(&backing) else {
+            return;
+        };
+        self.refresh_pixmap_for_read(owed.src);
+        let (Some(src), Some(dst)) = (
+            self.resolve_paint_target(owed.src),
+            self.resolve_paint_target(owed.dst),
+        ) else {
+            return;
+        };
+        let (sx, sy) = src.offset();
+        let (dx, dy) = dst.offset();
+        let rect = ash::vk::Rect2D {
+            offset: ash::vk::Offset2D { x: sx, y: sy },
+            extent: ash::vk::Extent2D {
+                width: u32::from(owed.width),
+                height: u32::from(owed.height),
+            },
+        };
+        if let Err(error) = self.engine.copy_area(
+            &mut self.store,
+            &mut self.platform,
+            src.src(),
+            dst.dst(),
+            rect,
+            ash::vk::Offset2D { x: dx, y: dy },
+        ) {
+            log::warn!(
+                "wayland: settling the direct present of 0x{:x} into 0x{:x}: {error:?}",
+                owed.src,
+                owed.dst
+            );
+        }
+    }
+
+    /// A pixmap goes: the backings owed it are settled while it can still
+    /// be read, and the compositor's buffers of it go too.
+    fn wl_direct_forget_pixmap(&mut self, host_xid: u32) {
+        for backing in self.wl_direct.owed_from(host_xid) {
+            self.wl_direct_settle(backing);
+        }
+        self.wl_direct.forget(host_xid);
+    }
+
+    /// A `PresentPixmap` of a whole window from a LINEAR DRI3 buffer, to a
+    /// compositor that takes dmabufs: owed to the window's backing rather
+    /// than copied, the completion queued as the copy's would be. Any
+    /// other present settles what the backing is owed first, so it draws
+    /// over the frame it follows.
+    #[cfg(feature = "wayland")]
+    fn try_wayland_direct(
+        &mut self,
+        candidate: &yserver_core::backend::PresentScanoutCandidate,
+        event: yserver_core::backend::CompletedPresentEvent,
+    ) -> bool {
+        let Some(target) = self.resolve_paint_target(candidate.paint_dst_host_xid) else {
+            return false;
+        };
+        let backing = target.backing_id();
+        let eligible = self.wl_direct.enabled()
+            && self
+                .wayland
+                .as_ref()
+                .is_some_and(crate::wayland::WaylandLink::takes_dmabufs)
+            && !candidate.explicit_sync
+            && candidate.update_is_full
+            && candidate.valid_region_xid == 0
+            && (candidate.x_off, candidate.y_off) == (0, 0)
+            && target.offset() == (0, 0)
+            && !target.has_border_clip()
+            && self
+                .wl_direct
+                .layouts
+                .get(&candidate.src_host_xid)
+                .is_some_and(|layout| {
+                    (layout.width, layout.height) == (candidate.src_width, candidate.src_height)
+                });
+        if !eligible {
+            self.wl_direct_settle(backing);
+            return false;
+        }
+        self.wl_direct.owe(
+            backing,
+            candidate.src_host_xid,
+            candidate.paint_dst_host_xid,
+            candidate.src_width,
+            candidate.src_height,
+        );
+        self.enqueue_present_completion(event, candidate.completion_dst_host_xid);
+        true
     }
 }
 
@@ -20291,6 +20436,7 @@ impl KmsBackend {
                 io::Error::last_os_error()
             )));
         }
+        let wl_fd = fd.try_clone().ok();
         let mapped = Dri3Mapped {
             fd,
             map,
@@ -20308,6 +20454,12 @@ impl KmsBackend {
             handle.as_raw()
         );
         let _ = self.dri3_mapped.insert(handle.as_raw(), mapped);
+        if let (Some(fd), Ok(offset), Ok(stride)) =
+            (wl_fd, u32::try_from(offset), u32::try_from(stride))
+        {
+            self.wl_direct
+                .record(handle.as_raw(), fd, offset, stride, width, height, depth);
+        }
         self.refresh_pixmap_for_read(handle.as_raw());
         Ok(handle)
     }
@@ -21234,6 +21386,10 @@ impl Backend for KmsBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
+        #[cfg(feature = "wayland")]
+        if self.wayland.is_some() {
+            return Ok(self.try_wayland_direct(&candidate, event));
+        }
         if self.scanout_m2.reentry_blocked_until_composed {
             return Ok(false);
         }
@@ -24224,6 +24380,7 @@ impl Backend for KmsBackend {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.wl_direct_forget_pixmap(host_xid);
         let _ = self.dri3_mapped.remove(&host_xid);
         // If the current clip cache still has only metadata, freeze the CPU
         // bytes now while the source drawable is still live. This preserves
@@ -24930,6 +25087,15 @@ impl Backend for KmsBackend {
         height: u16,
     ) -> io::Result<()> {
         self.telemetry.record_copy_area_call();
+        // A window backing owed a direct present is settled before it is
+        // read or drawn into (`super::wl_direct`).
+        if !self.wl_direct.owed.is_empty() {
+            for host_xid in [src_host_xid, dst_host_xid] {
+                if let Some(target) = self.resolve_paint_target(host_xid) {
+                    self.wl_direct_settle(target.backing_id());
+                }
+            }
+        }
         // Resolve the SOURCE the same way as the destination. A window
         // that is Composite-redirected (or whose ancestor is) has its
         // pixels in the redirect *backing*; its own leaf storage is
@@ -25727,6 +25893,11 @@ impl Backend for KmsBackend {
         height: u16,
         plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        if !self.wl_direct.owed.is_empty()
+            && let Some(target) = self.resolve_paint_target(host_xid)
+        {
+            self.wl_direct_settle(target.backing_id());
+        }
         // Stage 4a — resolve through redirect routing per spec Risk 1
         // ("GetImage reads what the X server considers W's content,
         // which under redirect is B").
@@ -28190,6 +28361,11 @@ impl Backend for KmsBackend {
         {
             return self.dri3_import_mapped(fd, width, height, stride, offset, depth);
         }
+        // The compositor can be handed a LINEAR buffer as it is
+        // (`super::wl_direct`).
+        let wl_fd = (modifier == crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR)
+            .then(|| fd.try_clone().ok())
+            .flatten();
         let drawable = crate::kms::vk::dri3::import_dmabuf_reporting(
             vk.clone(),
             fd,
@@ -28254,8 +28430,13 @@ impl Backend for KmsBackend {
         // the per-second counters stay accurate under DRI3 traffic.
         self.telemetry.record_storage_allocation();
         self.telemetry.record_image_view_create();
-        PixmapHandle::from_raw(host_xid)
-            .ok_or_else(|| io::Error::other("DRI3 import: failed to make PixmapHandle"))
+        let handle = PixmapHandle::from_raw(host_xid)
+            .ok_or_else(|| io::Error::other("DRI3 import: failed to make PixmapHandle"))?;
+        if let Some(fd) = wl_fd {
+            self.wl_direct
+                .record(host_xid, fd, offset, stride, width, height, depth);
+        }
+        Ok(handle)
     }
 
     fn refresh_pixmap_for_read(&mut self, host_xid: u32) {
