@@ -2358,8 +2358,10 @@ pub(crate) struct PlatformBackend {
 /// A software Vulkan device (lavapipe) drives no GPU, so it has no render
 /// node of its own and DRI3 stays off unless `YSERVER_DRI_RENDER_NODE` names
 /// one: then the clients' GPU allocates on that node and the server imports
-/// their LINEAR buffers by mapping them (`VK_EXT_external_memory_dma_buf`
-/// with `VK_EXT_image_drm_format_modifier`, which lavapipe has). Asked for,
+/// their LINEAR buffers by mapping them (`VK_EXT_external_memory_dma_buf`,
+/// which lavapipe has: import only, and without
+/// `VK_EXT_image_drm_format_modifier` where there is no `/dev/udmabuf`, as
+/// on Ferrix, so the import is the implicit LINEAR one). Asked for,
 /// never guessed, because every GL and Vulkan client then renders on that
 /// GPU rather than on the CPU.
 fn headless_render_node(vk: &VkContext) -> Option<crate::kms::render_node::OpenedRenderNode> {
@@ -2367,10 +2369,10 @@ fn headless_render_node(vk: &VkContext) -> Option<crate::kms::render_node::Opene
         if !crate::kms::render_node::render_node_named() {
             return None;
         }
-        if vk.external_memory_fd.is_none() || !vk.image_drm_format_modifier {
+        if vk.external_memory_fd.is_none() {
             log::warn!(
                 "DRI3: the software Vulkan device cannot import dma-bufs \
-                 (VK_KHR_external_memory_fd and VK_EXT_image_drm_format_modifier); DRI3 is off"
+                 (VK_KHR_external_memory_fd); DRI3 is off"
             );
             return None;
         }
@@ -2466,7 +2468,10 @@ fn build_render_device_inventory(
                     .get_driver_capability(::drm::DriverCapability::TimelineSyncObj)
                     .ok()
             })
-            .is_some_and(|value| value != 0);
+            .is_some_and(|value| value != 0)
+            && render_node_device
+                .as_deref()
+                .is_some_and(syncobj_exports_as_descriptor);
         selected.render_node = Some(render_node);
         selected.render_node_device = render_node_device;
         selected.syncobj_timeline = syncobj_timeline;
@@ -2496,6 +2501,33 @@ fn resolve_copied_sink_renderer(
             "copied scanout KMS device {kms_key} matches multiple Vulkan renderers: {:?}",
             matches.iter().map(|(id, _)| id).collect::<Vec<_>>()
         ))),
+    }
+}
+
+/// Whether the node exports a syncobj as an opaque descriptor
+/// (`SYNCOBJ_HANDLE_TO_FD` without the sync-file flag). DRI3 1.4's explicit
+/// sync is built on that: a client exports each image's timeline syncobjs
+/// so, and imports them into the server with `DRI3ImportSyncobj`. A node
+/// that has timeline syncobjs but not that export -- Ferrix's i915 front end
+/// serves sync files only -- would have Mesa's WSI choose explicit sync and
+/// then fail to make its swapchain, so DRI3 stays at 1.3 there, with
+/// implicit sync.
+fn syncobj_exports_as_descriptor(device: &drm::Device) -> bool {
+    use ::drm::control::Device as _;
+    let Ok(handle) = device.create_syncobj(false) else {
+        return false;
+    };
+    let exported = device.syncobj_to_fd(handle, false);
+    let _ = device.destroy_syncobj(handle);
+    match exported {
+        Ok(_fd) => true,
+        Err(error) => {
+            log::info!(
+                "DRI3: the render node exports no syncobj as a descriptor ({error}); \
+                 explicit sync is off"
+            );
+            false
+        }
     }
 }
 
