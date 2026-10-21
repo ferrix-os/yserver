@@ -20142,6 +20142,15 @@ pub(crate) struct Dri3Mapped {
 }
 
 impl Dri3Mapped {
+    /// The image's rows as they lie in the buffer: `stride` bytes apart,
+    /// from `offset`, `height` of them.
+    fn rows(&self) -> &[u8] {
+        // SAFETY: `map` is a live read-only mapping of `len` bytes, and
+        // `offset + stride * height <= len` was checked when it was made.
+        let bytes = unsafe { std::slice::from_raw_parts(self.map.cast::<u8>(), self.len) };
+        &bytes[self.offset..self.offset + self.stride * usize::from(self.height)]
+    }
+
     /// The image, its rows packed to `width` pixels: an X `ZPixmap` at 32
     /// bits per pixel.
     fn packed(&self) -> Vec<u8> {
@@ -21414,11 +21423,19 @@ impl Backend for KmsBackend {
             return Ok(PresentSourceWait::Ready);
         };
         let mut fds = Vec::new();
+        // A mapped DRI3 buffer (`Dri3Mapped`) is read when the present
+        // executes, so its read fence is waited for here as an import's is,
+        // from the loop, never blocking it.
+        let mapped_fd = self
+            .dri3_mapped
+            .get(&src_pixmap_host_xid)
+            .map(|mapped| mapped.fd.as_fd());
         if let Some(fd) = self
             .store
             .get(src_id)
             .and_then(|d| d.storage.imported_drawable.as_ref())
             .and_then(super::super::vk::target::DrawableImage::imported_dma_buf_fd)
+            .or(mapped_fd)
         {
             match export_dmabuf_read_access_sync_file(fd) {
                 ExportedSyncFile::Idle => {}
@@ -28188,6 +28205,9 @@ impl Backend for KmsBackend {
             }],
         )
         .map_err(|e| io::Error::other(format!("DRI3 import_dmabuf: {e:?}")))?;
+        log::info!(
+            "DRI3: pixmap ({width}x{height}, stride {stride}) is imported: the renderer reads the client's buffer in place"
+        );
         // Build a sample-side view over the imported VkImage. The
         // DRI3 path's own `vk_image_view` (kept as `image_view` on
         // the resulting Storage) is IDENTITY-swizzle and serves as
@@ -28239,20 +28259,43 @@ impl Backend for KmsBackend {
     }
 
     fn refresh_pixmap_for_read(&mut self, host_xid: u32) {
+        // No wait here: a Present waited for the client's GPU work on the
+        // buffer before it executes (`arm_present_source_wait`); a CopyArea
+        // reads it as an imported buffer's is read, under implicit sync.
+        let Some(target) = self.resolve_paint_target(host_xid) else {
+            return;
+        };
         let Some(mapped) = self.dri3_mapped.get(&host_xid) else {
             return;
         };
-        // After the client's GPU work on it, as an import's read waits
-        // (bounded: a stale frame at worst, never a stall).
-        let _ =
-            crate::kms::vk::dri3::wait_dmabuf_read_ready(std::os::fd::AsFd::as_fd(&mapped.fd), 100);
-        let bytes = mapped.packed();
-        let (depth, width, height) = (mapped.depth, mapped.width, mapped.height);
-        let _ = Backend::clear_clip_rectangles(self, None);
-        if let Err(err) =
-            Backend::put_image(self, None, host_xid, depth, width, height, 0, 0, &bytes)
-        {
-            log::warn!("DRI3: filling mapped pixmap 0x{host_xid:x}: {err}");
+        // Straight from the mapping into the upload, at the client's stride:
+        // the upload's source rows are `stride / 4` pixels apart, and the
+        // copy is clamped to the pixmap, so the padding is never read. A
+        // stride that is no whole number of pixels is repacked first.
+        let packed;
+        let (bytes, row_pixels) = match u16::try_from(mapped.stride / 4) {
+            Ok(row_pixels) if mapped.stride % 4 == 0 => (mapped.rows(), row_pixels),
+            _ => {
+                packed = mapped.packed();
+                (packed.as_slice(), mapped.width)
+            }
+        };
+        if let Err(err) = self.engine.put_image(
+            &mut self.store,
+            &mut self.platform,
+            target.dst(),
+            ash::vk::Offset2D {
+                x: target.offset().0,
+                y: target.offset().1,
+            },
+            ash::vk::Extent2D {
+                width: u32::from(row_pixels),
+                height: u32::from(mapped.height),
+            },
+            bytes,
+            mapped.depth,
+        ) {
+            log::warn!("DRI3: filling mapped pixmap 0x{host_xid:x}: {err:?}");
         }
     }
 

@@ -12908,6 +12908,10 @@ fn execute_present_pixmap_copy(
             req.serial, req.pixmap, req.window, req.x_off, req.y_off, req.valid, req.update,
         ),
     };
+    // The source is read now, when the present executes: after its wait
+    // (`arm_present_source_wait`, the client's GPU work on a DRI3 buffer)
+    // and never at the request, which would block the loop on that work.
+    refresh_pixmap_for_read(state, backend, origin, ResourceId(pixmap));
 
     let candidate = crate::backend::PresentScanoutCandidate {
         client_id: client_id.0,
@@ -13564,7 +13568,6 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
-            refresh_pixmap_for_read(state, backend, origin, ResourceId(req.pixmap));
             // Phase 4.2.3: wait_fence / idle_fence are accepted. The
             // dispatcher mirrors the result onto state.sync_fences via
             // the XSync resource table for QueryFence / TriggerFence.
@@ -13971,7 +13974,6 @@ fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
-            refresh_pixmap_for_read(state, backend, origin, ResourceId(req.pixmap));
             let acquire_known = req.acquire_syncobj != 0
                 && backend.dri3_syncobj_owned(client_id, req.acquire_syncobj);
             if !acquire_known {
