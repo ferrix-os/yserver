@@ -2359,6 +2359,12 @@ pub trait Backend {
     /// an implicit import resolves to is what `BuffersFromPixmap` must
     /// later report back — that round trip is the contract clients
     /// sample by.
+    /// Bring pixmap `host_xid`'s backing up to date before it is read
+    /// (`PresentPixmap`, `CopyArea`), for a backing that is a copy of
+    /// memory its client writes: a DRI3 buffer the renderer could not import
+    /// as it lies. Nothing for any other pixmap.
+    fn refresh_pixmap_for_read(&mut self, _host_xid: u32) {}
+
     #[allow(clippy::too_many_arguments)]
     fn dri3_import_pixmap(
         &mut self,

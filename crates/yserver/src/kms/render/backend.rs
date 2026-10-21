@@ -1676,6 +1676,10 @@ pub struct KmsBackend {
     /// is shown on screen. Driven by `update_effective_cursor`;
     /// `define_cursor` + `update_pointer_window` re-evaluate it.
     pub(crate) effective_cursor_xid: Option<u32>,
+    /// DRI3 buffers mapped rather than imported, by their pixmap's host
+    /// XID: each pixmap is filled from its mapping as it is read
+    /// ([`Dri3Mapped`]).
+    pub(crate) dri3_mapped: HashMap<u32, Dri3Mapped>,
     /// Highest-priority sprite override for an active pointer grab
     /// (Xorg `ActivatePointerGrab`). When `Some(h)`, host cursor
     /// handle `h` is displayed regardless of the per-window cursor
@@ -5452,6 +5456,7 @@ impl KmsBackend {
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
+            dri3_mapped: HashMap::new(),
             grab_cursor_override: None,
             cursor_hidden: false,
             displayed_cursor_pending: None,
@@ -6472,6 +6477,7 @@ impl KmsBackend {
             next_cursor_version: 1,
             default_cursor_xid: None,
             effective_cursor_xid: None,
+            dri3_mapped: HashMap::new(),
             grab_cursor_override: None,
             cursor_hidden: false,
             displayed_cursor_pending: None,
@@ -20116,6 +20122,188 @@ impl crate::wayland::WindowImages for KmsBackend {
     }
 }
 
+/// A client's LINEAR DRI3 buffer that the renderer cannot import as it
+/// lies, mapped read-only: a renderer without
+/// `VK_EXT_image_drm_format_modifier` (lavapipe where there is no
+/// `/dev/udmabuf`, as on Ferrix) imports a LINEAR buffer with
+/// `VK_IMAGE_TILING_LINEAR` at a row pitch of its own choosing, so a buffer
+/// whose pitch is another would be read sheared. Its pixmap is an ordinary
+/// one, filled from the mapping each time it is read
+/// (`KmsBackend::refresh_pixmap_for_read`), after the client's GPU work on it.
+pub(crate) struct Dri3Mapped {
+    fd: std::os::fd::OwnedFd,
+    map: *mut libc::c_void,
+    len: usize,
+    offset: usize,
+    stride: usize,
+    width: u16,
+    height: u16,
+    depth: u8,
+}
+
+impl Dri3Mapped {
+    /// The image, its rows packed to `width` pixels: an X `ZPixmap` at 32
+    /// bits per pixel.
+    fn packed(&self) -> Vec<u8> {
+        let row = usize::from(self.width) * 4;
+        let mut out = Vec::with_capacity(row * usize::from(self.height));
+        // SAFETY: `map` is a live read-only mapping of `len` bytes, and
+        // `offset + stride * height <= len` with `row <= stride` was checked
+        // when it was made.
+        let bytes = unsafe { std::slice::from_raw_parts(self.map.cast::<u8>(), self.len) };
+        for y in 0..usize::from(self.height) {
+            let start = self.offset + y * self.stride;
+            out.extend_from_slice(&bytes[start..start + row]);
+        }
+        out
+    }
+}
+
+// SAFETY: the mapping is read-only memory the value owns; nothing about it
+// is tied to a thread.
+unsafe impl Send for Dri3Mapped {}
+
+impl Drop for Dri3Mapped {
+    fn drop(&mut self) {
+        // SAFETY: the mapping this value made and nothing else holds.
+        unsafe {
+            libc::munmap(self.map, self.len);
+        }
+    }
+}
+
+impl KmsBackend {
+    /// Whether the renderer's own LINEAR layout of a `width` x `height`
+    /// image in `format` is `offset` and `pitch` -- what an import with
+    /// `VK_IMAGE_TILING_LINEAR` reads the client's buffer as.
+    fn linear_layout_is(
+        vk: &crate::kms::vk::device::VkContext,
+        format: vk::Format,
+        width: u16,
+        height: u16,
+        offset: u32,
+        pitch: u32,
+    ) -> bool {
+        let mut external = vk::ExternalMemoryImageCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+        let info = vk::ImageCreateInfo::default()
+            .push_next(&mut external)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: u32::from(width),
+                height: u32::from(height),
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(crate::kms::vk::dri3::CLIENT_IMPORT_USAGE)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: a valid create-info; the image is destroyed below and
+        // never bound or used.
+        let Ok(image) = (unsafe { vk.device.create_image(&info, None) }) else {
+            return false;
+        };
+        // SAFETY: `image` is a live LINEAR image of this device.
+        let layout = unsafe {
+            vk.device.get_image_subresource_layout(
+                image,
+                vk::ImageSubresource {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    array_layer: 0,
+                },
+            )
+        };
+        // SAFETY: as above; nothing else holds it.
+        unsafe { vk.device.destroy_image(image, None) };
+        layout.offset == u64::from(offset) && layout.row_pitch == u64::from(pitch)
+    }
+
+    /// A DRI3 buffer mapped, and an ordinary pixmap for it filled from the
+    /// mapping ([`Dri3Mapped`]).
+    fn dri3_import_mapped(
+        &mut self,
+        fd: std::os::fd::OwnedFd,
+        width: u16,
+        height: u16,
+        stride: u32,
+        offset: u32,
+        depth: u8,
+    ) -> io::Result<PixmapHandle> {
+        use std::os::fd::AsRawFd;
+        let row = usize::from(width) * 4;
+        let stride = stride as usize;
+        let offset = offset as usize;
+        if stride < row {
+            return Err(io::Error::other(format!(
+                "DRI3 import: stride {stride} is below a row of {width} pixels"
+            )));
+        }
+        let len = offset
+            .checked_add(
+                stride
+                    .checked_mul(usize::from(height))
+                    .ok_or_else(|| io::Error::other("DRI3 import: size"))?,
+            )
+            .ok_or_else(|| io::Error::other("DRI3 import: size"))?;
+        // A dmabuf's size is its file's (Linux sets `i_size`, as Ferrix
+        // does): a buffer smaller than its stated layout is refused rather
+        // than mapped past its end.
+        // SAFETY: fstat into a zeroed stat on a descriptor we own.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } == 0
+            && st.st_size > 0
+            && (st.st_size as u64) < len as u64
+        {
+            return Err(io::Error::other(format!(
+                "DRI3 import: a {}-byte buffer for a {len}-byte layout",
+                st.st_size
+            )));
+        }
+        // SAFETY: a shared read-only mapping of the client's buffer, kept
+        // by `Dri3Mapped` and unmapped by its drop.
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(io::Error::other(format!(
+                "DRI3 import: mapping the buffer: {}",
+                io::Error::last_os_error()
+            )));
+        }
+        let mapped = Dri3Mapped {
+            fd,
+            map,
+            len,
+            offset,
+            stride,
+            width,
+            height,
+            depth,
+        };
+        let handle = Backend::create_pixmap(self, None, depth, width, height)?;
+        log::info!(
+            "DRI3: pixmap 0x{:x} ({width}x{height}, stride {stride}) is mapped and copied as it is read: \
+             the renderer imports LINEAR only at its own pitch",
+            handle.as_raw()
+        );
+        let _ = self.dri3_mapped.insert(handle.as_raw(), mapped);
+        self.refresh_pixmap_for_read(handle.as_raw());
+        Ok(handle)
+    }
+}
+
 impl Backend for KmsBackend {
     // ── A. Accessors (mirror KmsBackend exactly) ────────────────
 
@@ -24019,6 +24207,7 @@ impl Backend for KmsBackend {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        let _ = self.dri3_mapped.remove(&host_xid);
         // If the current clip cache still has only metadata, freeze the CPU
         // bytes now while the source drawable is still live. This preserves
         // retain-after-free for CPU-clipped fills without paying the readback
@@ -27978,6 +28167,12 @@ impl Backend for KmsBackend {
             ),
         };
         let modifier = vk_modifier;
+        if !vk.image_drm_format_modifier
+            && modifier == crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR
+            && !Self::linear_layout_is(&vk, format, width, height, offset, stride)
+        {
+            return self.dri3_import_mapped(fd, width, height, stride, offset, depth);
+        }
         let drawable = crate::kms::vk::dri3::import_dmabuf_reporting(
             vk.clone(),
             fd,
@@ -28041,6 +28236,24 @@ impl Backend for KmsBackend {
         self.telemetry.record_image_view_create();
         PixmapHandle::from_raw(host_xid)
             .ok_or_else(|| io::Error::other("DRI3 import: failed to make PixmapHandle"))
+    }
+
+    fn refresh_pixmap_for_read(&mut self, host_xid: u32) {
+        let Some(mapped) = self.dri3_mapped.get(&host_xid) else {
+            return;
+        };
+        // After the client's GPU work on it, as an import's read waits
+        // (bounded: a stale frame at worst, never a stall).
+        let _ =
+            crate::kms::vk::dri3::wait_dmabuf_read_ready(std::os::fd::AsFd::as_fd(&mapped.fd), 100);
+        let bytes = mapped.packed();
+        let (depth, width, height) = (mapped.depth, mapped.width, mapped.height);
+        let _ = Backend::clear_clip_rectangles(self, None);
+        if let Err(err) =
+            Backend::put_image(self, None, host_xid, depth, width, height, 0, 0, &bytes)
+        {
+            log::warn!("DRI3: filling mapped pixmap 0x{host_xid:x}: {err}");
+        }
     }
 
     fn dri3_supported_modifiers(&self, _window: u32, depth: u8, bpp: u8) -> (Vec<u64>, Vec<u64>) {
