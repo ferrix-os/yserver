@@ -77,9 +77,83 @@ pub fn recv_with_fds(stream: &mut UnixStream, buf: &mut [u8]) -> io::Result<(usi
 
 /// Send `bytes` together with `fd` over `stream` using `sendmsg(2)` so
 /// the receiving end gets the FD via `SCM_RIGHTS`. Used by
-/// MIT-SHM::CreateSegment to pass a server-allocated `memfd_create`
-/// descriptor back to the client in its reply.
+/// MIT-SHM::CreateSegment and DRI3 to pass a server-allocated descriptor
+/// back to the client in its reply.
+///
+/// All of `bytes` goes, or an error comes back. A client's socket may be
+/// non-blocking and nearly full, so the `sendmsg` may refuse with `EAGAIN`
+/// or (on a kernel that takes what room there is) send only part; the
+/// descriptor rides with the first byte that goes, and the rest is written
+/// after it, each wait bounded by [`SEND_WAIT_MS`]. Dropping the rest used to
+/// tear the client's stream: its next reply began mid-message, and Xlib
+/// ended the client with `XIO: fatal IO error` (Ferrix, Endfield's starts,
+/// 2026-10-23).
 pub fn send_with_fd(stream: &mut UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<()> {
+    let mut sent = loop {
+        match send_once_with_fd(stream, bytes, fd) {
+            Ok(n) => break n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => wait_writable(stream)?,
+            Err(e) => return Err(e),
+        }
+    };
+    while sent < bytes.len() {
+        let rest = &bytes[sent..];
+        // SAFETY: `rest` is a live slice for the length passed.
+        let n = unsafe {
+            libc::send(
+                stream.as_raw_fd(),
+                rest.as_ptr().cast(),
+                rest.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if n >= 0 {
+            sent += n as usize;
+            continue;
+        }
+        let e = io::Error::last_os_error();
+        match e.kind() {
+            io::ErrorKind::Interrupted => {}
+            io::ErrorKind::WouldBlock => wait_writable(stream)?,
+            _ => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// How long [`send_with_fd`] waits for room each time before it gives the
+/// client up as stuck.
+const SEND_WAIT_MS: libc::c_int = 5_000;
+
+/// Wait until `stream` can take more, or fail with `TimedOut`.
+fn wait_writable(stream: &UnixStream) -> io::Result<()> {
+    let mut pfd = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: one valid pollfd.
+        let n = unsafe { libc::poll(&raw mut pfd, 1, SEND_WAIT_MS) };
+        if n > 0 {
+            return Ok(());
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "client socket stayed full while a reply with a descriptor was sent",
+            ));
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// One `sendmsg` of `bytes` with `fd` attached: the count it sent.
+fn send_once_with_fd(stream: &UnixStream, bytes: &[u8], fd: RawFd) -> io::Result<usize> {
     let mut iov = libc::iovec {
         iov_base: bytes.as_ptr() as *mut _,
         iov_len: bytes.len(),
@@ -101,12 +175,12 @@ pub fn send_with_fd(stream: &mut UnixStream, bytes: &[u8], fd: RawFd) -> io::Res
             libc::CMSG_DATA(cmsg),
             std::mem::size_of::<libc::c_int>(),
         );
-        let n = libc::sendmsg(stream.as_raw_fd(), &raw const msg, 0);
+        let n = libc::sendmsg(stream.as_raw_fd(), &raw const msg, libc::MSG_NOSIGNAL);
         if n < 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(n as usize)
     }
-    Ok(())
 }
 
 /// `Read` adapter over a `UnixStream` that uses `recvmsg(2)` under the hood
@@ -281,6 +355,45 @@ mod tests {
         assert_eq!(got, "hello-from-fd");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reply_with_a_descriptor_to_a_full_nonblocking_client_arrives_whole() {
+        use std::io::Read;
+        let (mut tx, mut rx) = UnixStream::pair().expect("socketpair");
+        tx.set_nonblocking(true).expect("nonblocking");
+        // Fill the client's socket with filler a byte short of an odd size,
+        // so the reply cannot fit whole.
+        let filler = [0x55_u8; 333];
+        let mut queued = 0_usize;
+        loop {
+            match tx.write(&filler) {
+                Ok(n) => queued += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("filling: {e}"),
+            }
+        }
+        let f = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let reply: Vec<u8> = (0..32_u8).collect();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut sink = vec![0_u8; queued];
+            rx.read_exact(&mut sink).expect("drain filler");
+            let mut got = vec![0_u8; 32];
+            let mut have = 0;
+            let mut fds = Vec::new();
+            while have < got.len() {
+                let (n, more) = recv_with_fds(&mut rx, &mut got[have..]).expect("recvmsg");
+                assert!(n > 0, "the reply ended early");
+                have += n;
+                fds.extend(more);
+            }
+            (got, fds)
+        });
+        send_with_fd(&mut tx, &reply, f.as_raw_fd()).expect("send the reply");
+        let (got, fds) = reader.join().expect("reader");
+        assert_eq!(got, reply, "the reply arrived torn");
+        assert_eq!(fds.len(), 1, "the descriptor came with it");
     }
 
     #[test]
