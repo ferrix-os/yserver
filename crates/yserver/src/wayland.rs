@@ -182,6 +182,9 @@ struct Frames {
     rows: Vec<u64>,
     /// The [`DirectFrame::serial`] last shown as the client's own buffer.
     direct: Option<u64>,
+    /// The frame callback awaited is for a client's own buffer: the
+    /// Present clock is held until it comes ([`clock`]).
+    direct_pending: bool,
 }
 
 /// A top-level X window as the compositor's window.
@@ -365,12 +368,19 @@ impl WaylandLink {
         };
         match event {
             Event::Frame { surface, .. } => {
-                if let Some(frames) = self.frames_of(surface) {
+                let held = self.frames_of(surface).is_some_and(|frames| {
                     frames.pending = false;
-                }
-                // The Present clock does not follow the frame: the
-                // compositor drew it when this server's commit came, after
-                // the MSC it shows began ([`clock`]).
+                    std::mem::take(&mut frames.direct_pending)
+                });
+                // The Present clock follows the frame only when it showed a
+                // client's own buffer, a flip, as Xwayland's does
+                // ([`clock`]); a read-back image's frame does not move it.
+                let bumped = held && self.clock.frame_done(clock::monotonic_us());
+                log::debug!(
+                    target: "present_pace",
+                    "WL-INSTR t={} stage=frame_done held={held} bumped={bumped}",
+                    yserver_core::core_loop::process_request::pace_instr_ms()
+                );
             }
             Event::Configure {
                 surface,
@@ -561,10 +571,15 @@ impl WaylandLink {
         self.retire_popups(state, &kept);
 
         let client = &mut self.client;
+        let present_clock = &mut self.clock;
         self.toplevels.retain(|host_xid, toplevel| {
             let keep = wanted.iter().any(|(wanted, _)| wanted == host_xid);
             if !keep {
                 log::info!("wayland: window 0x{host_xid:x} is gone from the compositor");
+                if toplevel.frames.direct_pending {
+                    // Its callback will not come.
+                    let _ = present_clock.frame_done(now);
+                }
                 client.destroy(toplevel.surface);
             }
             keep
@@ -681,6 +696,9 @@ impl WaylandLink {
                     &mut toplevel.frames,
                     false,
                 );
+            }
+            if toplevel.frames.direct_pending {
+                self.clock.hold(clock::monotonic_us());
             }
         }
         self.show_popups(state, images);

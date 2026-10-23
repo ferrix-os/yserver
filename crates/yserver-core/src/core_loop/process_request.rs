@@ -12244,6 +12244,9 @@ fn supersede_covered_pending_presents(
     let Some(target) = successor.effective_target_msc else {
         return;
     };
+    if !backend.present_supersedes_same_msc() {
+        return;
+    }
     let window = successor.request.window();
 
     let mut victim_ids: Vec<u64> = Vec::new();
@@ -13823,8 +13826,8 @@ fn handle_present_request(
                 );
                 log::debug!(
                     target: "present_pace",
-                    "PACE-INSTR t={} pid={} client={} serial={} stage=request kind=pixmap target_msc={} div={} rem={} kernel_msc={} eff={:?}",
-                    pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, domain.raw_msc, effective_target_msc
+                    "PACE-INSTR t={} pid={} client={} serial={} stage=request kind=pixmap target_msc={} div={} rem={} kernel_msc={} eff={:?} opts=0x{:x}",
+                    pace_instr_ms(), present_id, client_id.0, req.serial, req.target_msc, req.divisor, req.remainder, domain.raw_msc, effective_target_msc, masked_options
                 );
                 let pending = PendingPresentPixmap {
                     origin,
@@ -14645,7 +14648,7 @@ pub(crate) fn fire_due_present_notify_msc_for_domain(
 /// wait — came from it. Emission is `log::debug!(target: "present_pace", ...)`,
 /// so it is silent unless that target is explicitly enabled and costs nothing
 /// at the default log level.
-pub(crate) fn pace_instr_ms() -> u128 {
+pub fn pace_instr_ms() -> u128 {
     use std::{sync::OnceLock, time::Instant};
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     EPOCH.get_or_init(Instant::now).elapsed().as_millis()

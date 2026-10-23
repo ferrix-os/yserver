@@ -22,6 +22,23 @@
 //! while drawn. Kept to its own period, the clock leads and the
 //! compositor's frames follow it, one each MSC.
 //!
+//! Except while a client's own buffer waits to be shown. A whole-window
+//! present handed to the compositor as the client's buffer (`super::direct`)
+//! is a flip, and Xwayland lets the MSC of a window with a flip pending move
+//! only when the compositor's frame callback for it comes
+//! (`xwl_present_frame_callback` -> `xwl_present_msc_bump` in
+//! `hw/xwayland/xwayland-present.c`), its 17 ms timer stretched to a second
+//! (`TIMER_LEN_FLIP`) in case none ever comes. So does this clock
+//! ([`FrameClock::hold`], [`FrameClock::frame_done`]): from the commit until
+//! the compositor drew it, the MSC stays, and the callback begins the next.
+//! A FIFO swapchain -- Mesa's X11 WSI waits for each present's
+//! `PresentCompleteNotify` and asks for the MSC after it -- then presents
+//! one frame for each the compositor drew, and none is replaced by the next
+//! before it was shown. Timed by the timer alone, a game presenting in
+//! pairs (FSR3 frame generation) had two MSCs come due while one frame
+//! waited for its callback, and lost the first: 35 presents a second, 19
+//! shown.
+//!
 //! The UST is `CLOCK_MONOTONIC` in microseconds, as the kernel's vblank
 //! timestamps are; the period is kept in nanoseconds, so that a rate whose
 //! period is not a whole microsecond (74.992 Hz, 13 334.7 µs) does not
@@ -38,6 +55,21 @@
 /// The refresh a compositor that gave none is taken to have, in millihertz.
 const DEFAULT_REFRESH_MHZ: u64 = 60_000;
 
+/// How long the clock waits for a held frame's callback before it counts on
+/// without it, in microseconds: Xwayland's `TIMER_LEN_FLIP`. A compositor
+/// that shows the surface nowhere sends none.
+const HOLD_US: u64 = 1_000_000;
+
+/// A frame of a client's own buffer the compositor has not drawn yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Held {
+    /// The MSC it was committed in, and when that MSC began.
+    msc: u64,
+    ust: u64,
+    /// When it was committed.
+    since: u64,
+}
+
 /// One output's Present clock. Times are `CLOCK_MONOTONIC` microseconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FrameClock {
@@ -49,6 +81,9 @@ pub(crate) struct FrameClock {
     /// When the core loop must next come round for parked Present work:
     /// the time of an MSC still to come. `None` while nothing waits.
     wake: Option<u64>,
+    /// A committed frame the compositor has not drawn yet: the MSC stays
+    /// where it is until it has, or for [`HOLD_US`].
+    held: Option<Held>,
 }
 
 impl FrameClock {
@@ -61,6 +96,7 @@ impl FrameClock {
             base_msc: 1,
             base_ust: now,
             wake: None,
+            held: None,
         }
     }
 
@@ -71,8 +107,69 @@ impl FrameClock {
 
     /// The MSC `now` falls in, and the time it began.
     pub(crate) fn sample(&self, now: u64) -> (u64, u64) {
+        if let Some(held) = self.held {
+            if now < held.since.saturating_add(HOLD_US) {
+                return (held.msc, held.ust);
+            }
+            // No callback came in time: the clock went on without it.
+            return self.released(held).sample(now);
+        }
         let elapsed = self.periods_to(now);
         (self.base_msc.wrapping_add(elapsed), self.start_of(elapsed))
+    }
+
+    /// The clock as it is once `held` ends without a callback: the next
+    /// MSC begins when the wait for it ran out.
+    fn released(&self, held: Held) -> Self {
+        Self {
+            base_msc: held.msc.wrapping_add(1),
+            base_ust: held.since.saturating_add(HOLD_US),
+            held: None,
+            ..*self
+        }
+    }
+
+    /// A hold whose wait ran out by `now` ends, as if the timer had.
+    fn settle(&mut self, now: u64) {
+        if let Some(held) = self.held
+            && now >= held.since.saturating_add(HOLD_US)
+        {
+            *self = Self {
+                wake: self.wake,
+                ..self.released(held)
+            };
+        }
+    }
+
+    /// A frame of a client's own buffer was committed at `now`: the MSC
+    /// stays until the compositor's callback for it ([`FrameClock::frame_done`]).
+    /// A second commit while one is held changes nothing.
+    pub(crate) fn hold(&mut self, now: u64) {
+        self.settle(now);
+        if self.held.is_some() {
+            return;
+        }
+        let (msc, ust) = self.sample(now);
+        self.held = Some(Held {
+            msc,
+            ust,
+            since: now,
+        });
+        // A wake armed for the next MSC by the timer is too early now.
+        self.wake = None;
+    }
+
+    /// The compositor drew the held frame at `now`: the next MSC begins.
+    /// Whether one did (`false` without a hold, or after one that ran out,
+    /// which began its next MSC already).
+    pub(crate) fn frame_done(&mut self, now: u64) -> bool {
+        self.settle(now);
+        let Some(held) = self.held.take() else {
+            return false;
+        };
+        self.base_msc = held.msc.wrapping_add(1);
+        self.base_ust = now.max(held.ust);
+        true
     }
 
     /// The whole periods from the base to `now`: the first microsecond an
@@ -95,6 +192,12 @@ impl FrameClock {
         if period_ns == self.period_ns {
             return;
         }
+        self.settle(now);
+        if self.held.is_some() {
+            // The period counts from the MSC the callback begins.
+            self.period_ns = period_ns;
+            return;
+        }
         let (msc, ust) = self.sample(now);
         self.base_msc = msc;
         self.base_ust = ust;
@@ -105,10 +208,16 @@ impl FrameClock {
     /// begins. Whether a wake was newly armed (`false` when one is armed
     /// already, so the core loop may call this every iteration).
     pub(crate) fn arm(&mut self, now: u64) -> bool {
+        self.settle(now);
         if self.wake.is_some_and(|wake| wake > now) {
             return false;
         }
-        self.wake = Some(self.next_tick(now));
+        // While a frame is held the next MSC is its callback's, which wakes
+        // the loop by itself; the wake is for the callback that never comes.
+        self.wake = Some(match self.held {
+            Some(held) => held.since.saturating_add(HOLD_US),
+            None => self.next_tick(now),
+        });
         true
     }
 
@@ -304,6 +413,68 @@ mod tests {
             last = told;
             // Drawing and handing the frame over: 2.4 ms more.
             now += 2_400;
+        }
+    }
+
+    #[test]
+    fn a_held_frame_keeps_the_msc_until_its_callback_begins_the_next() {
+        let mut clock = FrameClock::new(0, HZ60);
+        // Committed in MSC 2; the timer would be at 5 by 70 ms.
+        clock.hold(20_000);
+        assert_eq!(clock.sample(20_000), (2, 16_667));
+        assert_eq!(clock.sample(70_000), (2, 16_667), "held");
+        // The callback at 71 ms begins MSC 3 there, and the timer counts on
+        // from it.
+        assert!(clock.frame_done(71_000));
+        assert_eq!(clock.sample(71_000), (3, 71_000));
+        assert_eq!(clock.sample(71_000 + 16_667), (4, 87_667));
+        assert!(!clock.frame_done(90_000), "nothing held");
+    }
+
+    #[test]
+    fn a_wake_while_held_is_for_the_callback_that_never_comes() {
+        let mut clock = FrameClock::new(0, HZ60);
+        assert!(clock.arm(1_000));
+        assert_eq!(clock.wake(), Some(16_667));
+        clock.hold(2_000);
+        assert_eq!(clock.wake(), None, "the timer's wake is too early");
+        assert!(clock.arm(2_000));
+        assert_eq!(clock.wake(), Some(2_000 + HOLD_US));
+    }
+
+    #[test]
+    fn a_hold_runs_out_after_a_second_and_its_late_callback_moves_nothing() {
+        let mut clock = FrameClock::new(0, HZ60);
+        clock.hold(10_000);
+        let out = 10_000 + HOLD_US;
+        assert_eq!(clock.sample(out - 1), (1, 0));
+        assert_eq!(clock.sample(out), (2, out));
+        assert_eq!(clock.sample(out + 16_667), (3, out + 16_667));
+        // The callback after it does not count twice, and nothing goes back.
+        let before = clock.sample(out + 20_000);
+        assert!(!clock.frame_done(out + 20_000));
+        assert_eq!(clock.sample(out + 20_000), before);
+    }
+
+    #[test]
+    fn a_game_presenting_each_msc_shows_one_frame_a_callback() {
+        // FIFO: each present asks for the MSC after the last completed one
+        // and is executed -- committed, held -- when that MSC begins. With
+        // the compositor drawing every 16.7 ms, a little late each time,
+        // every MSC is one callback and the count never skips.
+        let mut clock = FrameClock::new(0, HZ60);
+        let mut now = 5_000;
+        let mut last = clock.sample(now).0;
+        for frame in 0..600_u64 {
+            clock.hold(now);
+            // The compositor draws 9 to 15 ms after the commit.
+            now += 9_000 + (frame * 7_919) % 6_000;
+            assert_eq!(clock.sample(now).0, last, "frame {frame}: moved while held");
+            assert!(clock.frame_done(now));
+            let msc = clock.sample(now).0;
+            assert_eq!(msc, last + 1, "frame {frame}");
+            last = msc;
+            now += 500;
         }
     }
 

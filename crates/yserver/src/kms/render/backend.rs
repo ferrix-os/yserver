@@ -8937,6 +8937,7 @@ impl KmsBackend {
         let Some(mut link) = self.wayland.take() else {
             return;
         };
+        self.wl_direct.unsynced = false;
         link.sync(state, self);
         for request in std::mem::take(&mut state.server_wm_requests) {
             link.wm_request(state, request);
@@ -21072,8 +21073,15 @@ impl Backend for KmsBackend {
             .and_then(crate::wayland::WaylandLink::present_clock_wake);
         #[cfg(not(feature = "wayland"))]
         let present_clock_deadline = None;
+        // A present owed to a window since the last sync goes to the
+        // compositor on the next iteration, which is now.
+        #[cfg(feature = "wayland")]
+        let direct_deadline = (self.wayland.is_some() && self.wl_direct.unsynced).then_some(now);
+        #[cfg(not(feature = "wayland"))]
+        let direct_deadline = None;
         scene_deadline
             .into_iter()
+            .chain(direct_deadline)
             .chain(present_deadline)
             .chain(present_clock_deadline)
             .chain(clipboard_deadline)
@@ -21906,6 +21914,16 @@ impl Backend for KmsBackend {
             self.store.end_prewaited_exported_write(id);
         }
         self.store_decref_with_invalidate(wait.source_id);
+    }
+
+    fn present_supersedes_same_msc(&self) -> bool {
+        // The rootless Wayland backend executes every present in turn, as
+        // Xwayland does; the compositor shows the frames it gets.
+        #[cfg(feature = "wayland")]
+        if self.wayland.is_some() {
+            return false;
+        }
+        true
     }
 
     fn present_flip_in_flight(&self, crtc_id: u32) -> bool {

@@ -276,6 +276,7 @@ impl Direct {
         // Commits what was attached, as the surface has been drawn.
         client.request_frame(surface);
         frames.pending = true;
+        frames.direct_pending = true;
         frames.direct = Some(frame.serial);
         // What the compositor shows is no longer the read-back image: the
         // next one read back is handed over whole.
@@ -283,6 +284,12 @@ impl Direct {
         frames.rows.clear();
         frames.configured = false;
         self.frames += 1;
+        log::debug!(
+            target: "present_pace",
+            "WL-INSTR t={} stage=commit serial={} window=0x{host_xid:x}",
+            yserver_core::core_loop::process_request::pace_instr_ms(),
+            frame.serial
+        );
         if self.reported.elapsed() >= REPORT {
             log::info!(
                 "yserver: zero-copy frames {} ({} in all)",

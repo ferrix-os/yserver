@@ -65,6 +65,12 @@ pub(crate) struct WlDirect {
     next_generation: u64,
     next_serial: u64,
     enabled: Option<bool>,
+    /// A present was owed since the link last synced: the loop comes round
+    /// at once to hand it to the compositor (`KmsBackend::next_wakeup`).
+    /// Executed by the core's due pass, which runs after this iteration's
+    /// sync, it would otherwise wait for whatever woke the loop next -- the
+    /// next MSC, often -- and be replaced by that MSC's present unshown.
+    pub(crate) unsynced: bool,
 }
 
 impl WlDirect {
@@ -125,6 +131,13 @@ impl WlDirect {
     /// Owe `backing` a whole-window present of `src` to `dst`.
     pub(crate) fn owe(&mut self, backing: DrawableId, src: u32, dst: u32, width: u16, height: u16) {
         self.next_serial += 1;
+        self.unsynced = true;
+        log::debug!(
+            target: "present_pace",
+            "WL-INSTR t={} stage=owe serial={} src=0x{src:x}",
+            yserver_core::core_loop::process_request::pace_instr_ms(),
+            self.next_serial
+        );
         let _ = self.owed.insert(
             backing,
             Owed {
