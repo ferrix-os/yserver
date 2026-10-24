@@ -225,6 +225,10 @@ pub struct WaylandLink {
     toplevels: HashMap<u32, Toplevel>,
     /// Host XIDs whose title or class changed since the last sync.
     renamed: HashSet<u32>,
+    /// Host XIDs the compositor's window could not be made for, and the
+    /// `CLOCK_MONOTONIC` microsecond to try again at: once a second, or as
+    /// soon as the window is renamed, not on every pass of the loop.
+    refused: HashMap<u32, u64>,
     /// The keyboard and the pointer ([`input`]).
     seat: input::Seat,
     /// What the compositor asked, for the server to carry out.
@@ -280,6 +284,7 @@ impl WaylandLink {
             client,
             toplevels: HashMap::new(),
             renamed: HashSet::new(),
+            refused: HashMap::new(),
             seat,
             requests: Vec::new(),
             popups: Vec::new(),
@@ -575,6 +580,7 @@ impl WaylandLink {
         let kept: HashSet<u32> = wanted.iter().map(|&(host_xid, _)| host_xid).collect();
         self.retire_popups(state, &kept);
 
+        self.refused.retain(|host_xid, _| kept.contains(host_xid));
         let client = &mut self.client;
         let present_clock = &mut self.clock;
         self.toplevels.retain(|host_xid, toplevel| {
@@ -602,6 +608,14 @@ impl WaylandLink {
             let toplevel = match self.toplevels.entry(host_xid) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
+                    if self
+                        .refused
+                        .get(&host_xid)
+                        .is_some_and(|&until| now < until)
+                        && !self.renamed.contains(&host_xid)
+                    {
+                        continue;
+                    }
                     let (title, app_id) = names(state, window);
                     // Sent before the first commit, where the compositor
                     // decides whether a window of a fixed size floats.
@@ -615,6 +629,7 @@ impl WaylandLink {
                     };
                     match self.client.toplevel(&options) {
                         Ok(surface) => {
+                            let _ = self.refused.remove(&host_xid);
                             log::info!(
                                 "wayland: window 0x{host_xid:x} ({}x{}) is the compositor's \
                                  window {surface:?}, {title:?} of {app_id:?}",
@@ -634,7 +649,16 @@ impl WaylandLink {
                             })
                         }
                         Err(error) => {
-                            log::warn!("wayland: no window for 0x{host_xid:x}: {error}");
+                            // Said once, and tried again in a second or
+                            // when the window is renamed: on every pass it
+                            // was 112 refusals in a minute on 2026-10-24.
+                            if self
+                                .refused
+                                .insert(host_xid, now + REFUSED_RETRY_US)
+                                .is_none()
+                            {
+                                log::warn!("wayland: no window for 0x{host_xid:x}: {error}");
+                            }
                             continue;
                         }
                     }
@@ -930,6 +954,10 @@ fn is_name(state: &ServerState, property: AtomId) -> bool {
 
 /// A window's title and app id: `_NET_WM_NAME` (UTF-8) or else `WM_NAME`
 /// (Latin-1), and `WM_CLASS`'s class ([`class`]). Missing ones are empty.
+/// How long a window the compositor's window could not be made for waits
+/// before it is tried again, in microseconds.
+const REFUSED_RETRY_US: u64 = 1_000_000;
+
 fn names(state: &ServerState, window: &Window) -> (String, String) {
     let property = |name: &str| {
         let atom = state.atoms.id_for(name)?;
@@ -938,12 +966,21 @@ fn names(state: &ServerState, window: &Window) -> (String, String) {
             .get(&atom)
             .map(|value| value.data.as_slice())
     };
+    // Up to a NUL, as `latin1` reads `WM_NAME`: a Wayland string cannot
+    // hold one, and a title with one was refused by the compositor
+    // (`set_title: BadArgument`) on every pass.
     let title = property("_NET_WM_NAME")
-        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .map(utf8_title)
         .or_else(|| property("WM_NAME").map(latin1))
         .unwrap_or_default();
     let app_id = property("WM_CLASS").map(class).unwrap_or_default();
     (title, app_id)
+}
+
+/// `_NET_WM_NAME`'s UTF-8 text, up to a NUL.
+fn utf8_title(bytes: &[u8]) -> String {
+    let text = bytes.split(|&byte| byte == 0).next().unwrap_or_default();
+    String::from_utf8_lossy(text).into_owned()
 }
 
 /// `WM_CLASS`'s class: the second of the two strings it holds, each ended
@@ -967,6 +1004,17 @@ fn latin1(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_title_ends_at_a_nul_which_no_wayland_string_can_hold() {
+        assert_eq!(utf8_title(b"Steam\0"), "Steam");
+        assert_eq!(utf8_title(b"Endfield\0junk"), "Endfield");
+        assert_eq!(
+            utf8_title("Arknights: \u{7d42}".as_bytes()),
+            "Arknights: \u{7d42}"
+        );
+        assert_eq!(utf8_title(b"\0"), "");
+    }
 
     #[test]
     fn the_class_is_the_second_string_or_the_only_one() {
