@@ -20131,7 +20131,7 @@ impl crate::wayland::WindowImages for KmsBackend {
 
     fn direct_frame(&mut self, host_xid: u32) -> Option<crate::wayland::DirectFrame> {
         let backing = self.resolve_paint_target(host_xid)?.backing_id();
-        let owed = *self.wl_direct.owed.get(&backing)?;
+        let owed = self.wl_direct.next_owed(backing)?;
         // The window presented to may have gone, and its backing's id been
         // reused: then the entry is stale.
         if self
@@ -20140,6 +20140,7 @@ impl crate::wayland::WindowImages for KmsBackend {
             != Some(backing)
         {
             let _ = self.wl_direct.owed.remove(&backing);
+            self.wl_direct.forget_backing(backing);
             return None;
         }
         let layout = self.wl_direct.layouts.get(&owed.src)?;
@@ -20152,7 +20153,14 @@ impl crate::wayland::WindowImages for KmsBackend {
             offset: layout.offset,
             stride: layout.stride,
             depth: layout.depth,
+            not_before: owed.not_before,
         })
+    }
+
+    fn direct_handed(&mut self, host_xid: u32, serial: u64) {
+        if let Some(target) = self.resolve_paint_target(host_xid) {
+            self.wl_direct.handed(target.backing_id(), serial);
+        }
     }
 
     fn direct_fd(&self, generation: u64) -> Option<std::os::fd::OwnedFd> {
@@ -20175,6 +20183,9 @@ impl KmsBackend {
     /// `execute_present_pixmap_copy` would have. Nothing when nothing is
     /// owed.
     pub(crate) fn wl_direct_settle(&mut self, backing: DrawableId) {
+        // A held frame a newer one follows is not drawn into the backing:
+        // the newer one is.
+        self.wl_direct.drop_backing(backing);
         let Some(owed) = self.wl_direct.owed.remove(&backing) else {
             return;
         };
@@ -20262,6 +20273,7 @@ impl KmsBackend {
             candidate.paint_dst_host_xid,
             candidate.src_width,
             candidate.src_height,
+            crate::wayland::monotonic_us(),
         );
         self.enqueue_present_completion(event, candidate.completion_dst_host_xid);
         true
@@ -21079,9 +21091,21 @@ impl Backend for KmsBackend {
         let direct_deadline = (self.wayland.is_some() && self.wl_direct.unsynced).then_some(now);
         #[cfg(not(feature = "wayland"))]
         let direct_deadline = None;
+        // The second of a pair is handed over when its time comes
+        // (`super::wl_direct`'s pacing).
+        #[cfg(feature = "wayland")]
+        let pace_deadline = self.wayland.as_ref().and_then(|_| {
+            let mono = crate::wayland::monotonic_us();
+            self.wl_direct
+                .pace_wake(mono)
+                .map(|at| now + std::time::Duration::from_micros(at - mono))
+        });
+        #[cfg(not(feature = "wayland"))]
+        let pace_deadline = None;
         scene_deadline
             .into_iter()
             .chain(direct_deadline)
+            .chain(pace_deadline)
             .chain(present_deadline)
             .chain(present_clock_deadline)
             .chain(clipboard_deadline)

@@ -120,6 +120,7 @@ pub enum Request {
 
 mod clipboard;
 mod clock;
+pub(crate) use clock::monotonic_us;
 mod direct;
 mod input;
 mod lock;
@@ -165,6 +166,10 @@ pub trait WindowImages {
     fn take_freed_direct(&mut self) -> Vec<u64> {
         Vec::new()
     }
+
+    /// The frame [`DirectFrame::serial`] of `host_xid`'s was handed to the
+    /// compositor: the next [`WindowImages::direct_frame`] may be another.
+    fn direct_handed(&mut self, _host_xid: u32, _serial: u64) {}
 }
 
 /// Where a window of the compositor's is in drawing it: the frame callback

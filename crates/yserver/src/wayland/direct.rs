@@ -47,6 +47,9 @@ pub struct DirectFrame {
     pub stride: u32,
     /// The pixmap's depth, 24 or 32.
     pub depth: u8,
+    /// The second of a pair: not handed over before this `CLOCK_MONOTONIC`
+    /// microsecond (`kms/render/wl_direct.rs`'s pacing).
+    pub not_before: Option<u64>,
 }
 
 /// A buffer of the compositor's for a client's.
@@ -245,6 +248,13 @@ impl Direct {
         if frames.direct == Some(frame.serial) && !frames.configured {
             return true;
         }
+        if frames.direct != Some(frame.serial)
+            && let Some(at) = frame.not_before
+            && super::clock::monotonic_us() < at
+        {
+            // The second of a pair, until its time: the first stays shown.
+            return true;
+        }
         let Some(buffer) = self.buffer(client, images, &frame) else {
             return false;
         };
@@ -278,6 +288,7 @@ impl Direct {
         frames.pending = true;
         frames.direct_pending = true;
         frames.direct = Some(frame.serial);
+        images.direct_handed(host_xid, frame.serial);
         // What the compositor shows is no longer the read-back image: the
         // next one read back is handed over whole.
         frames.shown = None;
