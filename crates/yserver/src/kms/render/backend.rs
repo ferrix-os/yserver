@@ -20139,7 +20139,7 @@ impl crate::wayland::WindowImages for KmsBackend {
             .map(super::target::PaintTarget::backing_id)
             != Some(backing)
         {
-            let _ = self.wl_direct.owed.remove(&backing);
+            let _ = self.wl_direct.take_owed(backing);
             self.wl_direct.forget_backing(backing);
             return None;
         }
@@ -20160,6 +20160,12 @@ impl crate::wayland::WindowImages for KmsBackend {
     fn direct_handed(&mut self, host_xid: u32, serial: u64) {
         if let Some(target) = self.resolve_paint_target(host_xid) {
             self.wl_direct.handed(target.backing_id(), serial);
+        }
+    }
+
+    fn direct_released(&mut self, generation: u64) {
+        if let Some(pixmap) = self.wl_direct.pixmap_of(generation) {
+            self.wl_direct.buffer_returned(pixmap);
         }
     }
 
@@ -20186,7 +20192,7 @@ impl KmsBackend {
         // A held frame a newer one follows is not drawn into the backing:
         // the newer one is.
         self.wl_direct.drop_backing(backing);
-        let Some(owed) = self.wl_direct.owed.remove(&backing) else {
+        let Some(owed) = self.wl_direct.take_owed(backing) else {
             return;
         };
         self.refresh_pixmap_for_read(owed.src);
@@ -20292,6 +20298,16 @@ impl KmsBackend {
             candidate.src_height,
             crate::wayland::monotonic_us(),
         );
+        // A flip: complete now, idle once the compositor is done with the
+        // buffer (`super::wl_direct`, "When a buffer is the client's
+        // again").
+        let mut event = event;
+        event.emit_idle = false;
+        if let Some(serial) = self.wl_direct.owed.get(&backing).map(|owed| owed.serial) {
+            let _ = self.wl_direct.uncompleted.insert(event.present_id);
+            self.wl_direct
+                .hold_idle(candidate.src_host_xid, serial, event.clone());
+        }
         self.enqueue_present_completion(event, candidate.completion_dst_host_xid);
         true
     }
@@ -29127,13 +29143,25 @@ impl Backend for KmsBackend {
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
         let mut completed = self.drain_completed_present_events_impl();
         completed.append(&mut self.scanout_m2.completed);
+        for event in &completed {
+            let _ = self.wl_direct.uncompleted.remove(&event.present_id);
+        }
         completed
     }
 
     fn drain_retired_present_idle_events(
         &mut self,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        std::mem::take(&mut self.scanout_m2.idled)
+        let mut idled = std::mem::take(&mut self.scanout_m2.idled);
+        // A direct present's idle only after its completion was drained:
+        // the completion retains the idle fence's wake that the idle
+        // releases, and CompleteNotify goes before IdleNotify.
+        let (early, due): (Vec<_>, Vec<_>) = std::mem::take(&mut self.wl_direct.idle_now)
+            .into_iter()
+            .partition(|event| self.wl_direct.uncompleted.contains(&event.present_id));
+        self.wl_direct.idle_now = early;
+        idled.extend(due);
+        idled
     }
 
     fn signal_present_wake(&mut self, present_id: u64) {
@@ -43710,6 +43738,42 @@ mod tests {
             "the metadata path moves the logical geometry and leaves the \
              storage at its allocated extent",
         );
+    }
+
+    /// 2026-10-28, the N150: a zero-copy present replaced in the pass it
+    /// was owed was idled before the core drained its completion. The
+    /// idle found no retained wake, the idle fence never fired, and
+    /// Endfield waited on that buffer for ever. An idle waits for its
+    /// completion.
+    #[test]
+    fn a_direct_presents_idle_waits_for_its_completion() {
+        use yserver_core::backend::Backend;
+        let mut b = KmsBackend::for_tests();
+        let event = yserver_core::backend::CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: 1,
+            host_xid: 0,
+            dst_host_xid: 0,
+            options: 0,
+            present_id: 77,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: false,
+        };
+        let _ = b.wl_direct.uncompleted.insert(77);
+        b.wl_direct.idle_now.push(event);
+        assert!(
+            b.drain_retired_present_idle_events().is_empty(),
+            "an idle before its completion releases no wake",
+        );
+        let _ = b.wl_direct.uncompleted.remove(&77);
+        let idled = b.drain_retired_present_idle_events();
+        assert_eq!(idled.iter().map(|e| e.present_id).collect::<Vec<_>>(), [77]);
     }
 
     /// A LINEAR import binds the renderer's whole memory requirement in

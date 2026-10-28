@@ -170,6 +170,11 @@ pub trait WindowImages {
     /// The frame [`DirectFrame::serial`] of `host_xid`'s was handed to the
     /// compositor: the next [`WindowImages::direct_frame`] may be another.
     fn direct_handed(&mut self, _host_xid: u32, _serial: u64) {}
+
+    /// The compositor gave back its buffer of the client's buffer
+    /// [`DirectFrame::generation`] (`wl_buffer.release`): the client may
+    /// draw into it again.
+    fn direct_released(&mut self, _generation: u64) {}
 }
 
 /// Where a window of the compositor's is in drawing it: the frame callback
@@ -551,6 +556,9 @@ impl WaylandLink {
     pub fn sync(&mut self, state: &ServerState, images: &mut dyn WindowImages) {
         let freed = images.take_freed_direct();
         if let Some(direct) = self.direct.as_mut() {
+            for generation in direct.take_released() {
+                images.direct_released(generation);
+            }
             direct.forget(&mut self.client, freed);
         }
         // The Present clock's armed wake is spent once the loop has come

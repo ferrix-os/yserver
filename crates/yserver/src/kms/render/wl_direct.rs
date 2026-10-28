@@ -18,6 +18,20 @@
 //!
 //! `YSERVER_WAYLAND_DIRECT=0` turns it off.
 //!
+//! ## When a buffer is the client's again
+//!
+//! A present the compositor is handed is a flip, not a copy: the
+//! compositor reads the client's buffer when it draws, after the present
+//! completed. The present's `IdleNotify` (and its idle fence) therefore
+//! waits until the compositor gives the buffer back
+//! (`wl_buffer.release`), as Xwayland's flips wait, and is held here
+//! ([`WlDirect::hold_idle`]) until then. A present that is never handed
+//! over -- settled into the backing, replaced before the link took it --
+//! has been copied or dropped and is idle at once. Sent at completion,
+//! as it was until 2026-10-28, it let a game draw its next frame into a
+//! buffer hyprix was still reading: Endfield's loading screen on the N150
+//! showed rows of black dashes, every few frames.
+//!
 //! ## Pairs presented together
 //!
 //! A game with frame generation (FSR3) presents a generated frame and a
@@ -42,7 +56,21 @@
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::OwnedFd;
 
+use yserver_core::backend::CompletedPresentEvent;
+
 use super::store::DrawableId;
+
+/// A direct present's idle notification, held while the compositor may
+/// still read its buffer.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldIdle {
+    /// The direct present's [`Owed::serial`].
+    pub(crate) serial: u64,
+    /// It was handed to the compositor, which now holds the buffer.
+    pub(crate) handed: bool,
+    /// Its completion, sent with `emit_idle` off; retired as an idle.
+    pub(crate) event: CompletedPresentEvent,
+}
 
 /// A DRI3 buffer's single LINEAR plane, as the client gave it: what a
 /// `zwp_linux_buffer_params_v1` for it says.
@@ -195,6 +223,20 @@ pub(crate) struct WlDirect {
     next_generation: u64,
     next_serial: u64,
     enabled: Option<bool>,
+    /// Idle notifications held for direct presents, by the presented
+    /// pixmap's host XID (module doc, "When a buffer is the client's
+    /// again").
+    pub(crate) held_idle: HashMap<u32, Vec<HeldIdle>>,
+    /// Idle notifications due now, for the core to retire
+    /// (`Backend::drain_retired_present_idle_events`) once their
+    /// completion has been drained.
+    pub(crate) idle_now: Vec<CompletedPresentEvent>,
+    /// Direct presents whose completion the core has not drained yet. An
+    /// idle retired before it finds no wake to release: the idle fence
+    /// never fires and the client waits on that buffer for ever (the N150,
+    /// 2026-10-28: Endfield stopped after two minutes, a present replaced
+    /// in the same pass it was owed).
+    pub(crate) uncompleted: std::collections::HashSet<u64>,
     /// A present was owed since the link last synced: the loop comes round
     /// at once to hand it to the compositor (`KmsBackend::next_wakeup`).
     /// Executed by the core's due pass, which runs after this iteration's
@@ -252,9 +294,13 @@ impl WlDirect {
     }
 
     /// Forget `pixmap`'s layout; its owed presents must be settled first.
+    /// Whatever idles it still held are due: the pixmap is gone.
     pub(crate) fn forget(&mut self, pixmap: u32) {
         if let Some(old) = self.layouts.remove(&pixmap) {
             self.freed.push(old.generation);
+        }
+        if let Some(held) = self.held_idle.remove(&pixmap) {
+            self.idle_now.extend(held.into_iter().map(|held| held.event));
         }
     }
 
@@ -309,7 +355,18 @@ impl WlDirect {
             not_before,
             handed: false,
         };
-        if let Some(old) = self.owed.insert(backing, owed)
+        let replaced = self.owed.insert(backing, owed);
+        if let Some(old) = replaced
+            && !old.handed
+            && old.not_before.is_none()
+            && not_before.is_none()
+        {
+            // Replaced before the link took it, and not kept to show: the
+            // compositor never gets that buffer, which is the client's
+            // again.
+            self.idle_unhanded(old.src, old.serial);
+        }
+        if let Some(old) = replaced
             && !old.handed
             && (old.not_before.is_some() || not_before.is_some())
         {
@@ -337,6 +394,7 @@ impl WlDirect {
                     "WL-INSTR stage=replaced serial={}",
                     dropped.serial
                 );
+                self.idle_unhanded(dropped.src, dropped.serial);
             }
         }
     }
@@ -353,10 +411,11 @@ impl WlDirect {
 
     /// The link handed the frame `serial` owed `backing` to the compositor.
     pub(crate) fn handed(&mut self, backing: DrawableId, serial: u64) {
+        let mut src = None;
         if let Some(queue) = self.queued.get_mut(&backing)
             && queue.front().is_some_and(|queued| queued.serial == serial)
         {
-            let _ = queue.pop_front();
+            src = queue.pop_front().map(|queued| queued.src);
             if queue.is_empty() {
                 let _ = self.queued.remove(&backing);
             }
@@ -364,7 +423,76 @@ impl WlDirect {
             && owed.serial == serial
         {
             owed.handed = true;
+            src = Some(owed.src);
         }
+        if let Some(held) = src
+            .and_then(|src| self.held_idle.get_mut(&src))
+            .and_then(|held| held.iter_mut().find(|held| held.serial == serial))
+        {
+            held.handed = true;
+        }
+    }
+
+    /// Hold the idle notification of the direct present `serial` of
+    /// `pixmap` until the compositor is done with its buffer.
+    pub(crate) fn hold_idle(&mut self, pixmap: u32, serial: u64, event: CompletedPresentEvent) {
+        self.held_idle.entry(pixmap).or_default().push(HeldIdle {
+            serial,
+            handed: false,
+            event,
+        });
+    }
+
+    /// The direct present `serial` of `pixmap` will never be handed to the
+    /// compositor: it was copied into its backing or dropped, and its
+    /// pixmap is idle now.
+    pub(crate) fn idle_unhanded(&mut self, pixmap: u32, serial: u64) {
+        let Some(held) = self.held_idle.get_mut(&pixmap) else {
+            return;
+        };
+        if let Some(at) = held
+            .iter()
+            .position(|held| held.serial == serial && !held.handed)
+        {
+            self.idle_now.push(held.remove(at).event);
+        }
+        if held.is_empty() {
+            let _ = self.held_idle.remove(&pixmap);
+        }
+    }
+
+    /// The compositor gave `pixmap`'s buffer back: every present of it
+    /// that was handed over is idle.
+    pub(crate) fn buffer_returned(&mut self, pixmap: u32) {
+        let Some(held) = self.held_idle.get_mut(&pixmap) else {
+            return;
+        };
+        let (returned, kept): (Vec<_>, Vec<_>) = held.drain(..).partition(|held| held.handed);
+        self.idle_now
+            .extend(returned.into_iter().map(|held| held.event));
+        if kept.is_empty() {
+            let _ = self.held_idle.remove(&pixmap);
+        } else {
+            *held = kept;
+        }
+    }
+
+    /// The pixmap whose buffer is of `generation`, while it is kept.
+    pub(crate) fn pixmap_of(&self, generation: u64) -> Option<u32> {
+        self.layouts
+            .iter()
+            .find(|(_, layout)| layout.generation == generation)
+            .map(|(&pixmap, _)| pixmap)
+    }
+
+    /// Take `backing`'s newest owed present out, idling it if it was never
+    /// handed over: the caller copies it into the backing or drops it.
+    pub(crate) fn take_owed(&mut self, backing: DrawableId) -> Option<Owed> {
+        let owed = self.owed.remove(&backing)?;
+        if !owed.handed {
+            self.idle_unhanded(owed.src, owed.serial);
+        }
+        Some(owed)
     }
 
     /// When the loop must come round to hand over a held frame: the
@@ -382,12 +510,14 @@ impl WlDirect {
     /// `backing` was settled: a queued frame is not shown, the newest is
     /// drawn into it.
     pub(crate) fn drop_backing(&mut self, backing: DrawableId) {
-        let _ = self.queued.remove(&backing);
+        for queued in self.queued.remove(&backing).unwrap_or_default() {
+            self.idle_unhanded(queued.src, queued.serial);
+        }
     }
 
     /// `backing`'s window went: its pacing too.
     pub(crate) fn forget_backing(&mut self, backing: DrawableId) {
-        let _ = self.queued.remove(&backing);
+        self.drop_backing(backing);
         let _ = self.pacers.remove(&backing);
     }
 
@@ -467,6 +597,75 @@ mod tests {
         let mut fast = Pacer::default();
         // 150 pairs a second: the refresh spaces them.
         assert!(pairs(&mut fast, 0, 6_600, 30).iter().all(Option::is_none));
+    }
+
+    /// A completion of present `id`, its idle held back.
+    fn completion(id: u64) -> CompletedPresentEvent {
+        CompletedPresentEvent {
+            client_id: yserver_protocol::x11::ClientId(1),
+            serial: 1,
+            host_xid: 0,
+            dst_host_xid: 0,
+            options: 0,
+            present_id: id,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: yserver_core::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: false,
+        }
+    }
+
+    /// Owe `backing` a present of `pixmap` with its idle held, as
+    /// `KmsBackend::try_wayland_direct` does; its serial.
+    fn owe_held(direct: &mut WlDirect, backing: DrawableId, pixmap: u32, now: u64) -> u64 {
+        direct.owe(backing, pixmap, 9, 8, 8, now);
+        let serial = direct.owed[&backing].serial;
+        direct.hold_idle(pixmap, serial, completion(serial));
+        serial
+    }
+
+    fn idled(direct: &mut WlDirect) -> Vec<u64> {
+        std::mem::take(&mut direct.idle_now)
+            .into_iter()
+            .map(|event| event.present_id)
+            .collect()
+    }
+
+    /// 2026-10-28, Endfield on the N150: a zero-copy present was idle the
+    /// moment it completed, so the game drew its next frame into a buffer
+    /// hyprix was still reading -- black dashes in the loading screen, the
+    /// HUD missing from a frame now and then. A handed buffer is idle only
+    /// when the compositor gives it back; one never handed is idle at once.
+    #[test]
+    fn a_handed_buffer_is_idle_only_once_the_compositor_gives_it_back() {
+        let mut direct = WlDirect::default();
+        let backing = DrawableId::for_tests(1);
+        let a = owe_held(&mut direct, backing, 0xa, 0);
+        direct.handed(backing, a);
+        assert!(idled(&mut direct).is_empty(), "handed: the compositor reads it");
+        // The next frame, of another buffer, is handed too; A is still
+        // the compositor's until it says otherwise.
+        let b = owe_held(&mut direct, backing, 0xb, 16_000);
+        direct.handed(backing, b);
+        assert!(idled(&mut direct).is_empty());
+        direct.buffer_returned(0xa);
+        assert_eq!(idled(&mut direct), [a]);
+        // A present replaced before the link took it never reaches the
+        // compositor: idle at once.
+        let c = owe_held(&mut direct, backing, 0xc, 32_000);
+        let _ = owe_held(&mut direct, backing, 0xa, 48_000);
+        assert_eq!(idled(&mut direct), [c]);
+        // Settled into the backing (copied), never handed: idle at once.
+        let owed = direct.take_owed(backing).expect("owed");
+        assert_eq!(idled(&mut direct), [owed.serial]);
+        // B, still held, goes with its pixmap.
+        direct.forget(0xb);
+        assert_eq!(idled(&mut direct), [b]);
+        assert!(direct.held_idle.is_empty());
     }
 
     #[test]

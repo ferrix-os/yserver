@@ -67,6 +67,8 @@ pub(super) struct Direct {
     dmabuf: ObjectId,
     /// By [`DirectFrame::generation`].
     made: HashMap<u64, Made>,
+    /// Generations whose buffer the compositor gave back since asked.
+    released: Vec<u64>,
     frames: u64,
     reported_frames: u64,
     reported: Instant,
@@ -87,6 +89,7 @@ impl Direct {
                 Some(Self {
                     dmabuf,
                     made: HashMap::new(),
+                    released: Vec::new(),
                     frames: 0,
                     reported_frames: 0,
                     reported: Instant::now(),
@@ -107,6 +110,17 @@ impl Direct {
         opcode: u16,
         args: &[Value],
     ) -> bool {
+        // `wl_buffer.release`: the compositor is done reading the client's
+        // buffer, which may be drawn into again.
+        if opcode == wl::wl_buffer::event::RELEASE
+            && let Some((&generation, _)) = self
+                .made
+                .iter()
+                .find(|(_, made)| matches!(made, Made::Ready(buffer) if *buffer == object))
+        {
+            self.released.push(generation);
+            return true;
+        }
         let Some((&generation, _)) = self
             .made
             .iter()
@@ -129,6 +143,12 @@ impl Direct {
         let _ = client.request(object, zwp_linux_buffer_params_v1::request::DESTROY, &[]);
         let _ = self.made.insert(generation, made);
         true
+    }
+
+    /// The generations whose buffer the compositor gave back since last
+    /// asked.
+    pub(super) fn take_released(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.released)
     }
 
     /// Destroy the buffers of client buffers that went.
