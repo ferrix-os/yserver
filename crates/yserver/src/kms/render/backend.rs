@@ -20221,6 +20221,17 @@ impl KmsBackend {
         }
     }
 
+    /// Whether a present of `width` by `height` fills `backing`, whose
+    /// storage is its window's size exactly
+    /// (`redirected_backing_can_fit`): only such a present can stand for
+    /// the window's whole image.
+    fn wl_direct_fills(&self, backing: DrawableId, width: u16, height: u16) -> bool {
+        self.store.get(backing).is_some_and(|drawable| {
+            drawable.storage.extent.width == u32::from(width)
+                && drawable.storage.extent.height == u32::from(height)
+        })
+    }
+
     /// A pixmap goes: the backings owed it are settled while it can still
     /// be read, and the compositor's buffers of it go too.
     fn wl_direct_forget_pixmap(&mut self, host_xid: u32) {
@@ -20256,6 +20267,12 @@ impl KmsBackend {
             && (candidate.x_off, candidate.y_off) == (0, 0)
             && target.offset() == (0, 0)
             && !target.has_border_clip()
+            // The whole window: a buffer smaller than its backing -- a
+            // game's old size, after the compositor maximized its window
+            // and before the game made buffers of the new one -- is copied
+            // into it, as any other present, so that what the backing
+            // shows moves on with it.
+            && self.wl_direct_fills(backing, candidate.src_width, candidate.src_height)
             && self
                 .wl_direct
                 .layouts
@@ -24088,6 +24105,14 @@ impl Backend for KmsBackend {
         backing: PixmapHandle,
     ) -> io::Result<()> {
         let raw = backing.as_raw();
+        // A present owed to the backing (`super::wl_direct`) is drawn
+        // into it while the window still routes to it: a resize carries
+        // the backing's contents into the next one, and they must be the
+        // client's last frame, not whatever the backing held when frames
+        // began going to the compositor directly.
+        if let Some(id) = self.store.lookup(raw) {
+            self.wl_direct_settle(id);
+        }
         // Drop the W→B map entry. v1 uses `retain` because the
         // map is keyed by W_xid (not B_xid); same shape here.
         self.core
@@ -43631,6 +43656,72 @@ mod tests {
             1282,
             "the metadata path moves the logical geometry and leaves the \
              storage at its allocated extent",
+        );
+    }
+
+    /// 2026-10-28, Endfield maximized on the N150: zero-copy presents of
+    /// its 1280x720 frames went to the compositor while the window's
+    /// backing was owed them and never written. The maximize rotated the
+    /// backing, carrying over what it held -- the loading screen from
+    /// before zero-copy began -- and the game's next 1280x720 presents
+    /// were owed again to the 1920x1009 backing, which the compositor
+    /// would not show as the window and nothing ever drew. The window
+    /// showed that stale frame in its corner and black around it.
+    ///
+    /// Two rules close it: a backing's owed present is settled before the
+    /// backing is released, while the window still routes to it; and only
+    /// a present that fills the backing is owed at all.
+    #[test]
+    fn a_backing_owed_a_direct_present_is_settled_before_it_goes() {
+        use crate::kms::{
+            core::AliasEntry,
+            render::store::{DrawableKind, Storage},
+        };
+        use yserver_core::backend::{Backend, PixmapHandle};
+
+        let mut b = KmsBackend::for_tests();
+        let backing = PixmapHandle::from_raw_panicking(0x9000_0002);
+        let id = b
+            .store
+            .allocate(
+                backing.as_raw(),
+                DrawableKind::RedirectedBacking,
+                24,
+                false,
+                Storage::for_tests_null(
+                    ash::vk::Extent2D {
+                        width: 1280,
+                        height: 720,
+                    },
+                    ash::vk::Format::B8G8R8A8_UNORM,
+                ),
+            )
+            .expect("backing allocate");
+        b.core.alias_registry.insert(
+            backing,
+            AliasEntry {
+                refcount: 1,
+                width: 1280,
+                height: 720,
+                depth: 24,
+            },
+        );
+
+        // A whole-window present fills it; the game's old size after a
+        // maximize does not.
+        assert!(b.wl_direct_fills(id, 1280, 720));
+        assert!(!b.wl_direct_fills(id, 1280, 719));
+        assert!(!b.wl_direct_fills(id, 1920, 1009));
+
+        b.wl_direct.owe(id, 0x7000_0001, 0x7000_0002, 1280, 720, 0);
+        assert!(b.wl_direct.owed.contains_key(&id));
+        b.release_redirected_backing(None, backing)
+            .expect("release the backing");
+        assert!(
+            b.wl_direct.owed.is_empty(),
+            "the owed present must be drawn into the backing before a resize \
+             carries the backing's contents on, not left owed to a backing \
+             that is gone",
         );
     }
 
