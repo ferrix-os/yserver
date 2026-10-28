@@ -20359,7 +20359,21 @@ impl Drop for Dri3Mapped {
 impl KmsBackend {
     /// Whether the renderer's own LINEAR layout of a `width` x `height`
     /// image in `format` is `offset` and `pitch` -- what an import with
-    /// `VK_IMAGE_TILING_LINEAR` reads the client's buffer as.
+    /// `VK_IMAGE_TILING_LINEAR` reads the client's buffer as -- and the
+    /// memory it asks for that image fits in the client's buffer of
+    /// `buffer_len` bytes.
+    ///
+    /// The second half matters as much as the first. Lavapipe pads a
+    /// LINEAR image's height (measured on the N150: 478 rows ask for 480,
+    /// 974 for 976), so a 1920x974 image asks for 7,495,680 bytes, more
+    /// than anv's 7680 x 974 buffer rounded to a page, 7,483,392;
+    /// importing it failed with
+    /// `VK_ERROR_OUT_OF_DEVICE_MEMORY`, the client's `PixmapFromBuffers`
+    /// got BadAlloc, and Mesa's swap chain creation failed with
+    /// `VK_ERROR_INITIALIZATION_FAILED` (Endfield on the N150, 2026-10-28,
+    /// maximized, it ended with a `[Critical] vkCreateSwapchainKHR`; at
+    /// 1280x720 the padding fits and nothing showed). Such
+    /// a buffer is mapped and copied as it is read instead.
     fn linear_layout_is(
         vk: &crate::kms::vk::device::VkContext,
         format: vk::Format,
@@ -20367,6 +20381,7 @@ impl KmsBackend {
         height: u16,
         offset: u32,
         pitch: u32,
+        buffer_len: Option<u64>,
     ) -> bool {
         let mut external = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -20402,9 +20417,39 @@ impl KmsBackend {
                 },
             )
         };
+        // SAFETY: as above.
+        let needs = unsafe { vk.device.get_image_memory_requirements(image) }.size;
         // SAFETY: as above; nothing else holds it.
         unsafe { vk.device.destroy_image(image, None) };
-        layout.offset == u64::from(offset) && layout.row_pitch == u64::from(pitch)
+        let fits = Self::linear_import_fits(needs, offset, buffer_len);
+        if !fits {
+            log::info!(
+                "DRI3: a {width}x{height} LINEAR image needs {needs} bytes of the renderer, \
+                 more than the client's buffer of {} past offset {offset}",
+                buffer_len.unwrap_or(0)
+            );
+        }
+        layout.offset == u64::from(offset) && layout.row_pitch == u64::from(pitch) && fits
+    }
+
+    /// Whether memory of `needs` bytes, bound at `offset`, lies inside a
+    /// client's buffer of `buffer_len` bytes ([`Self::linear_layout_is`]).
+    /// A buffer whose length is unknown is taken to fit, as before.
+    fn linear_import_fits(needs: u64, offset: u32, buffer_len: Option<u64>) -> bool {
+        buffer_len.is_none_or(|len| u64::from(offset).saturating_add(needs) <= len)
+    }
+
+    /// The length of the file `fd` names: a dmabuf's is its buffer's
+    /// size (Linux sets `i_size`, as Ferrix does).
+    fn fd_len(fd: &std::os::fd::OwnedFd) -> Option<u64> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fstat into a zeroed stat on a descriptor we hold.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        (unsafe { libc::fstat(fd.as_raw_fd(), &raw mut stat) } == 0)
+            .then(|| u64::try_from(stat.st_size).ok())
+            .flatten()
+            .filter(|&len| len > 0)
     }
 
     /// A DRI3 buffer mapped, and an ordinary pixmap for it filled from the
@@ -28424,7 +28469,15 @@ impl Backend for KmsBackend {
         let modifier = vk_modifier;
         if !vk.image_drm_format_modifier
             && modifier == crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR
-            && !Self::linear_layout_is(&vk, format, width, height, offset, stride)
+            && !Self::linear_layout_is(
+                &vk,
+                format,
+                width,
+                height,
+                offset,
+                stride,
+                Self::fd_len(&fd),
+            )
         {
             return self.dri3_import_mapped(fd, width, height, stride, offset, depth);
         }
@@ -43657,6 +43710,21 @@ mod tests {
             "the metadata path moves the logical geometry and leaves the \
              storage at its allocated extent",
         );
+    }
+
+    /// A LINEAR import binds the renderer's whole memory requirement in
+    /// the client's buffer, so a requirement past the buffer's end must
+    /// send it down the mapped path (2026-10-28: a 1920x974 swap chain
+    /// image's import failed with `VK_ERROR_OUT_OF_DEVICE_MEMORY`).
+    #[test]
+    fn a_linear_import_must_fit_in_the_clients_buffer() {
+        // anv's 1920x974 buffer, a page-rounded 7680 x 974.
+        let anv = Some(7_483_392);
+        assert!(KmsBackend::linear_import_fits(7_480_320, 0, anv));
+        assert!(!KmsBackend::linear_import_fits(7_680 * 976, 0, anv));
+        assert!(!KmsBackend::linear_import_fits(7_480_320, 4_096, anv));
+        // Unknown length: as before, the import is tried.
+        assert!(KmsBackend::linear_import_fits(u64::MAX, 0, None));
     }
 
     /// 2026-10-28, Endfield maximized on the N150: zero-copy presents of
