@@ -393,7 +393,8 @@ fn handle_mit_shm_create_pixmap(
 
 /// Bring a pixmap's backing up to date as it is about to be read, where the
 /// backing is a copy of memory the client writes: a MIT-SHM pixmap is
-/// filled from its segment. Nothing for any other pixmap.
+/// filled from its segment, and the backend refreshes its own such copies
+/// ([`Backend::refresh_pixmap_for_read`]). Nothing for any other pixmap.
 pub(super) fn refresh_pixmap_for_read(
     state: &ServerState,
     backend: &mut dyn Backend,
@@ -403,7 +404,11 @@ pub(super) fn refresh_pixmap_for_read(
     let Some(p) = state.resources.pixmap(pixmap) else {
         return;
     };
-    let (Some(source), Some(host_xid)) = (p.shm_source, p.host_xid) else {
+    let Some(host_xid) = p.host_xid else {
+        return;
+    };
+    let Some(source) = p.shm_source else {
+        backend.refresh_pixmap_for_read(host_xid.as_raw());
         return;
     };
     let Some(len) = zpixmap_expected_len(p.width, p.height, p.depth) else {

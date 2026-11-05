@@ -2552,6 +2552,12 @@ pub trait Backend {
         true
     }
 
+    /// Bring pixmap `host_xid`'s backing up to date before it is read (a
+    /// Present executes, `CopyArea`), for a backing that is a copy of
+    /// memory its client writes: a DRI3 buffer the renderer could not
+    /// import as it lies. Nothing for any other pixmap.
+    fn refresh_pixmap_for_read(&mut self, _host_xid: u32) {}
+
     /// Import a client-supplied dma-buf as a server-owned pixmap and
     /// return the host xid the dispatcher should bind. The `fd`
     /// ownership transfers into the backend on success; on Err the

@@ -492,6 +492,12 @@ pub trait Platform: OutputSink + Sized + 'static {
         Dri3Caps::unsupported()
     }
 
+    /// `Backend::refresh_pixmap_for_read`.
+    fn refresh_pixmap_for_read(_b: &mut XBackend<Self>, _host_xid: u32) {}
+
+    /// A client freed pixmap `host_xid`, before its storage goes.
+    fn pixmap_freed(_b: &mut XBackend<Self>, _host_xid: u32) {}
+
     fn dri3_import_pixmap(
         _b: &mut XBackend<Self>,
         _fd: yserver_core::fd::OwnedFd,
