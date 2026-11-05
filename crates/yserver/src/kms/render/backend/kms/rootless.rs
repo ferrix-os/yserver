@@ -11,7 +11,8 @@
 //! surface platform's, run here on the backing store and engine this
 //! platform has.
 
-#![allow(dead_code, reason = "no host is attached yet")]
+// Only the Wayland host (`--features wayland`) attaches one so far.
+#![cfg_attr(not(feature = "wayland"), allow(dead_code))]
 
 use std::{
     collections::{HashMap, HashSet},
