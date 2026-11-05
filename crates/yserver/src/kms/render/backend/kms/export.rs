@@ -477,6 +477,19 @@ impl KmsBackend {
             ),
         };
         let modifier = vk_modifier;
+        if !vk.image_drm_format_modifier
+            && modifier == crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR
+            && !Self::linear_layout_is(
+                &vk,
+                format,
+                (width, height),
+                offset,
+                stride,
+                Self::fd_len(&fd),
+            )
+        {
+            return self.dri3_import_mapped(fd, (width, height), stride, offset, depth);
+        }
         let drawable = crate::kms::vk::dri3::import_dmabuf_reporting(
             vk.clone(),
             fd,
@@ -492,6 +505,10 @@ impl KmsBackend {
             }],
         )
         .map_err(|e| io::Error::other(format!("DRI3 import_dmabuf: {e:?}")))?;
+        log::info!(
+            "DRI3: pixmap ({width}x{height}, stride {stride}) is imported: the renderer reads \
+             the client's buffer in place"
+        );
         // Build a sample-side view over the imported VkImage. The
         // DRI3 path's own `vk_image_view` (kept as `image_view` on
         // the resulting Storage) is IDENTITY-swizzle and serves as

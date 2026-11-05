@@ -879,6 +879,7 @@ impl<P: Platform> Backend for XBackend<P> {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        P::pixmap_freed(self, host_xid);
         Self::backend_redirect_free_pixmap(self, _origin, host_xid)
     }
 
@@ -1664,6 +1665,10 @@ impl<P: Platform> Backend for XBackend<P> {
 
     fn dri3_capabilities(&self) -> Dri3Caps {
         P::dri3_capabilities(self)
+    }
+
+    fn refresh_pixmap_for_read(&mut self, host_xid: u32) {
+        P::refresh_pixmap_for_read(self, host_xid);
     }
 
     fn dri3_import_pixmap(
