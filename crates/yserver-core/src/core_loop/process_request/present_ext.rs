@@ -1726,6 +1726,7 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
+            super::xshm::refresh_pixmap_for_read(state, backend, origin, ResourceId(req.pixmap));
             // Phase 4.2.3: wait_fence / idle_fence are accepted. The
             // dispatcher mirrors the result onto state.sync_fences via
             // the XSync resource table for QueryFence / TriggerFence.
@@ -2125,6 +2126,7 @@ pub(super) fn handle_present_request(
                     PRESENT_MAJOR_OPCODE,
                 );
             };
+            super::xshm::refresh_pixmap_for_read(state, backend, origin, ResourceId(req.pixmap));
             let acquire_known = req.acquire_syncobj != 0
                 && backend.dri3_syncobj_owned(client_id, req.acquire_syncobj);
             if !acquire_known {

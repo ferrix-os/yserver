@@ -1367,6 +1367,7 @@ pub(super) fn handle_copy_area(
     if request.width == 0 || request.height == 0 {
         return Ok(RequestOutcome::Handled);
     }
+    super::xshm::refresh_pixmap_for_read(state, backend, origin, request.src);
     debug!(
         "client {} #{} CopyArea src=0x{:x} dst=0x{:x} gc=0x{:x} src=({},{}) dst=({},{}) {}x{}",
         client_id.0,
