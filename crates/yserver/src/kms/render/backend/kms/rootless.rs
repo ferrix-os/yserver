@@ -13,12 +13,16 @@
 
 #![allow(dead_code, reason = "no host is attached yet")]
 
-use std::{io, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    io,
+    time::Instant,
+};
 
 use yserver_core::{
     backend::Backend as _,
     core_loop::handle_host_input,
-    rootless::{CoordinatePolicy, RootlessError, RootlessEvent},
+    rootless::{CoordinatePolicy, RootlessError, RootlessEvent, ToplevelId},
     server::ServerState,
 };
 
@@ -27,6 +31,7 @@ use crate::{
     rootless::{
         Presenter,
         display::{HostWork, PresenterHandle, SharedHost},
+        host::{DirectFrame, FrameEvent},
         present_clock::{PresentClock, monotonic_us},
     },
 };
@@ -43,6 +48,11 @@ pub(crate) struct RootlessKms {
     /// The cursor the host was last given: `(version, hotspot)`, or none;
     /// `None` before the first.
     cursor_sent: Option<Option<(u64, (u16, u16))>>,
+    /// The direct frame (its present's serial) each window shows.
+    direct_shown: HashMap<ToplevelId, u64>,
+    /// Windows whose last commit was a direct frame, whose `Ready` the
+    /// Present clock waits for ([`PresentClock::hold`]).
+    direct_pending: HashSet<ToplevelId>,
 }
 
 impl KmsBackend {
@@ -91,6 +101,8 @@ impl KmsBackend {
             randr_ids: None,
             clock,
             cursor_sent: None,
+            direct_shown: HashMap::new(),
+            direct_pending: HashSet::new(),
         });
         Ok(())
     }
@@ -147,13 +159,26 @@ impl KmsBackend {
             input,
             frames,
         } = work;
-        if let Some(presenter) = self
-            .pstate
-            .rootless
-            .as_mut()
-            .and_then(|r| r.presenter.as_mut())
-        {
-            presenter.apply_frame_events(&mut self.store, frames);
+        let now = monotonic_us();
+        let mut released = Vec::new();
+        if let Some(rootless) = self.pstate.rootless.as_mut() {
+            for event in &frames {
+                match event {
+                    FrameEvent::DirectReleased { generation } => released.push(*generation),
+                    // The callback for a direct frame: the Present clock's
+                    // held MSC ends.
+                    FrameEvent::Ready { id } if rootless.direct_pending.remove(id) => {
+                        let _ = rootless.clock.frame_done(now);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(presenter) = rootless.presenter.as_mut() {
+                presenter.apply_frame_events(&mut self.store, frames);
+            }
+        }
+        for generation in released {
+            self.direct_released(generation);
         }
         for request in requests {
             yserver_core::rootless::host_request(state, self, request);
@@ -170,12 +195,19 @@ impl KmsBackend {
         state: &ServerState,
         events: &[RootlessEvent],
     ) {
-        if let Some(presenter) = self
-            .pstate
-            .rootless
-            .as_mut()
-            .and_then(|r| r.presenter.as_mut())
-        {
+        let Some(rootless) = self.pstate.rootless.as_mut() else {
+            return;
+        };
+        for event in events {
+            if let RootlessEvent::Unmapped { id } = event {
+                let _ = rootless.direct_shown.remove(id);
+                if rootless.direct_pending.remove(id) {
+                    // Its callback will not come.
+                    let _ = rootless.clock.frame_done(monotonic_us());
+                }
+            }
+        }
+        if let Some(presenter) = rootless.presenter.as_mut() {
             presenter.apply_events(state, events);
             presenter.host.on_events(events);
         }
@@ -188,6 +220,13 @@ impl KmsBackend {
             return;
         };
         host.borrow_mut().service(state, self);
+        // What the host queued since its connection was last read (the
+        // frame events of the presenter's last tick).
+        let mut work = HostWork::default();
+        if let Err(error) = host.borrow_mut().dispatch(&mut work) {
+            log::debug!("rootless: the host's display: {error}");
+        }
+        self.apply_host_work(state, work);
     }
 
     /// The presenter's share of `maybe_composite`, then the cursor, and
@@ -202,11 +241,67 @@ impl KmsBackend {
         rootless.clock.set_refresh(now, refresh);
         if let Some(presenter) = rootless.presenter.as_mut() {
             presenter.poll_retiring();
+            self.hand_direct_frames(
+                presenter,
+                &mut rootless.direct_shown,
+                &mut rootless.direct_pending,
+                &mut rootless.clock,
+                now,
+            );
             presenter.tick(self);
             self.flush_rootless_cursor(&mut rootless);
         }
         rootless.host.borrow_mut().flush();
         self.pstate.rootless = Some(rootless);
+    }
+
+    /// Each window ready for a frame that is owed a whole-window present of
+    /// a client's buffer gets it as a direct frame (extension X3); one the
+    /// host does not take is settled into the backing, to be read back.
+    fn hand_direct_frames(
+        &mut self,
+        presenter: &mut Presenter,
+        shown: &mut HashMap<ToplevelId, u64>,
+        pending: &mut HashSet<ToplevelId>,
+        clock: &mut PresentClock,
+        now: u64,
+    ) {
+        self.pstate.direct_frames.unsynced = false;
+        if !presenter.host.takes_direct() {
+            return;
+        }
+        let freed = std::mem::take(&mut self.pstate.direct_frames.freed);
+        if !freed.is_empty() {
+            presenter.host.forget_direct(&freed);
+        }
+        for (id, top) in presenter.direct_ready() {
+            let Some(frame) = self.owed_direct_frame(top, shown.get(&id).copied()) else {
+                continue;
+            };
+            let serial = frame.serial;
+            let taken = presenter.host.submit_direct(DirectFrame {
+                id,
+                generation: frame.generation,
+                serial,
+                width: frame.width,
+                height: frame.height,
+                offset: frame.offset,
+                stride: frame.stride,
+                modifier: crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR,
+                depth: frame.depth,
+                fd: frame.fd,
+            });
+            if taken {
+                presenter.direct_submitted(id);
+                self.direct_handed(top, serial);
+                let _ = shown.insert(id, serial);
+                let _ = pending.insert(id);
+                clock.hold(now);
+            } else {
+                let _ = shown.remove(&id);
+                self.settle_direct_window(top);
+            }
+        }
     }
 
     /// The host has no cursor plane: it gets the sprite itself, its bytes
@@ -242,7 +337,19 @@ impl KmsBackend {
             now + std::time::Duration::from_micros(wake.saturating_sub(monotonic_us()))
         });
         let host = rootless.host.borrow().next_wakeup();
-        [presenter, clock, host].into_iter().flatten().min()
+        // A present owed to a window since the last tick goes to the host
+        // on the next iteration, which is now; the second of a pair when its
+        // time comes.
+        let direct = &self.pstate.direct_frames;
+        let unsynced = direct.unsynced.then_some(now);
+        let mono = monotonic_us();
+        let paced = direct
+            .pace_wake(mono)
+            .map(|at| now + std::time::Duration::from_micros(at - mono));
+        [presenter, clock, host, unsynced, paced]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub(in crate::kms::render::backend) fn rootless_active(&self) -> bool {

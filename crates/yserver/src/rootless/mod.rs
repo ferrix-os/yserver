@@ -211,6 +211,8 @@ impl Presenter {
                         }
                     }
                 }
+                // The platform's: it holds the client buffers' idles.
+                FrameEvent::DirectReleased { .. } => {}
                 FrameEvent::Released { id, seq, pixels } => {
                     if let Some(Presented {
                         path: Path::Cpu(cpu),
@@ -300,6 +302,34 @@ impl Presenter {
             if w.frames.readiness() == Readiness::Busy && !w.wanted && has_work {
                 w.wanted = true;
                 self.host.frame_wanted(*id);
+            }
+        }
+    }
+
+    /// Windows that may take a direct frame now (extension X3): shown
+    /// already (a first frame is always read back) and ready for the next,
+    /// with no readback in flight; with their backend window.
+    #[cfg(kms)]
+    pub(crate) fn direct_ready(&self) -> Vec<(ToplevelId, u32)> {
+        self.windows
+            .iter()
+            .filter(|(_, w)| {
+                w.frames.readiness() == Readiness::Ready
+                    && matches!(&w.path, Path::Cpu(cpu) if !cpu.in_flight())
+            })
+            .map(|(&id, w)| (id, w.host_xid))
+            .collect()
+    }
+
+    /// A direct frame went to the host for `id`: the window waits for its
+    /// `Ready`, and the next CPU frame is whole, since the host's window
+    /// shows the client's buffer now.
+    #[cfg(kms)]
+    pub(crate) fn direct_submitted(&mut self, id: ToplevelId) {
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.frames.wait_for_ready();
+            if let Path::Cpu(cpu) = &mut w.path {
+                cpu.force_full();
             }
         }
     }

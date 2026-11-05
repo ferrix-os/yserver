@@ -737,6 +737,7 @@ impl KmsBackend {
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
             dri3_mapped: std::collections::HashMap::new(),
+            direct_frames: Default::default(),
             rootless: None,
             export_holders: Default::default(),
         };
