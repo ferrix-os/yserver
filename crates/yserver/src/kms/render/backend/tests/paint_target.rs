@@ -3230,6 +3230,7 @@ fn pointer_crossing_between_cow_and_a_sibling_is_nonlinear() {
         cow.0,
         0,
         yserver_core::core_loop::InputOrigin::NestedHost,
+        1,
     );
     assert_eq!(
         crossings(&mut b),
@@ -3243,6 +3244,7 @@ fn pointer_crossing_between_cow_and_a_sibling_is_nonlinear() {
         app,
         0,
         yserver_core::core_loop::InputOrigin::NestedHost,
+        1,
     );
     assert_eq!(
         crossings(&mut b),
