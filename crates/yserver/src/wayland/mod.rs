@@ -68,11 +68,12 @@ use crate::{
     kms::vk::device::VkContext,
     rootless::{
         display::{DisplayHost, HostScreen, HostWork},
-        host::{CpuFrame, FrameEvent, HandoffKind, RootlessHost},
+        host::{CpuFrame, DirectFrame, FrameEvent, HandoffKind, RootlessHost},
     },
 };
 
 mod clipboard;
+mod direct;
 mod input;
 
 /// How long a window the compositor refused to make waits before it is
@@ -107,6 +108,9 @@ struct Win {
     dismissed: bool,
     /// The popup's parent and placement it was made with.
     placed: Option<(ToplevelId, PopupOptions)>,
+    /// The last commit attached a client's buffer (a direct frame): the
+    /// next read-back one is damaged whole.
+    direct_shown: bool,
 }
 
 /// The connection, what the compositor said about its screens, and the
@@ -119,6 +123,9 @@ pub(crate) struct WaylandHost {
     order: Vec<ToplevelId>,
     seat: input::Seat,
     clipboard: Option<clipboard::Clipboard>,
+    /// Direct frames ([`direct`]); `None` when the compositor takes no
+    /// dmabufs.
+    direct: Option<direct::Direct>,
     /// What the compositor said, waiting for the core.
     work: HostWork,
     next_serial: u64,
@@ -140,6 +147,7 @@ impl WaylandHost {
         if clipboard.is_none() {
             log::warn!("wayland: the compositor has no ext_data_control_v1; no clipboard");
         }
+        let direct = direct::Direct::bind(&mut client);
         let mut seat = input::Seat::default();
         seat.bind(&mut client);
         let mut host = Self {
@@ -148,6 +156,7 @@ impl WaylandHost {
             order: Vec::new(),
             seat,
             clipboard,
+            direct,
             work: HostWork::default(),
             next_serial: 1,
         };
@@ -225,6 +234,20 @@ impl WaylandHost {
                 ..
             } if self.clipboard.as_mut().is_some_and(|clipboard| {
                 clipboard.event(&mut self.client, object, opcode, args)
+            }) => {}
+            Event::Object {
+                object,
+                opcode,
+                ref args,
+                ..
+            } if self.direct.as_mut().is_some_and(|direct| {
+                direct.event(
+                    &mut self.client,
+                    object,
+                    opcode,
+                    args,
+                    &mut self.work.frames,
+                )
             }) => {}
             other => log::debug!("wayland: {other:?}"),
         }
@@ -404,6 +427,7 @@ impl WaylandHost {
                 retry_at: None,
                 dismissed: false,
                 placed: None,
+                direct_shown: false,
             },
         );
         self.order.push(id);
@@ -541,6 +565,9 @@ impl RootlessHost for WaylandHost {
         } = frame;
         let shown = self.windows.get(&id).filter(|win| win.configured);
         let surface = shown.and_then(|win| win.surface);
+        // After a client's buffer, the compositor's last buffer is not the
+        // one this frame's damage is counted from: all of it changed.
+        let whole = shown.is_some_and(|win| win.direct_shown);
         let border = shown.map_or(0, |win| usize::from(crop(&win.spec)));
         let (width, height) = (usize::from(width), usize::from(height));
         let (shown_w, shown_h) = (
@@ -557,7 +584,11 @@ impl RootlessHost for WaylandHost {
                 depth != 32,
                 |out| {
                     copy_cropped(&pixels, width, border, (shown_w, shown_h), out);
-                    Some(cropped_damage(&damage, border, (shown_w, shown_h)))
+                    Some(if whole {
+                        Vec::new()
+                    } else {
+                        cropped_damage(&damage, border, (shown_w, shown_h))
+                    })
                 },
             ) {
                 Ok(drawn) => {
@@ -572,6 +603,9 @@ impl RootlessHost for WaylandHost {
                 }
             }
         });
+        if delivered && let Some(win) = self.windows.get_mut(&id) {
+            win.direct_shown = false;
+        }
         let frames = &mut self.work.frames;
         if delivered {
             frames.push(FrameEvent::Delivered { id, seq });
@@ -644,6 +678,37 @@ impl RootlessHost for WaylandHost {
 
     fn set_cursor(&mut self, cursor: Option<&ActiveCursorImage>) {
         self.seat.set_cursor(&mut self.client, cursor);
+    }
+
+    fn takes_direct(&self) -> bool {
+        self.direct.is_some()
+    }
+
+    /// A client's buffer as the window's, when the window shows exactly
+    /// that much (nothing of its X border is left out) and the compositor's
+    /// buffer for it is made; otherwise declined, and read back.
+    fn submit_direct(&mut self, frame: DirectFrame) -> bool {
+        let id = frame.id;
+        let Some(win) = self.windows.get(&id).filter(|win| win.configured) else {
+            return false;
+        };
+        let (Some(surface), Some(direct)) = (win.surface, self.direct.as_mut()) else {
+            return false;
+        };
+        if crop(&win.spec) != 0 || shown_size(&win.spec) != (frame.width, frame.height) {
+            return false;
+        }
+        let shown = direct.show(&mut self.client, surface, frame);
+        if shown && let Some(win) = self.windows.get_mut(&id) {
+            win.direct_shown = true;
+        }
+        shown
+    }
+
+    fn forget_direct(&mut self, generations: &[u64]) {
+        if let Some(direct) = self.direct.as_mut() {
+            direct.forget(&mut self.client, generations);
+        }
     }
 }
 

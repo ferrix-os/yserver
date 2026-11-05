@@ -509,6 +509,11 @@ pub trait Platform: OutputSink + Sized + 'static {
     /// A client freed pixmap `host_xid`, before its storage goes.
     fn pixmap_freed(_b: &mut XBackend<Self>, _host_xid: u32) {}
 
+    /// The drawable `host_xid` is about to be read or drawn into (a copy, a
+    /// `GetImage`), or the redirect backing `host_xid` is about to go: a
+    /// platform that keeps it owed a frame makes it whole first.
+    fn settle_for_access(_b: &mut XBackend<Self>, _host_xid: u32) {}
+
     fn dri3_import_pixmap(
         _b: &mut XBackend<Self>,
         _fd: yserver_core::fd::OwnedFd,

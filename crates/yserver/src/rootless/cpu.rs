@@ -129,6 +129,12 @@ impl CpuState {
         self.pool.len() < POOL || self.pool.iter().any(|b| b.pixels.is_some())
     }
 
+    /// The next readback is whole (the host showed something else since).
+    #[cfg(kms)]
+    pub(crate) fn force_full(&mut self) {
+        self.needs_full = true;
+    }
+
     pub(crate) fn needs_full(&self) -> bool {
         self.needs_full || self.canonical.is_none()
     }
