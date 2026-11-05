@@ -18,7 +18,7 @@ use yserver_protocol::{
     x11::{AtomId, ClientId, RequestHeader, ResourceId, SequenceNumber},
 };
 
-pub(super) fn handle_set_selection_owner(
+pub(crate) fn handle_set_selection_owner(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
@@ -312,7 +312,7 @@ fn fanout_xfixes_selection_notify(
     }
 }
 
-pub(super) fn handle_convert_selection(
+pub(crate) fn handle_convert_selection(
     state: &mut ServerState,
     client_id: ClientId,
     sequence: SequenceNumber,
@@ -366,6 +366,33 @@ pub(super) fn handle_convert_selection(
             24,
         );
     }
+
+    // A selection the server's own window owns is answered by the rootless
+    // host that made it, which has no connection for the SelectionRequest.
+    if let Some(owner) = state
+        .selections
+        .get(&selection)
+        .map(|owner| owner.window)
+        .filter(|window| window.0 != 0)
+        && crate::rootless::selection::note_request(
+            state,
+            owner,
+            crate::rootless::SelectionEvent::Request {
+                time: time_val,
+                requestor,
+                selection,
+                target: target_atom,
+                property,
+            },
+        )
+    {
+        debug!(
+            "client {} #{} ConvertSelection -> the server's window 0x{:x}",
+            client_id.0, sequence.0, owner.0
+        );
+        return Ok(RequestOutcome::Handled);
+    }
+
     if let Some((owner_window, owner_id)) = selection_owner_target_id(state, selection) {
         let _dropped = fanout_event_to_clients(state, &[owner_id], |buf, seq, order| {
             x11::encode_selection_request_event(
@@ -384,6 +411,8 @@ pub(super) fn handle_convert_selection(
             "client {} #{} ConvertSelection -> owner 0x{:x}",
             client_id.0, sequence.0, owner_window.0
         );
+    } else if crate::rootless::selection::note_refusal(state, requestor, selection, target_atom) {
+        // No owner, and the server's window asked: its host hears it.
     } else {
         // No owner, or its setter is gone (`dix/selection.c:297-301`):
         // SelectionNotify(None) to the client that issued ConvertSelection
@@ -411,7 +440,7 @@ pub(super) fn handle_convert_selection(
     Ok(RequestOutcome::Handled)
 }
 
-pub(super) fn handle_send_event(
+pub(crate) fn handle_send_event(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     client_id: ClientId,
@@ -468,6 +497,34 @@ pub(super) fn handle_send_event(
             req.event_mask,
             25,
         );
+    }
+    // A SelectionNotify for the server's own selection window, the answer
+    // to the rootless host's ConvertSelection: the host takes it, as no
+    // client can.
+    if event_type == 31 {
+        let word = |at: usize| {
+            let bytes = [
+                req.event[at],
+                req.event[at + 1],
+                req.event[at + 2],
+                req.event[at + 3],
+            ];
+            match sender_byte_order {
+                ClientByteOrder::BigEndian => u32::from_be_bytes(bytes),
+                ClientByteOrder::LittleEndian => u32::from_le_bytes(bytes),
+            }
+        };
+        if crate::rootless::selection::note_selection_notify(
+            state,
+            req.destination,
+            [word(12), word(16), word(20)],
+        ) {
+            debug!(
+                "client {} #{} SendEvent SelectionNotify to the server's window 0x{:x}",
+                client_id.0, sequence.0, req.destination.0
+            );
+            return Ok(RequestOutcome::Handled);
+        }
     }
     let targets = match send_event_recipients(state, req.destination, req.event_mask, header.data) {
         Ok(targets) => targets,
