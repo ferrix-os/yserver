@@ -28,6 +28,8 @@ pub(crate) mod surface;
 pub mod version;
 #[cfg(kms)]
 mod vt;
+#[cfg(all(kms, feature = "wayland"))]
+mod wayland;
 #[cfg(windows)]
 mod windows;
 
@@ -813,8 +815,20 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // would otherwise kill the whole session when the user hits Ctrl-C
     // inside an X client. Skipped silently when not on a Linux VC (pty
     // under SSH or a graphical terminal emulator).
-    let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
-    let device_paths = crate::platform::drm::resolve_default_kms_devices()?;
+    //
+    // A client of a Wayland compositor owns neither the console nor a card:
+    // the compositor has both, and the server runs on its renderer alone.
+    let wayland = wayland_requested();
+    let console_guard = if wayland {
+        None
+    } else {
+        crate::kms::console::ConsoleGuard::acquire(opts.vt)?
+    };
+    let device_paths = if wayland {
+        Vec::new()
+    } else {
+        crate::platform::drm::resolve_default_kms_devices()?
+    };
     if device_paths.is_empty() {
         log::info!("yserver: no DRM devices to open; starting zero-card headless");
     } else {
@@ -833,6 +847,18 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // present.
     let mut backend =
         build_kms_backend(&device_paths, console_guard, opts.layout.clone(), opts.vrr)?;
+    // The rootless Wayland host, which the root's size and the keymap come
+    // from: attached before the topology is read.
+    #[cfg(feature = "wayland")]
+    let wayland_host = if wayland {
+        let host = std::rc::Rc::new(std::cell::RefCell::new(wayland::WaylandHost::connect()?));
+        backend.attach_rootless_host(host.clone())?;
+        let (width, height) = backend.fb_dimensions();
+        log::info!("wayland: the root window is the compositor's screen, {width}x{height}");
+        Some(host)
+    } else {
+        None
+    };
     // One snapshot of everything `ServerState` needs from the live
     // backend — screen extent, RandR outputs/modes/providers, backend
     // capabilities. The server-reset boundary re-derives a generation
@@ -855,6 +881,17 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     crate::clock::init(state.start_instant);
     install_backend_root_bindings(&mut state, &backend);
     yserver_core::core_loop::process_request::install_default_font(&mut state, &mut backend)?;
+    #[cfg(feature = "wayland")]
+    if let Some(host) = &wayland_host {
+        backend
+            .start_rootless(&mut state)
+            .map_err(|e| io::Error::other(format!("rootless: {e}")))?;
+        if let Some(name) = host.borrow().window_manager_name() {
+            log::info!("wayland: the window manager is {name}");
+            yserver_core::rootless::name_window_manager(&mut state, &mut backend, &name);
+        }
+        log::info!("yserver: rootless, on the Wayland compositor");
+    }
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir).map_err(|e| {
@@ -933,7 +970,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             // libinput could not be set up at all (`SendContext::new()` failed
             // → `take_input_ctx()` is None). Refuse to start: a session with no
             // input is dead on arrival and cannot even be zapped.
-            if std::env::var_os("YSERVER_ALLOW_NO_INPUT").is_some() {
+            if no_input_allowed() {
                 log::warn!(
                     "yserver: no input devices; YSERVER_ALLOW_NO_INPUT set, starting anyway"
                 );
@@ -966,7 +1003,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
             // satisfy the guard, or we come up with a dead, un-zappable
             // session. The context tracks capability at add time.
             let opened = input_ctx.usable_input_device_count();
-            if opened > 0 || std::env::var_os("YSERVER_ALLOW_NO_INPUT").is_none() {
+            if opened > 0 || !no_input_allowed() {
                 ensure_input_devices_opened(opened)?;
             }
             log::info!("yserver: {opened} usable input device(s) opened at startup");
@@ -1193,6 +1230,28 @@ fn spawn_signal_thread(
             }
         })?;
     Ok(())
+}
+
+/// Whether `YSERVER_BACKEND=wayland` asks for the rootless Wayland host.
+/// Asked for in a build without the `wayland` feature, it is refused rather
+/// than ignored, since the server would take the console and the card of a
+/// machine whose compositor has them.
+#[cfg(kms)]
+fn wayland_requested() -> bool {
+    let asked = std::env::var("YSERVER_BACKEND").is_ok_and(|value| value == "wayland");
+    if asked && !cfg!(feature = "wayland") {
+        log::error!("yserver: YSERVER_BACKEND=wayland, but this build has no Wayland host");
+        std::process::exit(1);
+    }
+    asked
+}
+
+/// Whether the server may start with no input device: when
+/// `YSERVER_ALLOW_NO_INPUT` asks, and always as a Wayland client, whose
+/// input comes from the compositor rather than from evdev.
+#[cfg(kms)]
+fn no_input_allowed() -> bool {
+    std::env::var_os("YSERVER_ALLOW_NO_INPUT").is_some() || wayland_requested()
 }
 
 /// Build a `KmsBackend`. yserver is always Direct — self-managed DRM master

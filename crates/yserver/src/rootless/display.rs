@@ -9,7 +9,8 @@
 //! events -- and the platform applies it with the state in hand, after the
 //! host is no longer borrowed.
 
-#![allow(dead_code, reason = "no host is attached yet")]
+// Only the Wayland host (`--features wayland`) attaches one so far.
+#![cfg_attr(not(feature = "wayland"), allow(dead_code))]
 
 use std::{cell::RefCell, io, os::fd::RawFd, rc::Rc, time::Instant};
 
