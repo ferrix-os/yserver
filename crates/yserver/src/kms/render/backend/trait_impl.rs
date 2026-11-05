@@ -836,6 +836,7 @@ impl<P: Platform> Backend for XBackend<P> {
         origin: Option<OriginContext>,
         backing: PixmapHandle,
     ) -> io::Result<()> {
+        P::settle_for_access(self, backing.as_raw());
         Self::backend_redirect_release_redirected_backing(self, origin, backing)
     }
 
@@ -887,6 +888,7 @@ impl<P: Platform> Backend for XBackend<P> {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        P::pixmap_freed(self, host_xid);
         Self::backend_redirect_free_pixmap(self, _origin, host_xid)
     }
 
@@ -1106,6 +1108,8 @@ impl<P: Platform> Backend for XBackend<P> {
         height: u16,
     ) -> io::Result<()> {
         P::note_tearing_copy_damage(self, dst_host_xid);
+        P::settle_for_access(self, src_host_xid);
+        P::settle_for_access(self, dst_host_xid);
         Self::backend_draw_copy_area(
             self,
             _origin,
@@ -1175,6 +1179,7 @@ impl<P: Platform> Backend for XBackend<P> {
         height: u16,
         plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        P::settle_for_access(self, host_xid);
         Self::backend_draw_get_image(
             self, _origin, host_xid, format, x, y, width, height, plane_mask,
         )

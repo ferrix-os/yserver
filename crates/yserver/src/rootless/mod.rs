@@ -211,6 +211,8 @@ impl Presenter {
                         }
                     }
                 }
+                // The platform's: it holds the client buffers' idles.
+                FrameEvent::DirectReleased { .. } => {}
                 FrameEvent::Released { id, seq, pixels } => {
                     if let Some(Presented {
                         path: Path::Cpu(cpu),
@@ -300,6 +302,43 @@ impl Presenter {
             if w.frames.readiness() == Readiness::Busy && !w.wanted && has_work {
                 w.wanted = true;
                 self.host.frame_wanted(*id);
+            }
+        }
+    }
+
+    /// Windows that may take a direct frame now: shown already (a first
+    /// frame is always read back) and ready for the next, with no readback
+    /// in flight; with their backend window.
+    #[cfg(kms)]
+    pub(crate) fn direct_ready(&self) -> Vec<(ToplevelId, u32)> {
+        self.windows
+            .iter()
+            .filter(|(_, w)| {
+                w.frames.readiness() == Readiness::Ready
+                    && matches!(&w.path, Path::Cpu(cpu) if !cpu.in_flight())
+            })
+            .map(|(&id, w)| (id, w.host_xid))
+            .collect()
+    }
+
+    /// A direct frame went to the host for `id`: the window waits for its
+    /// `Ready`. The host's window shows the client's buffer now, a whole
+    /// window newer than the backing: the backing's damage so far is
+    /// acked, as Xwayland's flip leaves the window's damage nothing to
+    /// post, and the window is read back again only once the backing is
+    /// drawn (settled, or drawn into), and then whole.
+    #[cfg(kms)]
+    pub(crate) fn direct_submitted(&mut self, store: &mut DrawableStore, id: ToplevelId) {
+        if let Some(w) = self.windows.get_mut(&id) {
+            w.frames.wait_for_ready();
+            if let Path::Cpu(cpu) = &mut w.path {
+                cpu.direct_shown();
+                if let Some(snapshot) = cpu
+                    .backing()
+                    .and_then(|backing| store.peek_presentation_damage(backing))
+                {
+                    store.ack_presentation_damage(snapshot);
+                }
             }
         }
     }

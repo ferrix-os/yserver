@@ -59,6 +59,34 @@ pub(crate) struct DmabufFrame {
     pub damage: Vec<Rect>,
 }
 
+/// A whole-window frame that is a client's own buffer, handed to the host as
+/// it is (`kms/render/backend/kms/direct_frames.rs`): the client presented a
+/// LINEAR DRI3 buffer of the window's size, and the window's backing is owed
+/// the copy rather than made it.
+// Built by a host that takes direct frames; the Wayland host is the first.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct DirectFrame {
+    pub id: ToplevelId,
+    /// The client buffer's, unique for the server's life: what the host
+    /// keeps its own buffer object for it by.
+    pub generation: u64,
+    /// The present's, new for each.
+    pub serial: u64,
+    pub width: u16,
+    pub height: u16,
+    /// The one plane's offset and pitch.
+    pub offset: u32,
+    pub stride: u32,
+    /// `DRM_FORMAT_MOD_LINEAR`.
+    pub modifier: u64,
+    /// 24: alpha undefined; 32: premultiplied ARGB.
+    pub depth: u8,
+    /// A descriptor of the buffer, for a host that has no object of this
+    /// generation yet.
+    pub fd: OwnedFd,
+}
+
 /// Host → presenter, over the platform link (spec §4.5, §4.5.1).
 #[derive(Debug)]
 pub(crate) enum FrameEvent {
@@ -76,6 +104,10 @@ pub(crate) enum FrameEvent {
         seq: FrameSeq,
         pixels: Vec<u8>,
     },
+    /// The window system gave back the client buffer of a direct frame
+    /// (`wl_buffer.release`): the client may draw into it again.
+    #[allow(dead_code)]
+    DirectReleased { generation: u64 },
 }
 
 /// A native window system's side of rootless mode (spec §4.5), driven on the
@@ -116,4 +148,22 @@ pub(crate) trait RootlessHost {
     /// straight-alpha BGRA. For a host with no shell of its own to tell.
     #[cfg_attr(not(kms), allow(dead_code))]
     fn set_cursor(&mut self, _cursor: Option<&ActiveCursorImage>) {}
+    /// Whether the host takes direct frames: its window system can show a
+    /// client's dma-buf as a window's buffer.
+    #[cfg_attr(not(kms), allow(dead_code))]
+    fn takes_direct(&self) -> bool {
+        false
+    }
+    /// Show `frame` as its window's buffer, in place of the backing: `true`
+    /// when it was committed, after which the host owes a `Ready` as after a
+    /// CPU frame and a `DirectReleased` once the window system is done with
+    /// the buffer. `false` (no buffer object of that generation yet, or
+    /// refused): the window is read back instead.
+    #[cfg_attr(not(kms), allow(dead_code))]
+    fn submit_direct(&mut self, _frame: DirectFrame) -> bool {
+        false
+    }
+    /// The client buffers of these generations went: their objects may go.
+    #[cfg_attr(not(kms), allow(dead_code))]
+    fn forget_direct(&mut self, _generations: &[u64]) {}
 }

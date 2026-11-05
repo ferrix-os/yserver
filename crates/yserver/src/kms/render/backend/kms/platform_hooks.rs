@@ -402,6 +402,22 @@ impl Platform for PlatformBackend {
         false
     }
 
+    fn pixmap_freed(b: &mut KmsBackend, host_xid: u32) {
+        b.forget_direct_pixmap(host_xid);
+    }
+
+    fn settle_for_access(b: &mut KmsBackend, host_xid: u32) {
+        if b.pstate.direct_frames.owed.is_empty() {
+            return;
+        }
+        // A backing settles by its own id; a window or pixmap by the
+        // backing it draws into.
+        match b.store.lookup(host_xid) {
+            Some(id) if b.pstate.direct_frames.owed.contains_key(&id) => b.settle_direct(id),
+            _ => b.settle_direct_window(host_xid),
+        }
+    }
+
     fn maybe_teardown_export(b: &mut KmsBackend, id: DrawableId) {
         b.maybe_teardown_export(id);
     }
@@ -543,6 +559,11 @@ impl Platform for PlatformBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
+        // A rootless server has no scanout: a whole-window present may go
+        // to its host as the client's buffer instead.
+        if b.rootless_active() {
+            return Ok(b.try_direct_frame(&candidate, event));
+        }
         let result = KmsBackend::backend_present_try_present_direct(b, candidate, event);
         b.note_present_outcome(candidate.src_host_xid, matches!(result, Ok(true)));
         result
@@ -928,7 +949,11 @@ impl Platform for PlatformBackend {
     fn drain_completed_present_events(
         b: &mut KmsBackend,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        KmsBackend::backend_present_drain_completed_present_events(b)
+        let completed = KmsBackend::backend_present_drain_completed_present_events(b);
+        for event in &completed {
+            let _ = b.pstate.direct_frames.uncompleted.remove(&event.present_id);
+        }
+        completed
     }
 
     fn drain_retired_present_idle_events(
@@ -938,6 +963,7 @@ impl Platform for PlatformBackend {
         for owner in &mut b.pstate.direct.outputs {
             idled.append(&mut owner.idled);
         }
+        idled.extend(b.take_direct_idles());
         idled
     }
 
