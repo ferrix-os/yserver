@@ -52,10 +52,15 @@ pub(super) fn handle_mit_shm_request(
             // SAFETY: geteuid/getegid take no arguments and cannot fail.
             let (euid, egid) = unsafe { (libc::geteuid(), libc::getegid()) };
             #[allow(clippy::cast_possible_truncation)]
+            // Shared pixmaps: a MIT-SHM pixmap is filled from its segment
+            // whenever it is read (`refresh_pixmap_for_read`), so what the
+            // client wrote is what a Present or a copy of it shows. Mesa's
+            // software Vulkan WSI presents through them, rather than
+            // sending every frame as a PutImage.
             let reply = shm::encode_query_version_reply(
                 byte_order,
                 sequence,
-                false,
+                true,
                 euid as u16,
                 egid as u16,
             );
@@ -139,7 +144,23 @@ pub(super) fn handle_mit_shm_request(
         }
         shm::DETACH => {
             if let Some(shmseg) = shm::parse_detach(body) {
-                state.mit_shm_segments.remove(&shmseg);
+                if state.mit_shm_segments.remove(&shmseg).is_none() {
+                    // Xorg's VERIFY_SHMSEG: BadShmSeg, the extension's
+                    // first error. Mesa's WSI tells a local server by this
+                    // answer to a Detach of segment 0 (a remote one has no
+                    // MIT-SHM and answers BadRequest).
+                    const BAD_SHM_SEG: u8 = 168;
+                    return emit_x11_error_with_minor(
+                        state,
+                        client_id,
+                        sequence,
+                        BAD_SHM_SEG,
+                        shmseg,
+                        u16::from(minor),
+                        MIT_SHM_MAJOR_OPCODE,
+                    );
+                }
+                state.resources.forget_shm_segment(shmseg);
             }
         }
         shm::CREATE_PIXMAP => {
@@ -360,7 +381,57 @@ fn handle_mit_shm_create_pixmap(
             .set_pixmap_host_xid(ResourceId(req.pid), xid);
         debug_assert!(updated, "pixmap was just inserted above");
     }
+    state.resources.set_pixmap_shm_source(
+        ResourceId(req.pid),
+        crate::resources::ShmPixmapSource {
+            shmseg: req.shmseg,
+            offset: req.offset,
+        },
+    );
     Ok(RequestOutcome::Handled)
+}
+
+/// Bring a pixmap's backing up to date as it is about to be read, where the
+/// backing is a copy of memory the client writes: a MIT-SHM pixmap is
+/// filled from its segment. Nothing for any other pixmap.
+pub(super) fn refresh_pixmap_for_read(
+    state: &ServerState,
+    backend: &mut dyn Backend,
+    origin: Option<OriginContext>,
+    pixmap: ResourceId,
+) {
+    let Some(p) = state.resources.pixmap(pixmap) else {
+        return;
+    };
+    let (Some(source), Some(host_xid)) = (p.shm_source, p.host_xid) else {
+        return;
+    };
+    let Some(len) = zpixmap_expected_len(p.width, p.height, p.depth) else {
+        return;
+    };
+    let Some(segment) = state.mit_shm_segments.get(&source.shmseg) else {
+        return;
+    };
+    let start = source.offset as usize;
+    let Some(bytes) = segment.as_slice().get(start..start.saturating_add(len)) else {
+        return;
+    };
+    let _ = backend.clear_clip_rectangles(origin);
+    if let Err(err) = backend.put_image(
+        origin,
+        host_xid.as_raw(),
+        p.depth,
+        p.width,
+        p.height,
+        0,
+        0,
+        bytes,
+    ) {
+        log::warn!(
+            "MIT-SHM pixmap 0x{:x}: refresh from its segment failed: {err}",
+            pixmap.0
+        );
+    }
 }
 
 pub(super) fn handle_mit_shm_put_image(

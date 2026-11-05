@@ -1,8 +1,131 @@
 use super::*;
 use crate::core_loop::process_request::{
     misc::{advertised_extension_names, extension_query_reply},
-    xshm::{extract_shm_zpixmap_region, handle_mit_shm_put_image},
+    xshm::{extract_shm_zpixmap_region, handle_mit_shm_put_image, refresh_pixmap_for_read},
 };
+
+fn shm_request(
+    state: &mut ServerState,
+    backend: &mut RecordingBackend,
+    sequence: u16,
+    minor: u8,
+    body: &[u8],
+) {
+    #[allow(clippy::cast_possible_truncation)]
+    let length_units = 1 + (body.len() / 4) as u32;
+    process_request(
+        state,
+        backend,
+        ClientId(1),
+        SequenceNumber(sequence),
+        RequestHeader {
+            opcode: 130,
+            data: minor,
+            length_units,
+        },
+        body,
+        None,
+    )
+    .expect("MIT-SHM dispatch");
+}
+
+fn put_images_into(backend: &RecordingBackend, host_xid: u32) -> usize {
+    backend
+        .calls()
+        .iter()
+        .filter(|call| {
+            matches!(
+                call,
+                crate::backend::recording::RecordedCall::PutImage { host_xid: xid, .. }
+                    if *xid == host_xid
+            )
+        })
+        .count()
+}
+
+/// Mesa's software Vulkan WSI presents through MIT-SHM only when the
+/// server says it has shared pixmaps, and only when a Detach of segment 0
+/// is an error other than BadRequest (`wsi_x11_connection_init`).
+#[test]
+fn mit_shm_offers_shared_pixmaps_and_refuses_an_unknown_segment() {
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+
+    shm_request(&mut state, &mut backend, 1, 0, &[]);
+    let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+    assert_eq!(reply[0], 1, "ShmQueryVersion replies");
+    assert_eq!(reply[1], 1, "shared pixmaps are offered");
+    assert_eq!(reply[16], 2, "in Z format");
+
+    shm_request(&mut state, &mut backend, 2, 2, &0u32.to_le_bytes());
+    let reply = read_all_or_buffered(&mut state, 1, &mut peer);
+    assert_eq!(reply.len(), 32);
+    assert_eq!(reply[0], 0, "an error");
+    assert_eq!(reply[1], 168, "BadShmSeg, MIT-SHM's first error");
+    assert_eq!(reply[10], 130);
+}
+
+/// A shared pixmap is the client's memory: what the client writes after
+/// CreatePixmap is what a read of the pixmap gives, until the segment is
+/// detached.
+#[test]
+fn mit_shm_pixmap_is_filled_from_its_segment_when_read_until_detached() {
+    const PIXMAP: u32 = 0x0020_0001;
+    const SHMSEG: u32 = 0x0020_0003;
+    let mut state = ServerState::new();
+    let mut peer = install_client(&mut state, 1);
+    let mut backend = RecordingBackend::new();
+
+    // SAFETY: a fresh memfd, sized and handed to the segment, which owns it.
+    let fd = unsafe { libc::memfd_create(c"mit-shm-shared-pixmap".as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create failed");
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::ftruncate(fd, 64) }, 0, "ftruncate failed");
+    let segment = crate::server::MitShmSegment::from_fd(ClientId(1), fd, false)
+        .expect("map test SHM segment");
+    state.mit_shm_segments.insert(SHMSEG, segment);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&PIXMAP.to_le_bytes());
+    body.extend_from_slice(&ROOT_WINDOW.0.to_le_bytes());
+    body.extend_from_slice(&4u16.to_le_bytes());
+    body.extend_from_slice(&4u16.to_le_bytes());
+    body.extend_from_slice(&[24, 0, 0, 0]);
+    body.extend_from_slice(&SHMSEG.to_le_bytes());
+    body.extend_from_slice(&0u32.to_le_bytes());
+    shm_request(&mut state, &mut backend, 1, 5, &body);
+    let host = state
+        .resources
+        .pixmap(ResourceId(PIXMAP))
+        .and_then(|p| p.host_xid)
+        .expect("the shared pixmap has a backing")
+        .as_raw();
+    assert_eq!(
+        put_images_into(&backend, host),
+        1,
+        "filled once at CreatePixmap"
+    );
+
+    refresh_pixmap_for_read(&state, &mut backend, None, ResourceId(PIXMAP));
+    assert_eq!(
+        put_images_into(&backend, host),
+        2,
+        "filled again as it is read"
+    );
+
+    shm_request(&mut state, &mut backend, 2, 2, &SHMSEG.to_le_bytes());
+    assert!(
+        read_all_or_buffered(&mut state, 1, &mut peer).is_empty(),
+        "a known segment detaches without an error"
+    );
+    refresh_pixmap_for_read(&state, &mut backend, None, ResourceId(PIXMAP));
+    assert_eq!(
+        put_images_into(&backend, host),
+        2,
+        "a detached segment's pixmap keeps what it had"
+    );
+}
 
 #[test]
 fn remote_clients_are_rejected_before_dri3_and_mit_shm_handlers() {

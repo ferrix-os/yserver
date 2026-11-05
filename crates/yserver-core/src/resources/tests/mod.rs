@@ -94,6 +94,7 @@ fn resource_counts_by_owner_tallies_per_type_and_skips_zero() {
             owner,
             host_xid: Some(PixmapHandle::from_raw_for_test(0xb01)),
             composite_name: false,
+            shm_source: None,
         },
     );
 
@@ -140,6 +141,7 @@ fn disconnect_cleanup_drains_every_xid_in_use_map_for_owner() {
             owner,
             host_xid: Some(PixmapHandle::from_raw_for_test(0xa01)),
             composite_name: false,
+            shm_source: None,
         },
     );
 
