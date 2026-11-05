@@ -84,6 +84,44 @@ pub fn open_for_card<F: AsFd>(card_fd: F) -> io::Result<OpenedRenderNode> {
     Ok(OpenedRenderNode { fd, node: render })
 }
 
+/// Open the render node of a server that owns no card: the one
+/// `YSERVER_DRI_RENDER_NODE` names, else `/dev/dri/renderD<minor>` for the
+/// render node the renderer advertises, checked against that identity, or
+/// the machine's only render node when the renderer advertises none.
+pub(crate) fn open_headless(
+    advertised: Option<DrmDeviceKey>,
+) -> io::Result<Option<OpenedRenderNode>> {
+    let node = if let Some(path) = explicit_render_node_path() {
+        drm::render_node_from_path(path)?
+    } else if let Some(key) = advertised {
+        let node =
+            drm::render_node_from_path(PathBuf::from(format!("/dev/dri/renderD{}", key.minor)))?;
+        if node.key != key {
+            return Err(io::Error::other(format!(
+                "{} is {}, not the renderer's render node {key}",
+                node.path.display(),
+                node.key,
+            )));
+        }
+        node
+    } else {
+        // A renderer that names no node (its driver lacks
+        // VK_EXT_physical_device_drm): the machine's only render node, if
+        // it has exactly one, is the GPU that renderer drives.
+        match drm::render_nodes()?.as_slice() {
+            [only] => only.clone(),
+            _ => return Ok(None),
+        }
+    };
+    let fd = drm::open_node(&node)?;
+    Ok(Some(OpenedRenderNode { fd, node }))
+}
+
+/// Whether `YSERVER_DRI_RENDER_NODE` names a render node.
+pub(crate) fn render_node_named() -> bool {
+    explicit_render_node_path().is_some()
+}
+
 fn explicit_render_node_path() -> Option<PathBuf> {
     let path = PathBuf::from(env::var_os(RENDER_NODE_ENV)?);
     (!path.as_os_str().is_empty()).then_some(path)
