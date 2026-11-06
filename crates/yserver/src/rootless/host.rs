@@ -63,8 +63,7 @@ pub(crate) struct DmabufFrame {
 /// it is (`kms/render/backend/kms/direct_frames.rs`): the client presented a
 /// LINEAR DRI3 buffer of the window's size, and the window's backing is owed
 /// the copy rather than made it.
-// Built by a host that takes direct frames; the Wayland host is the first.
-#[allow(dead_code)]
+#[cfg_attr(not(wayland_host), allow(dead_code))]
 #[derive(Debug)]
 pub(crate) struct DirectFrame {
     pub id: ToplevelId,
@@ -106,7 +105,7 @@ pub(crate) enum FrameEvent {
     },
     /// The window system gave back the client buffer of a direct frame
     /// (`wl_buffer.release`): the client may draw into it again.
-    #[allow(dead_code)]
+    #[cfg_attr(not(wayland_host), allow(dead_code))]
     DirectReleased { generation: u64 },
 }
 

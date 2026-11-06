@@ -12,7 +12,7 @@
 //! pointer motion it belongs to.
 //!
 //! The globals only one part of the host uses (the relative pointer, the
-//! pointer constraints, data control) are that part's to bind, with
+//! pointer constraints, data control, dmabuf) are that part's to bind, with
 //! [`Client::bind`]; their events come back as [`Event`]s too.
 
 use std::{
@@ -52,6 +52,10 @@ use wayland_protocols::{
         cursor_shape::v1::client::{
             wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
             wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        },
+        linux_dmabuf::zv1::client::{
+            zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+            zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
         },
         pointer_constraints::zv1::client::{
             zwp_locked_pointer_v1::{self, ZwpLockedPointerV1},
@@ -230,6 +234,18 @@ pub(super) enum ClipboardEvent {
     Cancelled(ExtDataControlSourceV1),
 }
 
+/// What the dmabuf objects said ([`super::direct`]).
+#[derive(Debug)]
+pub(super) enum DirectEvent {
+    Created {
+        params: ZwpLinuxBufferParamsV1,
+        buffer: WlBuffer,
+    },
+    Failed(ZwpLinuxBufferParamsV1),
+    /// The compositor no longer reads a client's buffer.
+    Released(WlBuffer),
+}
+
 /// What happened on the connection, for the host.
 #[derive(Debug)]
 pub(super) enum Event {
@@ -261,6 +277,7 @@ pub(super) enum Event {
         locked: bool,
     },
     Clipboard(ClipboardEvent),
+    Direct(DirectEvent),
 }
 
 /// What a `wl_surface` of the host's is.
@@ -276,6 +293,8 @@ enum BufferData {
     /// One of a window's `wl_shm` buffers.
     Window(SurfaceId),
     Cursor,
+    /// A client's buffer, made by `zwp_linux_buffer_params_v1`.
+    Direct,
 }
 
 /// Memory shared with the compositor: a memfd, mapped.
@@ -974,6 +993,22 @@ impl Client {
             damage_buffer(&state.surface, (x, y, width, height));
         }
         Ok(true)
+    }
+
+    /// Attach a buffer that is not the host's (a client's dmabuf) to the
+    /// surface and damage all of it. [`Client::commit_frame`] shows it.
+    pub(super) fn attach(
+        &self,
+        surface: SurfaceId,
+        buffer: &WlBuffer,
+        (width, height): (u32, u32),
+    ) -> bool {
+        let Some(state) = self.state.surfaces.get(&surface) else {
+            return false;
+        };
+        state.surface.attach(Some(buffer), 0, 0);
+        damage_buffer(&state.surface, (0, 0, width, height));
+        true
     }
 
     /// Ask for an [`Event::Frame`] when the compositor next wants a frame
@@ -1738,6 +1773,9 @@ impl Dispatch<WlBuffer, BufferData> for State {
                 }
             }
             BufferData::Cursor => {}
+            BufferData::Direct => state
+                .pending
+                .push(Event::Direct(DirectEvent::Released(buffer.clone()))),
         }
     }
 }
@@ -1864,6 +1902,31 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
     }
 }
 
+impl Dispatch<ZwpLinuxBufferParamsV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        params: &ZwpLinuxBufferParamsV1,
+        event: zwp_linux_buffer_params_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let event = match event {
+            zwp_linux_buffer_params_v1::Event::Created { buffer } => DirectEvent::Created {
+                params: params.clone(),
+                buffer,
+            },
+            zwp_linux_buffer_params_v1::Event::Failed => DirectEvent::Failed(params.clone()),
+            _ => return,
+        };
+        state.pending.push(Event::Direct(event));
+    }
+
+    event_created_child!(State, ZwpLinuxBufferParamsV1, [
+        zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (WlBuffer, BufferData::Direct),
+    ]);
+}
+
 /// Objects whose events the host does not need.
 macro_rules! quiet {
     ($($interface:ty),* $(,)?) => {$(
@@ -1891,6 +1954,7 @@ quiet!(
     WpCursorShapeDeviceV1,
     ZwpRelativePointerManagerV1,
     ZwpPointerConstraintsV1,
+    ZwpLinuxDmabufV1,
     ExtDataControlManagerV1,
 );
 

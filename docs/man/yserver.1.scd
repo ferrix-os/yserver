@@ -254,6 +254,21 @@ above.
 	(*\_NET_WM_NAME* of the *\_NET_SUPPORTING_WM_CHECK* window) when the
 	compositor's process name cannot be read from its socket.
 
+*YSERVER_DIRECT_FRAMES*
+	*0* turns direct frames off under *YSERVER_BACKEND=wayland*: a
+	whole-window present of a client's LINEAR DRI3 buffer is copied into
+	the window and read back, rather than handed to the compositor as the
+	client's buffer.
+
+*YSERVER_PAIR_PACING*
+	*0* turns off the pacing of direct frames presented in pairs (frame
+	generation): the second of a pair goes to the compositor as soon as
+	the window can take it.
+
+*YSERVER_WAYLAND_DIRECT*
+	*0* makes the Wayland host take no direct frames: it binds no
+	*zwp_linux_dmabuf_v1*, and every window is read back.
+
 *YSERVER_DRM_DEVICE*
 	Path to the sole KMS device to use instead of auto-selecting devices,
 	e.g. _/dev/dri/card1_. Ignored when *YSERVER_DRM_DEVICES* is set.
