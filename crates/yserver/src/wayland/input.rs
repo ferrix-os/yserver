@@ -52,18 +52,66 @@ use compositor_toolkit::{
 use yserver_core::{
     backend::ActiveCursorImage,
     core_loop::{
-        HostInputEvent, InputOrigin,
-        message::{SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT, SYNTH_SCROLL_UP},
+        DeviceInfo, HostInputEvent, InputOrigin,
+        message::{
+            LibinputConfigSnapshot, SYNTH_SCROLL_DOWN, SYNTH_SCROLL_LEFT, SYNTH_SCROLL_RIGHT,
+            SYNTH_SCROLL_UP,
+        },
     },
     host_x11::HostKeyEvent,
     rootless::{HostRequest, RootlessInput, ToplevelId},
+    xinput::{InputCapabilities, InputSourceId},
 };
 
 use crate::rootless::{display::HostWork, present_clock::monotonic_us};
 
-/// The origin of the compositor's input: one pointer and one keyboard, the
-/// master devices'.
-const ORIGIN: InputOrigin = InputOrigin::NestedHost;
+/// The compositor's seat as X sees it: a slave pointer and a slave
+/// keyboard of the core pair, as Xwayland's `xwayland-pointer` and
+/// `xwayland-keyboard`, announced before any input ([`announcements`]).
+/// Their input carries their own ids as its source, as any slave's does:
+/// an event sourced from a master is one no X server sends, and a client
+/// that opens an event's source (Wine opens a raw button's with
+/// XOpenDevice) is refused one.
+///
+/// The ids are the top of the source space, clear of libinput's, which
+/// count up from 1.
+const POINTER: InputSourceId = InputSourceId(u64::MAX - 1);
+const KEYBOARD: InputSourceId = InputSourceId(u64::MAX);
+
+/// The origin of the compositor's pointer input.
+const ORIGIN: InputOrigin = InputOrigin::Physical(POINTER);
+
+/// The origin of the compositor's keys.
+const KEY_ORIGIN: InputOrigin = InputOrigin::Physical(KEYBOARD);
+
+/// The seat's two devices, for the core before any input: XI slaves of the
+/// core pointer and keyboard, as the window-system shells' are
+/// (`surface/input/devices.rs`).
+pub(super) fn announcements() -> [HostInputEvent; 2] {
+    let device = |source_id, name: &str, keyboard| {
+        HostInputEvent::DeviceAdded(DeviceInfo {
+            source_id,
+            enabled: true,
+            resume_key: None,
+            capabilities: InputCapabilities {
+                keyboard,
+                pointer: !keyboard,
+                touch: false,
+            },
+            name: name.to_owned(),
+            device_node: String::new(),
+            sysname: String::new(),
+            vendor_id: 0,
+            product_id: 0,
+            is_touchpad: false,
+            config: LibinputConfigSnapshot::default(),
+        })
+    };
+    [
+        device(POINTER, "Wayland pointer", false),
+        device(KEYBOARD, "Wayland keyboard", true),
+    ]
+}
 
 /// How much `wl_pointer.axis` scroll is one wheel click, where the
 /// compositor does not count clicks itself.
@@ -436,7 +484,7 @@ impl Seat {
                 };
                 if changed {
                     work.input.push(HostInputEvent::Key(HostKeyEvent {
-                        origin: ORIGIN,
+                        origin: KEY_ORIGIN,
                         pressed: key.pressed,
                         keycode,
                         time: crate::clock::server_time_ms(),
@@ -631,6 +679,29 @@ fn premultiplied(bgra: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pointer's and the keys' input comes from the two slaves the host
+    /// announces, never from a master (`InputOrigin::NestedHost`), whose
+    /// events carry the master as their source.
+    #[test]
+    fn the_seats_input_comes_from_the_slaves_it_announces() {
+        let [
+            HostInputEvent::DeviceAdded(pointer),
+            HostInputEvent::DeviceAdded(keyboard),
+        ] = announcements()
+        else {
+            panic!("two devices");
+        };
+        assert!(pointer.capabilities.pointer && !pointer.capabilities.keyboard);
+        assert!(keyboard.capabilities.keyboard && !keyboard.capabilities.pointer);
+        assert_ne!(pointer.source_id, keyboard.source_id);
+        assert_eq!(ORIGIN, InputOrigin::Physical(pointer.source_id));
+        assert_eq!(KEY_ORIGIN, InputOrigin::Physical(keyboard.source_id));
+        assert_eq!(
+            (pointer.name.as_str(), keyboard.name.as_str()),
+            ("Wayland pointer", "Wayland keyboard")
+        );
+    }
 
     #[test]
     fn the_wheel_counts_the_compositors_clicks_or_ten_units_a_click() {

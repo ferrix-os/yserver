@@ -160,6 +160,8 @@ impl WaylandHost {
             work: HostWork::default(),
             next_serial: 1,
         };
+        // The seat's devices, before its first input.
+        host.work.input.extend(input::announcements());
         if host.client.keyboard_layout().is_none() {
             // The keymap comes after the seat's keyboard is made, which the
             // first round trips only start.
