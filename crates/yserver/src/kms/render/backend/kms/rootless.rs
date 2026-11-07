@@ -293,7 +293,7 @@ impl KmsBackend {
                 fd: frame.fd,
             });
             if taken {
-                presenter.direct_submitted(id);
+                presenter.direct_submitted(&mut self.store, id);
                 self.direct_handed(top, serial);
                 let _ = shown.insert(id, serial);
                 let _ = pending.insert(id);

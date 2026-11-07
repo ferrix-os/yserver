@@ -51,6 +51,11 @@ pub(crate) struct CpuState {
     /// The next readback is full-extent: a new window or generation, or a
     /// dropped frame nothing at this generation was delivered after.
     needs_full: bool,
+    /// The host's window shows a client's buffer (a direct frame): newer
+    /// than the backing, which is owed it. Only new damage of the backing
+    /// is a reason to read it back; read back for nothing else, it put a
+    /// frame minutes old on screen between direct frames.
+    direct: bool,
     backing: Option<DrawableId>,
 }
 
@@ -114,6 +119,7 @@ impl CpuState {
         self.backing = Some(backing);
         self.canonical = None;
         self.needs_full = true;
+        self.direct = false;
     }
 
     pub(crate) fn backing(&self) -> Option<DrawableId> {
@@ -129,10 +135,13 @@ impl CpuState {
         self.pool.len() < POOL || self.pool.iter().any(|b| b.pixels.is_some())
     }
 
-    /// The next readback is whole (the host showed something else since).
+    /// The host shows a direct frame now: the next readback is whole (the
+    /// host showed something else since), and none is owed until the
+    /// backing is drawn again.
     #[cfg(kms)]
-    pub(crate) fn force_full(&mut self) {
+    pub(crate) fn direct_shown(&mut self) {
         self.needs_full = true;
+        self.direct = true;
     }
 
     pub(crate) fn needs_full(&self) -> bool {
@@ -140,9 +149,10 @@ impl CpuState {
     }
 
     /// Something to read: a full readback is owed, or the store holds
-    /// damage of the backing.
+    /// damage of the backing. While the host shows a direct frame, only
+    /// the damage: the backing is older than what the host shows.
     pub(crate) fn has_work(&self, store: &DrawableStore) -> bool {
-        self.needs_full()
+        (self.needs_full() && !self.direct)
             || self.backing.is_some_and(|b| {
                 store
                     .peek_presentation_damage(b)
@@ -211,6 +221,8 @@ impl CpuState {
         };
         match g.engine.begin_readback(g.store, g.gpu, backing, &rects) {
             Ok(readback) => {
+                // The frame read back replaces the direct one at the host.
+                self.direct = false;
                 self.in_flight = Some(InFlight {
                     backing_gen: frames.backing_gen(),
                     full,
@@ -352,5 +364,66 @@ pub(crate) fn ack(store: &mut DrawableStore, backing: Option<DrawableId>, epoch:
             epoch,
             region: RegionSet::new(),
         });
+    }
+}
+
+#[cfg(all(test, kms))]
+mod direct_tests {
+    use ash::vk;
+
+    use super::CpuState;
+    use crate::kms::render::store::{DrawableKind, DrawableStore, Storage};
+
+    fn window(store: &mut DrawableStore) -> crate::kms::render::store::DrawableId {
+        let storage = Storage::for_tests_null(
+            vk::Extent2D {
+                width: 16,
+                height: 16,
+            },
+            vk::Format::B8G8R8A8_UNORM,
+        );
+        store
+            .allocate(0x10, DrawableKind::Window, 24, true, storage)
+            .expect("allocated")
+    }
+
+    /// The N150, 2026-11-07: in world, 3 to 5 of every 6 screenshots of
+    /// Endfield showed a frame minutes old. After each direct frame the
+    /// window was owed a whole readback, so the next `Ready` read back the
+    /// backing the direct frames had left behind and committed it between
+    /// them. A direct frame owes no readback; the backing drawn after one
+    /// does, and whole.
+    #[test]
+    fn a_direct_frame_owes_no_readback_until_the_backing_is_drawn() {
+        let mut store = DrawableStore::new();
+        let backing = window(&mut store);
+        let mut cpu = CpuState::new();
+        cpu.new_generation(backing);
+        assert!(cpu.has_work(&store), "a new window is read back first");
+        cpu.direct_shown();
+        assert!(
+            !cpu.has_work(&store),
+            "the host shows the client's buffer, newer than the backing"
+        );
+        // Settled, or drawn into: the backing changed, and the frame read
+        // back is whole, since the host showed something else.
+        store.damage(
+            backing,
+            vk::Rect2D {
+                offset: vk::Offset2D { x: 2, y: 2 },
+                extent: vk::Extent2D {
+                    width: 4,
+                    height: 4,
+                },
+            },
+        );
+        assert!(cpu.has_work(&store));
+        assert!(cpu.needs_full());
+        // A new generation is read back whatever the host shows.
+        let mut store = DrawableStore::new();
+        let backing = window(&mut store);
+        cpu.direct_shown();
+        cpu.new_generation(backing);
+        assert!(cpu.has_work(&store));
     }
 }

@@ -322,14 +322,23 @@ impl Presenter {
     }
 
     /// A direct frame went to the host for `id`: the window waits for its
-    /// `Ready`, and the next CPU frame is whole, since the host's window
-    /// shows the client's buffer now.
+    /// `Ready`. The host's window shows the client's buffer now, a whole
+    /// window newer than the backing: the backing's damage so far is
+    /// acked, as Xwayland's flip leaves the window's damage nothing to
+    /// post, and the window is read back again only once the backing is
+    /// drawn (settled, or drawn into), and then whole.
     #[cfg(kms)]
-    pub(crate) fn direct_submitted(&mut self, id: ToplevelId) {
+    pub(crate) fn direct_submitted(&mut self, store: &mut DrawableStore, id: ToplevelId) {
         if let Some(w) = self.windows.get_mut(&id) {
             w.frames.wait_for_ready();
             if let Path::Cpu(cpu) = &mut w.path {
-                cpu.force_full();
+                cpu.direct_shown();
+                if let Some(snapshot) = cpu
+                    .backing()
+                    .and_then(|backing| store.peek_presentation_damage(backing))
+                {
+                    store.ack_presentation_damage(snapshot);
+                }
             }
         }
     }
