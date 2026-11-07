@@ -973,6 +973,7 @@ pub(super) fn execute_present_pixmap_copy(
     // The source is read now, when the present executes: after its wait
     // (`arm_present_source_wait`, the client's GPU work on a DRI3 buffer)
     // and never at the request, which would block the loop on that work.
+    #[cfg(unix)]
     super::xshm::refresh_pixmap_for_read(state, backend, origin, ResourceId(pixmap));
 
     let variable_refresh = crate::properties::variable_refresh_property_enabled(
