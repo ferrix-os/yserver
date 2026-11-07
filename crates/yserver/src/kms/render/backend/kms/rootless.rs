@@ -123,6 +123,14 @@ impl KmsBackend {
         Some(self.pstate.rootless.as_ref()?.host.borrow().fd())
     }
 
+    /// The host's last flush left output queued (`DisplayHost::unsent`).
+    pub(in crate::kms::render::backend) fn rootless_host_unsent(&self) -> bool {
+        self.pstate
+            .rootless
+            .as_ref()
+            .is_some_and(|rootless| rootless.host.borrow().unsent())
+    }
+
     /// The host's connection is readable: read it, then apply what it said
     /// with the host no longer borrowed. `false` when it closed.
     pub(in crate::kms::render::backend) fn rootless_on_display_ready(

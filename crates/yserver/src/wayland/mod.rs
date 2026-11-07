@@ -719,6 +719,10 @@ impl DisplayHost for WaylandHost {
         }
     }
 
+    fn unsent(&self) -> bool {
+        self.client.unsent()
+    }
+
     fn screen(&self) -> Option<HostScreen> {
         let output = self.client.outputs().next()?;
         let (width, height) = output.logical_size();

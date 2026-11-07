@@ -519,6 +519,10 @@ impl Platform for PlatformBackend {
         b.rootless_on_display_ready(state)
     }
 
+    fn host_display_wants_writable(b: &KmsBackend) -> bool {
+        b.rootless_host_unsent()
+    }
+
     fn dump_scanout(b: &mut KmsBackend) {
         KmsBackend::backend_readback_dump_scanout(b)
     }

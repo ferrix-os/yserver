@@ -124,10 +124,17 @@ pub(crate) trait DisplayHost: RootlessHost {
     /// platform's rootless state from here.
     fn service(&mut self, _state: &mut ServerState, _backend: &mut dyn Backend) {}
     /// Send what is queued, without blocking: it runs on the core thread.
-    /// What the socket does not take now stays queued, and the next call
-    /// (the platform calls this at least once each loop iteration, before
-    /// the loop blocks) sends it.
+    /// What the socket does not take now stays queued, and
+    /// [`DisplayHost::unsent`] says so; the next call (the platform calls
+    /// this at least once each loop iteration, before the loop blocks) sends
+    /// it.
     fn flush(&mut self) {}
+    /// The last [`DisplayHost::flush`] left output queued: the core loop
+    /// watches [`DisplayHost::fd`] for writable too, and comes round when
+    /// the socket takes more.
+    fn unsent(&self) -> bool {
+        false
+    }
     /// The host's screen.
     fn screen(&self) -> Option<HostScreen>;
     /// When the loop must come round for the host's own work.

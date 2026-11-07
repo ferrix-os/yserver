@@ -16,6 +16,7 @@
 //! [`Client::bind`]; their events come back as [`Event`]s too.
 
 use std::{
+    cell::Cell,
     collections::HashMap,
     io,
     num::NonZeroUsize,
@@ -503,6 +504,8 @@ pub(super) struct Client {
     registry: WlRegistry,
     state: State,
     next_surface: u32,
+    /// The last flush left requests queued: the socket was full.
+    unsent: Cell<bool>,
 }
 
 impl Client {
@@ -526,6 +529,7 @@ impl Client {
             registry,
             state: State::default(),
             next_surface: 1,
+            unsent: Cell::new(false),
         };
         // The globals, then what binding them made the compositor say (the
         // screens' descriptions, the seat's devices), then what those made
@@ -642,18 +646,21 @@ impl Client {
         Ok(std::mem::take(&mut self.state.pending))
     }
 
-    /// Send what is queued. A full socket is not an error: the rest goes
-    /// with the next flush.
+    /// Send what is queued. A full socket is not an error: the rest stays
+    /// queued, [`Client::unsent`] says so, and goes with the next flush.
     ///
     /// # Errors
     ///
     /// Writing to the compositor failing.
     pub(super) fn flush(&self) -> io::Result<()> {
-        match self.connection.flush() {
-            Ok(()) => Ok(()),
-            Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
-            Err(error) => Err(io::Error::other(error)),
-        }
+        let unsent = flush(&self.connection);
+        self.unsent.set(matches!(unsent, Ok(true)));
+        unsent.map(drop)
+    }
+
+    /// The last flush left requests queued, for a socket that was full.
+    pub(super) fn unsent(&self) -> bool {
+        self.unsent.get()
     }
 
     /// A `wl_surface` for the window or popup `id`, when the compositor
@@ -1908,6 +1915,16 @@ impl Dispatch<WlSurface, SurfaceData> for State {
     }
 }
 
+/// Send what `connection` has queued: whether some of it stays queued, the
+/// socket being full.
+fn flush(connection: &Connection) -> io::Result<bool> {
+    match connection.flush() {
+        Ok(()) => Ok(false),
+        Err(WaylandError::Io(error)) if error.kind() == io::ErrorKind::WouldBlock => Ok(true),
+        Err(error) => Err(io::Error::other(error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1959,5 +1976,37 @@ mod tests {
         assert_eq!(length(2, 3), Some(24));
         assert_eq!(length(0, 3), None);
         assert_eq!(length(65536, 65536), None);
+    }
+
+    /// A flush into a full socket leaves the request queued and says so; once
+    /// the compositor reads, the next flush sends it and says it is out.
+    #[test]
+    fn a_flush_into_a_full_socket_says_what_stays_queued() {
+        use std::io::{Read as _, Write as _};
+        let (host, mut compositor) = std::os::unix::net::UnixStream::pair().unwrap();
+        host.set_nonblocking(true).unwrap();
+        let mut filled = 0usize;
+        loop {
+            match (&host).write(&[0u8; 4096]) {
+                Ok(n) => filled += n,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let connection = Connection::from_socket(host).unwrap();
+        let queue = connection.new_event_queue::<State>();
+        let _registry = connection.display().get_registry(&queue.handle(), ());
+        assert!(flush(&connection).unwrap(), "the request stays queued");
+        compositor.set_nonblocking(true).unwrap();
+        let mut buf = vec![0u8; 64 << 10];
+        let mut read = 0usize;
+        while read < filled {
+            read += compositor.read(&mut buf).unwrap();
+        }
+        assert!(!flush(&connection).unwrap(), "the request went out");
+        // wl_display.get_registry: object 1, opcode 1, 12 bytes.
+        let n = compositor.read(&mut buf).unwrap();
+        assert_eq!(n, 12);
+        assert_eq!(u32::from_ne_bytes(buf[..4].try_into().unwrap()), 1);
     }
 }
