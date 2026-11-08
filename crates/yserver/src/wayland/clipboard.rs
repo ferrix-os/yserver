@@ -69,8 +69,15 @@ const PATIENCE: Duration = Duration::from_secs(5);
 /// The most a selection may hold: what one property of the server's takes.
 const LIMIT: usize = 16 << 20;
 
-/// The property on the server's window an X owner answers into.
-const PROPERTY: &str = "_YSERVER_SELECTION";
+/// The properties on the server's window an X owner answers into, one
+/// transfer's after another's: an answer that comes after its transfer was
+/// given up names a property the next transfer does not.
+const PROPERTIES: [&str; 4] = [
+    "_YSERVER_SELECTION_0",
+    "_YSERVER_SELECTION_1",
+    "_YSERVER_SELECTION_2",
+    "_YSERVER_SELECTION_3",
+];
 
 /// The two selections, by index: X's `CLIPBOARD` and `PRIMARY`.
 const NAMES: [&str; 2] = ["CLIPBOARD", "PRIMARY"];
@@ -87,8 +94,28 @@ struct Send {
 #[derive(Debug)]
 struct Converting {
     send: Send,
-    /// The type asked for.
+    /// What was asked: the selection, the type and the property.
+    asked: Asked,
+}
+
+/// One `ConvertSelection` of the server's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Asked {
+    selection: AtomId,
     target: AtomId,
+    property: AtomId,
+}
+
+impl Asked {
+    /// Whether a `SelectionNotify` is the answer to this: of the same
+    /// selection and type, into this property or refused. One into another
+    /// property is the late answer to a transfer given up. (A late refusal
+    /// names no property, and is taken for this one's.)
+    fn answered_by(&self, selection: AtomId, target: AtomId, property: AtomId) -> bool {
+        selection == self.selection
+            && target == self.target
+            && (property == self.property || property.0 == 0)
+    }
 }
 
 /// An X client's paste of the compositor's selection, read from the pipe.
@@ -127,7 +154,7 @@ struct Atoms {
     targets: AtomId,
     atom: AtomId,
     incr: AtomId,
-    property: AtomId,
+    properties: [AtomId; PROPERTIES.len()],
 }
 
 impl Atoms {
@@ -143,7 +170,7 @@ impl Atoms {
             targets: atom("TARGETS"),
             atom: atom("ATOM"),
             incr: atom("INCR"),
-            property: atom(PROPERTY),
+            properties: PROPERTIES.map(atom),
         }
     }
 
@@ -180,6 +207,8 @@ pub(super) struct Clipboard {
     x_owner: [Option<(ResourceId, u32)>; 2],
     sends: VecDeque<Send>,
     converting: Option<Converting>,
+    /// The transfers asked for so far, which picks the next one's property.
+    conversions: usize,
     answers: Vec<Answer>,
     writes: Vec<Writing>,
 }
@@ -203,6 +232,7 @@ impl Clipboard {
             x_owner: [None; 2],
             sends: VecDeque::new(),
             converting: None,
+            conversions: 0,
             answers: Vec::new(),
             writes: Vec::new(),
         })
@@ -358,9 +388,11 @@ impl Clipboard {
                     );
                 }
                 SelectionEvent::Notify {
-                    target, property, ..
+                    selection,
+                    target,
+                    property,
                 } => {
-                    self.answered(state, &atoms, window, target, property);
+                    self.answered(state, &atoms, window, selection, target, property);
                 }
                 // No INCR: a property's changes are not followed, and no
                 // requestor is watched.
@@ -582,6 +614,11 @@ impl Clipboard {
                             .data
                             .extend_from_slice(chunk.get(..read).unwrap_or_default());
                         if answer.data.len() > LIMIT {
+                            log::warn!(
+                                "wayland: the compositor's {} is larger than {LIMIT} bytes, \
+                                 which X takes only as INCR",
+                                NAMES[answer.which]
+                            );
                             break Some(false);
                         }
                     }
@@ -663,31 +700,47 @@ impl Clipboard {
     }
 
     fn ask(&mut self, state: &mut ServerState, atoms: &Atoms, send: Send, target: AtomId) {
-        let selection = atoms.selections[send.which];
+        let asked = Asked {
+            selection: atoms.selections[send.which],
+            target,
+            property: atoms.properties[self.conversions % PROPERTIES.len()],
+        };
+        self.conversions = self.conversions.wrapping_add(1);
         let name = NAMES[send.which];
-        self.converting = Some(Converting { send, target });
-        if let Err(error) = requests::convert_selection(state, selection, target, atoms.property) {
+        self.converting = Some(Converting { send, asked });
+        if let Err(error) =
+            requests::convert_selection(state, asked.selection, asked.target, asked.property)
+        {
             log::warn!("wayland: asking for {name}: {error:?}");
             self.converting = None;
         }
     }
 
-    /// The X owner answered the server's window.
+    /// An X owner answered the server's window: the transfer being asked
+    /// for, or a late answer to one given up, whose data goes.
     fn answered(
         &mut self,
         state: &mut ServerState,
         atoms: &Atoms,
         window: ResourceId,
+        selection: AtomId,
         target: AtomId,
         property: AtomId,
     ) {
-        let Some(converting) = self.converting.take() else {
+        let Some(converting) = self
+            .converting
+            .take_if(|converting| converting.asked.answered_by(selection, target, property))
+        else {
+            log::debug!(
+                "wayland: a late answer for {} ({}), dropped",
+                state.atoms.name(selection).unwrap_or("?"),
+                state.atoms.name(target).unwrap_or("?"),
+            );
+            if property.0 != 0 {
+                state.resources.delete_window_property(window, property);
+            }
             return;
         };
-        if converting.target != target {
-            self.converting = Some(converting);
-            return;
-        }
         if property.0 == 0 {
             // Refused: an owner that has no UTF8_STRING may have STRING.
             if target == atoms.utf8 {
@@ -705,8 +758,10 @@ impl Clipboard {
             return;
         };
         if value.r#type == atoms.incr {
+            // The Wayland program's pipe closes with nothing in it.
             log::warn!(
-                "wayland: X's {} is too large to pass on (INCR)",
+                "wayland: X's {} came as INCR, which the bridge does not take: \
+                 the paste is empty",
                 NAMES[converting.send.which]
             );
             return;
@@ -807,6 +862,33 @@ fn latin1_to_utf8(text: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `SelectionNotify` is the answer to the transfer asked for when it
+    /// names its selection, type and property (or refuses): a late
+    /// CLIPBOARD answer is no answer to a PRIMARY paste, nor to the next
+    /// CLIPBOARD one, which asks into another property.
+    #[test]
+    fn an_answer_is_matched_to_its_transfer() {
+        let (clipboard, primary) = (AtomId(10), AtomId(11));
+        let (utf8, string) = (AtomId(20), AtomId(21));
+        let (first, second) = (AtomId(30), AtomId(31));
+        let asked = Asked {
+            selection: clipboard,
+            target: utf8,
+            property: second,
+        };
+        assert!(asked.answered_by(clipboard, utf8, second));
+        assert!(asked.answered_by(clipboard, utf8, AtomId(0)), "refused");
+        assert!(!asked.answered_by(clipboard, utf8, first), "a late answer");
+        assert!(
+            !asked.answered_by(primary, utf8, second),
+            "another selection"
+        );
+        assert!(
+            !asked.answered_by(clipboard, string, second),
+            "another type"
+        );
+    }
 
     /// Only the server's end of a paste's pipe does not block: the owner
     /// writing into the other must not be cut short by `EAGAIN`.
