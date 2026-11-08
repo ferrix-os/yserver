@@ -14,8 +14,14 @@
 //!   compositor's clicks where it counts them, else ten units of its scroll
 //!   a click, which is what a wheel click is in `wl_pointer.axis`.
 //! * **Keys** are evdev codes plus 8, cooked by the server's own XKB state,
-//!   which took the compositor's layout at start. The X server repeats a
-//!   held key itself.
+//!   whose keymap is the compositor's. The X server repeats a held key
+//!   itself. **The keyboard's state** (`wl_keyboard.modifiers`: the
+//!   modifiers depressed, latched and locked, and the group) is X's as it
+//!   is, as Xwayland takes it, without a key pressed for it: a Shift held
+//!   as the keyboard enters a window, a Num Lock the compositor has on and
+//!   a group switch all reach X. The keys held at `enter` are not pressed
+//!   in X (the state that follows has them), and their releases are not
+//!   sent.
 //! * **Focus.** The keyboard entering a window is `HostRequest::Activated`,
 //!   leaving it `Deactivated`.
 //! * **The cursor** is the X cursor in effect, given with
@@ -61,7 +67,10 @@ use yserver_core::{
 };
 
 use super::client::{Client, Event, KeyboardEvent, PointerEvent, SurfaceId};
-use crate::rootless::{display::HostWork, present_clock::monotonic_us};
+use crate::rootless::{
+    display::{HostKeyboardState, HostWork},
+    present_clock::monotonic_us,
+};
 
 /// The compositor's seat as X sees it: a slave pointer and a slave
 /// keyboard of the core pair, announced before any input
@@ -155,6 +164,8 @@ pub(super) struct Seat {
     lock: Option<Lock>,
     /// The window the compositor's keyboard is on.
     keyboard_on: Option<ToplevelId>,
+    /// The keyboard's state, as the compositor last said.
+    keyboard_state: HostKeyboardState,
 }
 
 impl Seat {
@@ -407,9 +418,24 @@ impl Seat {
             }
             KeyboardEvent::Leave => {
                 self.keyboard_on = None;
-                // The core lets go of every key X still has down.
+                // The core lets go of every key X still has down, and with
+                // the keys their modifiers go: none is held off the
+                // compositor's windows, what is locked stays.
                 self.keys.clear();
                 work.request(HostRequest::Deactivated);
+                let released = HostKeyboardState {
+                    depressed: 0,
+                    latched: 0,
+                    ..self.keyboard_state
+                };
+                if released != self.keyboard_state {
+                    self.keyboard_state = released;
+                    work.keyboard(released);
+                }
+            }
+            KeyboardEvent::Modifiers(state) => {
+                self.keyboard_state = state;
+                work.keyboard(state);
             }
             KeyboardEvent::Key { code, pressed } => {
                 let Some(keycode) = x_keycode(code) else {
@@ -724,6 +750,53 @@ mod tests {
         ];
         seat.hand_over(&mut work, &windows);
         assert_eq!(seat.keyboard_window(), None);
+    }
+
+    /// The compositor's keyboard state goes to X as it is, with no key
+    /// pressed for it; off the compositor's windows nothing is held, and
+    /// what is locked stays.
+    #[test]
+    fn the_keyboard_state_goes_to_x_and_no_key_for_it() {
+        let on = SurfaceId::for_test(1);
+        let id = ToplevelId::fake(0x40_0001);
+        let windows = HashMap::from([(on, (id, 0))]);
+        let held = HostKeyboardState {
+            depressed: 0x01,
+            latched: 0,
+            locked: 0x10,
+            group: 1,
+        };
+        let mut seat = Seat::default();
+        let mut work = HostWork::default();
+        seat.queue = vec![
+            Event::Keyboard(KeyboardEvent::Enter(on)),
+            Event::Keyboard(KeyboardEvent::Modifiers(held)),
+            Event::Keyboard(KeyboardEvent::Leave),
+        ];
+        seat.hand_over(&mut work, &windows);
+        let states: Vec<HostKeyboardState> = work
+            .iter()
+            .filter_map(|item| match item {
+                HostItem::Keyboard(state) => Some(*state),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            states,
+            [
+                held,
+                HostKeyboardState {
+                    depressed: 0,
+                    ..held
+                }
+            ]
+        );
+        assert!(
+            !work
+                .iter()
+                .any(|item| matches!(item, HostItem::Input(HostInputEvent::Key(_)))),
+            "no key"
+        );
     }
 
     /// The pointer's and the keys' input comes from the two slaves the host
