@@ -453,6 +453,12 @@ impl WaylandHost {
         };
         win.spec.geometry = geometry;
         if !matches!(win.spec.kind, ToplevelKind::Popup { .. }) {
+            // A window that resized itself has that size now: the next
+            // configure that leaves the size to it must not resize it back.
+            if let Some(surface) = win.surface {
+                let size = size_u32(shown_size(&win.spec));
+                self.client.resized_by_x(surface, size);
+            }
             return;
         }
         // A popup follows where X puts it.

@@ -411,12 +411,41 @@ enum Role {
     Toplevel {
         xdg: XdgSurface,
         toplevel: XdgToplevel,
-        /// The size asked for.
-        size: (u32, u32),
-        /// The size the last `xdg_toplevel.configure` gave; a zero leaves
-        /// it to the host.
-        pending: (u32, u32),
+        size: WindowSize,
     },
+}
+
+/// A window's size between the compositor's configures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WindowSize {
+    /// The size it has: asked for, then the last configure's, or the size
+    /// X gave it since.
+    has: (u32, u32),
+    /// The size the last `xdg_toplevel.configure` gave; a zero leaves it to
+    /// the window.
+    pending: (u32, u32),
+}
+
+impl WindowSize {
+    fn new(asked: (u32, u32)) -> Self {
+        Self {
+            has: asked,
+            pending: (0, 0),
+        }
+    }
+
+    /// The size the `xdg_surface.configure` commits to, which the window
+    /// has from then: the compositor's, and where it says zero ("you
+    /// choose") the size the window has, so a window the compositor sized
+    /// and then let go (floated) keeps its size rather than snapping back.
+    fn commit(&mut self) -> (u32, u32) {
+        let pick = |pending, has| if pending == 0 { has } else { pending };
+        self.has = (
+            pick(self.pending.0, self.has.0),
+            pick(self.pending.1, self.has.1),
+        );
+        self.has
+    }
 }
 
 impl Role {
@@ -752,8 +781,7 @@ impl Client {
                 role: Role::Toplevel {
                     xdg,
                     toplevel,
-                    size: options.size,
-                    pending: (0, 0),
+                    size: WindowSize::new(options.size),
                 },
                 configured: None,
                 slots: Vec::new(),
@@ -841,6 +869,19 @@ impl Client {
     pub(super) fn set_size_limits(&self, window: SurfaceId, min: (u32, u32), max: (u32, u32)) {
         if let Some(toplevel) = self.toplevel_of(window) {
             size_limits(toplevel, min, max);
+        }
+    }
+
+    /// X gave a window `size` itself (a client resized it): the size it has
+    /// now, which a configure that leaves the size to the window answers
+    /// with. Anything but a window is left alone.
+    pub(super) fn resized_by_x(&mut self, window: SurfaceId, size: (u32, u32)) {
+        if let Some(Surface {
+            role: Role::Toplevel { size: has, .. },
+            ..
+        }) = self.state.surfaces.get_mut(&window)
+        {
+            has.has = size;
         }
     }
 
@@ -1744,26 +1785,15 @@ impl Dispatch<XdgSurface, SurfaceId> for State {
             return;
         };
         xdg.ack_configure(serial);
-        let size = match state.surfaces.get(&surface) {
+        let size = match state.surfaces.get_mut(&surface) {
             Some(Surface {
                 role: Role::Popup { pending, .. },
                 ..
             }) => *pending,
-            // Zero is "you choose": the size the window has, or, before it
-            // has one, the size it asked for. A window the compositor sized
-            // and then let go (floated) keeps its size rather than snapping
-            // back.
             Some(Surface {
-                role: Role::Toplevel { pending, size, .. },
-                configured,
+                role: Role::Toplevel { size, .. },
                 ..
-            }) => {
-                let (width, height) = configured.unwrap_or(*size);
-                (
-                    if pending.0 == 0 { width } else { pending.0 },
-                    if pending.1 == 0 { height } else { pending.1 },
-                )
-            }
+            }) => size.commit(),
             None => return,
         };
         state.configured(surface, size.0, size.1);
@@ -1783,11 +1813,11 @@ impl Dispatch<XdgToplevel, SurfaceId> for State {
             // The size the `xdg_surface.configure` that follows commits to.
             xdg_toplevel::Event::Configure { width, height, .. } => {
                 if let Some(Surface {
-                    role: Role::Toplevel { pending, .. },
+                    role: Role::Toplevel { size, .. },
                     ..
                 }) = state.surfaces.get_mut(&surface)
                 {
-                    *pending = (nonnegative(width), nonnegative(height));
+                    size.pending = (nonnegative(width), nonnegative(height));
                 }
             }
             xdg_toplevel::Event::Close => state.pending.push(Event::CloseRequested(surface)),
@@ -2119,6 +2149,25 @@ mod tests {
         assert!(keymap_text(open(), 0).is_err());
         assert!(keymap_text(open(), u32::MAX).is_err(), "over the limit");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A configure that leaves the size to the window answers with the
+    /// size it has: the compositor's last, or the one X gave it since (a
+    /// font change, a game's resolution), not the one it had before.
+    #[test]
+    fn a_window_keeps_the_size_x_gave_it() {
+        let mut size = WindowSize::new((100, 100));
+        assert_eq!(size.commit(), (100, 100), "the size asked for");
+        size.pending = (640, 480);
+        assert_eq!(size.commit(), (640, 480));
+        size.pending = (0, 0);
+        assert_eq!(size.commit(), (640, 480), "floated: kept");
+        // X resizes it (Client::resized_by_x).
+        size.has = (800, 600);
+        size.pending = (0, 0);
+        assert_eq!(size.commit(), (800, 600), "X's size, not 640x480");
+        size.pending = (1024, 0);
+        assert_eq!(size.commit(), (1024, 600));
     }
 
     #[test]
