@@ -642,6 +642,11 @@ impl Platform for PlatformBackend {
         if let Some(fd) = b.rootless_host_fd() {
             fds.push((fd, BackendFdKind::HostDisplay));
         }
+        // Readable when the host's own work can move: the loop comes round,
+        // and the host's service does it.
+        if let Some(fd) = b.rootless_host_wake_fd() {
+            fds.push((fd, BackendFdKind::HostDisplay));
+        }
         fds
     }
 

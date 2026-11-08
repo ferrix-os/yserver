@@ -81,10 +81,6 @@ use client::{Client, Event, Placement, Rect, SurfaceId, ToplevelOptions};
 /// tried again.
 const REFUSED_RETRY: Duration = Duration::from_secs(1);
 
-/// How often the loop comes round while a paste moves through pipes it does
-/// not poll.
-const CLIPBOARD_POLL: Duration = Duration::from_millis(5);
-
 /// What the compositor's window or popup for a top-level was made from.
 #[derive(Clone, Debug)]
 struct Spec {
@@ -768,6 +764,10 @@ impl DisplayHost for WaylandHost {
         self.client.as_raw_fd()
     }
 
+    fn wake_fd(&self) -> Option<RawFd> {
+        self.clipboard.as_ref()?.wake_fd()
+    }
+
     fn dispatch(&mut self, work: &mut HostWork) -> io::Result<()> {
         let read = match self.client.dispatch() {
             Ok(events) => {
@@ -837,8 +837,7 @@ impl DisplayHost for WaylandHost {
         let clipboard = self
             .clipboard
             .as_ref()
-            .filter(|clipboard| clipboard.busy())
-            .map(|_| now + CLIPBOARD_POLL);
+            .and_then(|clipboard| clipboard.deadline(now));
         let retry = self.windows.values().filter_map(|w| w.retry_at).min();
         [pending, clipboard, retry].into_iter().flatten().min()
     }

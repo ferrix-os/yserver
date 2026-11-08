@@ -125,6 +125,13 @@ impl KmsBackend {
         Some(self.pstate.rootless.as_ref()?.host.borrow().fd())
     }
 
+    /// The host's other descriptor, its own work's (`DisplayHost::wake_fd`).
+    pub(in crate::kms::render::backend) fn rootless_host_wake_fd(
+        &self,
+    ) -> Option<std::os::fd::RawFd> {
+        self.pstate.rootless.as_ref()?.host.borrow().wake_fd()
+    }
+
     /// The host's last flush left output queued (`DisplayHost::unsent`).
     pub(in crate::kms::render::backend) fn rootless_host_unsent(&self) -> bool {
         self.pstate

@@ -140,6 +140,13 @@ pub(crate) struct HostKeymap {
 pub(crate) trait DisplayHost: RootlessHost {
     /// The connection the core loop polls.
     fn fd(&self) -> RawFd;
+    /// A descriptor the core loop polls besides the connection (as
+    /// `BackendFdKind::HostDisplay` too), readable when the host's own work
+    /// can move: the pipes of a clipboard's transfers. Taken once, as the
+    /// loop starts.
+    fn wake_fd(&self) -> Option<RawFd> {
+        None
+    }
     /// Read what the window system sent into `work`, until a read would
     /// block: the core loop polls the fd edge-triggered, so what is left
     /// unread is not reported again.
