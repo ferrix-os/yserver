@@ -11,7 +11,8 @@
 //!   are backing pixels: `RootlessInput::PointerEnter`, `PointerMotionLocal`
 //!   and `PointerLeave`. **Buttons** pass through as evdev codes. **The
 //!   wheel** becomes X's buttons 4 to 7, one press and release a click: the
-//!   compositor's clicks where it counts them, else ten units of its scroll
+//!   compositor's clicks where it counts them (a wheel's frames, whose
+//!   continuous value is not counted again), else ten units of its scroll
 //!   a click, which is what a wheel click is in `wl_pointer.axis`.
 //! * **Keys** are evdev codes plus 8, cooked by the server's own XKB state,
 //!   whose keymap is the compositor's. The X server repeats a held key
@@ -580,7 +581,7 @@ fn press(work: &mut HostWork, button: u32, pressed: bool) {
 /// Whole wheel clicks from one axis event: the compositor's own count when
 /// it gives one, which also forgets what was left over, else `value` added
 /// to `residue`, a click every [`SCROLL_PER_CLICK`].
-fn clicks(residue: &mut f64, value: f64, discrete: i32) -> i32 {
+pub(super) fn clicks(residue: &mut f64, value: f64, discrete: i32) -> i32 {
     if discrete != 0 {
         *residue = 0.0;
         return discrete;
