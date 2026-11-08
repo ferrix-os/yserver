@@ -2927,6 +2927,10 @@ impl KmsCore {
     /// the names the server started with; and as no names compile to it, a
     /// load by names always reloads. `false` when it does not compile, and
     /// the keymap stays.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host's keymap is installed with it")
+    )]
     pub(crate) fn install_host_keymap(
         &mut self,
         text: &str,
