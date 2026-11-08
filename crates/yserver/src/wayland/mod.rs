@@ -2,7 +2,7 @@
 //! `xdg_toplevel` of the compositor `WAYLAND_DISPLAY` names, and each
 //! override-redirect one an `xdg_popup`.
 //!
-//! With `YSERVER_BACKEND=wayland` the server is a client of a Wayland
+//! With `--rootless` the server is a client of a Wayland
 //! compositor rather than the owner of a DRM card: it runs on the card-less
 //! KMS platform (`kms/render/backend/kms/rootless.rs`), which keeps DRI3 on
 //! a render node and Present for its clients, its root takes the size of

@@ -107,7 +107,7 @@ tcp-transport = []
 xdmcp = ["tcp-transport", "yserver-core/xdmcp"]
 # The rootless Wayland host (`src/wayland/`): each top-level X window an
 # `xdg_toplevel` of the compositor `WAYLAND_DISPLAY` names, under
-# `YSERVER_BACKEND=wayland`. Off by default, so a build that does not ask
+# `--rootless`. Off by default, so a build that does not ask
 # for it pulls in no Wayland crates. Linux only. xkbcommon's own `wayland`
 # feature reads the compositor's keymap from its descriptor.
 wayland = ["dep:wayland-client", "dep:wayland-protocols", "xkbcommon/wayland"]

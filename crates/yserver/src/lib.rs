@@ -414,10 +414,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     surface::server::run_headless(opts)
 }
 
-/// Run the server on the DRM/KMS platform.
+/// Run the server on the DRM/KMS platform: rootless on the Wayland
+/// compositor with `--rootless`, where the build has the Wayland host.
 #[cfg(kms)]
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
-    launch::shell_mode(&opts, false).map_err(io::Error::other)?;
+    let mode = launch::shell_mode(&opts, cfg!(wayland_host)).map_err(io::Error::other)?;
     if opts.headless {
         // The surface platform with no surface: no DRM device, no input.
         return surface::server::run_headless(opts);
@@ -826,7 +827,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     //
     // A client of a Wayland compositor owns neither the console nor a card:
     // the compositor has both, and the server runs on its renderer alone.
-    let wayland = wayland_requested();
+    let wayland = mode == launch::ShellMode::Rootless;
     let console_guard = if wayland {
         None
     } else {
@@ -1245,20 +1246,6 @@ fn spawn_signal_thread(
             }
         })?;
     Ok(())
-}
-
-/// Whether `YSERVER_BACKEND=wayland` asks for the rootless Wayland host.
-/// Asked for in a build without the `wayland` feature, it is refused rather
-/// than ignored, since the server would take the console and the card of a
-/// machine whose compositor has them.
-#[cfg(kms)]
-fn wayland_requested() -> bool {
-    let asked = std::env::var("YSERVER_BACKEND").is_ok_and(|value| value == "wayland");
-    if asked && !cfg!(wayland_host) {
-        log::error!("yserver: YSERVER_BACKEND=wayland, but this build has no Wayland host");
-        std::process::exit(1);
-    }
-    asked
 }
 
 /// Build a `KmsBackend`. yserver is always Direct — self-managed DRM master
