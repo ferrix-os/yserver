@@ -19,7 +19,7 @@ use yserver_core::{
         handle_host_input,
         xkb_layout::{XkbStateCause, announce_xkb_state},
     },
-    rootless::{CoordinatePolicy, RootlessError, RootlessEvent},
+    rootless::{CoordinatePolicy, HostRequest, RootlessError, RootlessEvent},
     server::ServerState,
 };
 
@@ -168,6 +168,21 @@ impl KmsBackend {
                 HostItem::Frame(event) => frames.push(event),
                 HostItem::Request(request) => {
                     self.apply_rootless_frames(std::mem::take(&mut frames));
+                    // The host's screen changed size: the root's storage
+                    // first, which the RandR state the core then reads is
+                    // of.
+                    if let HostRequest::ScreenLayout { outputs } = &request
+                        && let [output] = outputs.as_slice()
+                        && let Err(error) =
+                            self.backend_randr_set_logical_screen_size(output.width, output.height)
+                    {
+                        log::warn!(
+                            "rootless: the root cannot take the host's {}x{}: {error}",
+                            output.width,
+                            output.height
+                        );
+                        continue;
+                    }
                     yserver_core::rootless::host_request(state, self, request);
                 }
                 HostItem::Input(event) => {

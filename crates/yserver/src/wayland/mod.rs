@@ -57,8 +57,8 @@ use std::{
 use yserver_core::{
     backend::{ActiveCursorImage, Backend},
     rootless::{
-        Geometry, HostRequest, HostSerial, InfoFields, ResizeEdge, RootlessEvent, ToplevelId,
-        ToplevelKind, WindowInfo, WmRequest,
+        Geometry, HostOutput, HostRequest, HostSerial, InfoFields, ResizeEdge, RootlessEvent,
+        ToplevelId, ToplevelKind, WindowInfo, WmRequest,
     },
     server::ServerState,
 };
@@ -127,6 +127,9 @@ pub(crate) struct WaylandHost {
     /// What the compositor said, waiting for the core.
     work: HostWork,
     next_serial: u64,
+    /// The screen the root was last given: at start, or by a
+    /// `HostRequest::ScreenLayout`.
+    screen_said: Option<HostScreen>,
 }
 
 impl WaylandHost {
@@ -155,6 +158,7 @@ impl WaylandHost {
             clipboard,
             work: HostWork::default(),
             next_serial: 1,
+            screen_said: None,
         };
         // The seat's devices, before its first input.
         for device in input::announcements() {
@@ -172,7 +176,23 @@ impl WaylandHost {
                 Err(error) => log::warn!("wayland: waiting for the keymap: {error}"),
             }
         }
+        host.screen_said = host.screen();
         Ok(host)
+    }
+
+    /// The compositor's screen changed size since the root was given it:
+    /// the root follows (`HostRequest::ScreenLayout`), as a window shell's
+    /// does its window.
+    fn follow_screen(&mut self) {
+        let now = self.screen();
+        if let Some(request) = screen_layout(self.screen_said, now) {
+            log::info!(
+                "wayland: the compositor's screen is {:?} now, the root follows",
+                now.map(|screen| (screen.width, screen.height))
+            );
+            self.work.request(request);
+            self.screen_said = now;
+        }
     }
 
     /// The window manager's name: the compositor's process's, as the
@@ -587,6 +607,21 @@ impl WaylandHost {
     }
 }
 
+/// The root's new layout when the screen `now` is not the size it was
+/// given (`said`): one output at the origin, the compositor's first screen.
+fn screen_layout(said: Option<HostScreen>, now: Option<HostScreen>) -> Option<HostRequest> {
+    let now = now?;
+    let size = |screen: HostScreen| (screen.width, screen.height);
+    (said.map(size) != Some(size(now))).then(|| HostRequest::ScreenLayout {
+        outputs: vec![HostOutput {
+            x: 0,
+            y: 0,
+            width: now.width,
+            height: now.height,
+        }],
+    })
+}
+
 /// Whether a WM request is an activation the host grants itself: one for
 /// the window the compositor's keyboard is on ([`WaylandHost::wm_request`]).
 fn activation_granted(request: WmRequest, keyboard_on: Option<ToplevelId>, id: ToplevelId) -> bool {
@@ -747,6 +782,7 @@ impl DisplayHost for WaylandHost {
             )),
         };
         self.deliver_seat();
+        self.follow_screen();
         work.append(std::mem::take(&mut self.work));
         read
     }
@@ -1055,6 +1091,32 @@ mod tests {
         );
         assert_eq!(app_id(&info("", Some(("xev", "")))), "xev");
         assert_eq!(app_id(&info("", None)), "");
+    }
+
+    /// The root follows a later change of the compositor's screen's size,
+    /// not one of its refresh alone, and not a screen it cannot describe.
+    #[test]
+    fn the_root_follows_the_compositors_screen() {
+        let screen = |width, height, refresh_mhz| HostScreen {
+            width,
+            height,
+            refresh_mhz,
+        };
+        let said = Some(screen(1920, 1080, 60_000));
+        assert_eq!(
+            screen_layout(said, Some(screen(2560, 1440, 60_000))),
+            Some(HostRequest::ScreenLayout {
+                outputs: vec![HostOutput {
+                    x: 0,
+                    y: 0,
+                    width: 2560,
+                    height: 1440,
+                }],
+            })
+        );
+        assert_eq!(screen_layout(said, Some(screen(1920, 1080, 144_000))), None);
+        assert_eq!(screen_layout(said, None), None);
+        assert!(screen_layout(None, Some(screen(800, 600, 0))).is_some());
     }
 
     /// A greatest size below the least is raised to it, per axis; none (0)
