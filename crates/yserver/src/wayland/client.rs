@@ -79,6 +79,8 @@ use wayland_protocols::{
 };
 use xkbcommon::xkb;
 
+use crate::rootless::display::{HostKeyboardState, HostKeymap};
+
 /// The versions bound at most: what the host speaks.
 const COMPOSITOR: u32 = 6;
 const SEAT: u32 = 8;
@@ -89,6 +91,15 @@ const XDG_OUTPUT: u32 = 3;
 /// `wl_shm`'s formats the host draws in.
 const ARGB8888: wl_shm::Format = wl_shm::Format::Argb8888;
 const XRGB8888: wl_shm::Format = wl_shm::Format::Xrgb8888;
+
+/// The most a keymap the compositor sends may be: one runs to some tens of
+/// KiB, a few layouts to a few hundred.
+const KEYMAP_LIMIT: u64 = 4 << 20;
+
+/// X's eight real modifiers, by bit, as XKB names them.
+const REAL_MODS: [&str; 8] = [
+    "Shift", "Lock", "Control", "Mod1", "Mod2", "Mod3", "Mod4", "Mod5",
+];
 
 /// A window or popup the host made, by its own number.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -195,8 +206,12 @@ pub(super) enum PointerEvent {
 /// The keyboard on the host's windows.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum KeyboardEvent {
+    /// The keys held as it came are not pressed in X: the
+    /// [`KeyboardEvent::Modifiers`] that follows has their state.
     Enter(SurfaceId),
     Leave,
+    /// `wl_keyboard.modifiers`, as X's real modifiers and group.
+    Modifiers(HostKeyboardState),
     /// An evdev code, as the compositor sends it: no repeats.
     Key {
         code: u32,
@@ -440,6 +455,24 @@ struct Axis {
     discrete: (i32, i32),
 }
 
+/// The compositor's keymap as it sent it.
+struct Keymap {
+    /// XKB's text form.
+    text: String,
+    keymap: xkb::Keymap,
+    /// The layout and variant of each group, where the XKB rules name it.
+    layouts: Vec<Option<(String, String)>>,
+}
+
+impl std::fmt::Debug for Keymap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keymap")
+            .field("bytes", &self.text.len())
+            .field("layouts", &self.layouts)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The seat's state.
 #[derive(Debug, Default)]
 struct Seat {
@@ -447,9 +480,8 @@ struct Seat {
     pointer: Option<WlPointer>,
     keyboard: Option<WlKeyboard>,
     cursor_device: Option<WpCursorShapeDeviceV1>,
-    /// The layout and variant of each group the keymap has, where the XKB
-    /// rules name it.
-    layouts: Vec<Option<(String, String)>>,
+    keymap: Option<Keymap>,
+    /// The group in force, as `wl_keyboard.modifiers` last said.
     group: u32,
     pointer_focus: Option<SurfaceId>,
     pointer_at: (f64, f64),
@@ -592,16 +624,22 @@ impl Client {
             .filter(|output| output.done)
     }
 
-    /// The layout and variant of the keyboard's group in force, once a
-    /// keymap has come whose layouts the XKB rules name.
-    pub(super) fn keyboard_layout(&self) -> Option<(String, String)> {
-        let layouts = &self.state.seat.layouts;
-        usize::try_from(self.state.seat.group)
+    /// The compositor's keymap, once it sent one that compiles, with the
+    /// layout and variant of its group in force where the XKB rules name
+    /// it.
+    pub(super) fn keymap(&self) -> Option<HostKeymap> {
+        let keymap = self.state.seat.keymap.as_ref()?;
+        let layouts = &keymap.layouts;
+        let layout = usize::try_from(self.state.seat.group)
             .ok()
             .and_then(|group| layouts.get(group))
             .cloned()
             .flatten()
-            .or_else(|| layouts.iter().flatten().next().cloned())
+            .or_else(|| layouts.iter().flatten().next().cloned());
+        Some(HostKeymap {
+            text: keymap.text.clone(),
+            layout,
+        })
     }
 
     /// The connection's descriptor, which the core loop polls.
@@ -1156,37 +1194,28 @@ impl Seat {
         }
     }
 
-    /// The layout and variant the XKB rules give each group of a keymap.
+    /// Take the compositor's keymap, and the layout and variant the XKB
+    /// rules give each of its groups.
     fn read_keymap(&mut self, fd: OwnedFd, size: u32) {
-        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let Ok(size) = usize::try_from(size) else {
-            return;
-        };
-        // SAFETY: the descriptor came with the event and is this process's
-        // alone; the compositor does not change a keymap it has sent, and
-        // the map is private and read-only.
-        let keymap = unsafe {
-            xkb::Keymap::new_from_fd(
-                &context,
-                fd,
-                size,
-                xkb::KEYMAP_FORMAT_TEXT_V1,
-                xkb::KEYMAP_COMPILE_NO_FLAGS,
-            )
-        };
-        let keymap = match keymap {
-            Ok(Some(keymap)) => keymap,
-            Ok(None) => {
-                log::warn!("wayland: the compositor's keymap does not compile");
-                return;
-            }
+        let text = match keymap_text(fd, size) {
+            Ok(text) => text,
             Err(error) => {
                 log::warn!("wayland: reading the compositor's keymap: {error}");
                 return;
             }
         };
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let Some(keymap) = xkb::Keymap::new_from_string(
+            &context,
+            text.clone(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        ) else {
+            log::warn!("wayland: the compositor's keymap does not compile");
+            return;
+        };
         let rules = rules_list(&context);
-        self.layouts = (0..keymap.num_layouts())
+        let layouts = (0..keymap.num_layouts())
             .map(|group| {
                 let label = keymap.layout_get_name(group);
                 let named = rules
@@ -1198,7 +1227,78 @@ impl Seat {
                 named
             })
             .collect();
+        self.keymap = Some(Keymap {
+            text,
+            keymap,
+            layouts,
+        });
     }
+
+    /// `wl_keyboard.modifiers` as X's state: the compositor's masks are of
+    /// its keymap's modifiers, virtual ones too, which its keymap resolves
+    /// to X's eight. Before a keymap, the low eight bits are taken as X's.
+    fn x_state(&self, depressed: u32, latched: u32, locked: u32, group: u32) -> HostKeyboardState {
+        match &self.keymap {
+            Some(keymap) => x_state(&keymap.keymap, [depressed, latched, locked], group),
+            None => HostKeyboardState {
+                depressed: low_byte(depressed),
+                latched: low_byte(latched),
+                locked: low_byte(locked),
+                group: u8::try_from(group.min(3)).unwrap_or(0),
+            },
+        }
+    }
+}
+
+/// The keymap the compositor sent: `size` bytes of `fd` from its start,
+/// which must hold them, at most [`KEYMAP_LIMIT`], the text ending at its
+/// NUL. Read, not mapped: what the compositor does to the file afterwards
+/// cannot reach the server.
+fn keymap_text(fd: OwnedFd, size: u32) -> io::Result<String> {
+    use std::os::unix::fs::FileExt as _;
+    let file = std::fs::File::from(fd);
+    let held = file.metadata()?.len();
+    let size = u64::from(size);
+    if size == 0 || size > KEYMAP_LIMIT || size > held {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a keymap of {size} bytes in a file of {held} (at most {KEYMAP_LIMIT})"),
+        ));
+    }
+    let mut bytes = vec![0; usize::try_from(size).map_err(io::Error::other)?];
+    file.read_exact_at(&mut bytes, 0)?;
+    if let Some(end) = bytes.iter().position(|&byte| byte == 0) {
+        bytes.truncate(end);
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// The compositor's `[depressed, latched, locked]` masks and group, of
+/// `keymap`'s modifiers, as X's real modifiers: each component with what
+/// its virtual modifiers map to, as XKB resolves a mask it is given.
+fn x_state(keymap: &xkb::Keymap, masks: [u32; 3], group: u32) -> HostKeyboardState {
+    let mut state = xkb::State::new(keymap);
+    state.update_mask(masks[0], masks[1], masks[2], 0, 0, group);
+    let real = |component| {
+        REAL_MODS.iter().enumerate().fold(0u8, |mask, (bit, name)| {
+            let index = keymap.mod_get_index(name);
+            if index != xkb::MOD_INVALID && state.mod_index_is_active(index, component) {
+                mask | (1 << bit)
+            } else {
+                mask
+            }
+        })
+    };
+    HostKeyboardState {
+        depressed: real(xkb::STATE_MODS_DEPRESSED),
+        latched: real(xkb::STATE_MODS_LATCHED),
+        locked: real(xkb::STATE_MODS_LOCKED),
+        group: u8::try_from(state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE)).unwrap_or(0),
+    }
+}
+
+fn low_byte(mask: u32) -> u8 {
+    u8::try_from(mask & 0xff).unwrap_or(0)
 }
 
 /// The XKB rules' list of layouts and variants on the context's include
@@ -1596,7 +1696,21 @@ impl Dispatch<WlKeyboard, ()> for State {
                     .pending
                     .push(Event::Keyboard(KeyboardEvent::Key { code: key, pressed }));
             }
-            wl_keyboard::Event::Modifiers { group, .. } => state.seat.group = group,
+            wl_keyboard::Event::Modifiers {
+                mods_depressed,
+                mods_latched,
+                mods_locked,
+                group,
+                ..
+            } => {
+                state.seat.group = group;
+                let x = state
+                    .seat
+                    .x_state(mods_depressed, mods_latched, mods_locked, group);
+                state
+                    .pending
+                    .push(Event::Keyboard(KeyboardEvent::Modifiers(x)));
+            }
             _ => {}
         }
     }
@@ -1955,6 +2069,56 @@ mod tests {
         );
         assert_eq!(named("Generic 105-key PC"), None, "a model is no layout");
         assert_eq!(named("Klingon"), None);
+    }
+
+    /// The compositor's masks are of its keymap's modifiers, virtual ones
+    /// too: X gets the real ones they are, per component, and the group.
+    #[test]
+    fn the_compositors_modifiers_are_xs_real_ones() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "evdev",
+            "pc105",
+            "us,de",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("us,de");
+        let bit = |name| 1u32 << keymap.mod_get_index(name);
+        let state = x_state(
+            &keymap,
+            [bit("Shift"), bit("Control"), bit("NumLock") | bit("Lock")],
+            1,
+        );
+        assert_eq!(
+            state,
+            HostKeyboardState {
+                depressed: 0x01,
+                latched: 0x04,
+                // NumLock is Mod2.
+                locked: 0x12,
+                group: 1,
+            }
+        );
+        assert_eq!(x_state(&keymap, [0; 3], 5).group, 1, "wrapped to two");
+    }
+
+    /// A keymap is the `size` bytes the file holds, at most the limit, up
+    /// to its NUL.
+    #[test]
+    fn a_keymap_is_read_within_its_file_and_the_limit() {
+        use std::io::Write as _;
+        let path = std::env::temp_dir().join(format!("yserver-keymap-{}", std::process::id()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(b"xkb_keymap {};\0").unwrap();
+        let open = || OwnedFd::from(std::fs::File::open(&path).unwrap());
+        assert_eq!(keymap_text(open(), 15).unwrap(), "xkb_keymap {};");
+        assert!(keymap_text(open(), 16).is_err(), "more than the file");
+        assert!(keymap_text(open(), 0).is_err());
+        assert!(keymap_text(open(), u32::MAX).is_err(), "over the limit");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

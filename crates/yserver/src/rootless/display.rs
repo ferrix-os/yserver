@@ -28,6 +28,12 @@ use crate::kms::vk::device::VkContext;
 pub(crate) enum HostItem {
     Request(HostRequest),
     Input(HostInputEvent),
+    /// The window system's keyboard state, which X's takes as it is.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host passes its keyboard's state")
+    )]
+    Keyboard(HostKeyboardState),
     #[cfg_attr(
         not(wayland_host),
         allow(dead_code, reason = "the Wayland host queues its frame events")
@@ -49,6 +55,14 @@ impl HostWork {
 
     pub(crate) fn input(&mut self, event: HostInputEvent) {
         self.0.push(HostItem::Input(event));
+    }
+
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host passes its keyboard's state")
+    )]
+    pub(crate) fn keyboard(&mut self, state: HostKeyboardState) {
+        self.0.push(HostItem::Keyboard(state));
     }
 
     #[cfg_attr(
@@ -101,6 +115,27 @@ pub(crate) struct HostScreen {
     pub refresh_mhz: u64,
 }
 
+/// The window system's keyboard state as X's: the real modifiers (X's
+/// eight, Shift to Mod5) depressed, latched and locked, and the group in
+/// force. The server's keyboard takes it as it is, as Xwayland takes
+/// `wl_keyboard.modifiers`: no key is pressed or released for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostKeyboardState {
+    pub depressed: u8,
+    pub latched: u8,
+    pub locked: u8,
+    pub group: u8,
+}
+
+/// The window system's keymap: XKB's text form, which the server's keymap
+/// is from start, and the layout and variant the XKB rules call its group
+/// in force, where they name it (`_XKB_RULES_NAMES`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostKeymap {
+    pub text: String,
+    pub layout: Option<(String, String)>,
+}
+
 /// A host whose display connection the core loop polls.
 pub(crate) trait DisplayHost: RootlessHost {
     /// The connection the core loop polls.
@@ -141,10 +176,9 @@ pub(crate) trait DisplayHost: RootlessHost {
     fn next_wakeup(&self) -> Option<Instant> {
         None
     }
-    /// The window system's keyboard layout and variant, which the server's
-    /// keymap takes at start, so a key means in X what it means in the
-    /// host's other windows.
-    fn keyboard_layout(&self) -> Option<(String, String)> {
+    /// The window system's keymap, which the server's takes at start, so a
+    /// key means in X what it means in the host's other windows.
+    fn keymap(&self) -> Option<HostKeymap> {
         None
     }
     /// The name of the RandR output the host's screen is.

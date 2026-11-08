@@ -66,7 +66,7 @@ use yserver_core::{
 use crate::{
     kms::vk::device::VkContext,
     rootless::{
-        display::{DisplayHost, HostScreen, HostWork},
+        display::{DisplayHost, HostKeymap, HostScreen, HostWork},
         host::{CpuFrame, FrameEvent, HandoffKind, RootlessHost},
     },
 };
@@ -157,7 +157,7 @@ impl WaylandHost {
         for device in input::announcements() {
             host.work.input(device);
         }
-        if host.client.keyboard_layout().is_none() {
+        if host.client.keymap().is_none() {
             // The keymap comes after the seat's keyboard is made, which the
             // first round trips only start.
             match host.client.roundtrip() {
@@ -745,8 +745,8 @@ impl DisplayHost for WaylandHost {
         [pending, clipboard, retry].into_iter().flatten().min()
     }
 
-    fn keyboard_layout(&self) -> Option<(String, String)> {
-        self.client.keyboard_layout()
+    fn keymap(&self) -> Option<HostKeymap> {
+        self.client.keymap()
     }
 
     fn output_name(&self) -> &'static str {
