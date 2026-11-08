@@ -918,7 +918,8 @@ impl Client {
 
     /// Move a popup (`xdg_popup.reposition`, version 3); where the
     /// compositor's `xdg_wm_base` is older, the popup is made again at the
-    /// new place under the same [`SurfaceId`].
+    /// new place under the same [`SurfaceId`], which answers `true`: it
+    /// shows nothing until its first configure, as a new one.
     ///
     /// # Errors
     ///
@@ -927,24 +928,24 @@ impl Client {
         &mut self,
         id: SurfaceId,
         placement: &Placement,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let Some(Surface {
             role: Role::Popup { popup, parent, .. },
             ..
         }) = self.state.surfaces.get(&id)
         else {
-            return Ok(());
+            return Ok(false);
         };
         if popup.version() >= 3 {
             let positioner = positioner(self.wm_base()?, &self.qh, placement);
             popup.reposition(&positioner, 0);
             positioner.destroy();
-            return Ok(());
+            return Ok(false);
         }
         // Remade: the same number for the host, new objects underneath.
         let parent = *parent;
         self.destroy(id);
-        self.make_popup(id, parent, placement)
+        self.make_popup(id, parent, placement).map(|()| true)
     }
 
     /// Destroy a window or popup, with its role and its buffers.

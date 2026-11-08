@@ -478,11 +478,24 @@ impl WaylandHost {
             return;
         };
         if new_parent == parent && options != placed {
-            if let Err(error) = self.client.reposition_popup(surface, &options) {
-                log::warn!("wayland: moving popup {id:?}: {error}");
-            }
+            let moved = self.client.reposition_popup(surface, &options);
             if let Some(win) = self.windows.get_mut(&id) {
                 win.placed = Some((parent, options));
+                let remade = moved.unwrap_or_else(|error| {
+                    // Destroyed and not made again: tried again later, as a
+                    // popup the compositor refused.
+                    log::warn!("wayland: moving popup {id:?}: {error}");
+                    win.surface = None;
+                    win.placed = None;
+                    win.retry_at = Some(Instant::now() + REFUSED_RETRY);
+                    true
+                });
+                if remade {
+                    // A new surface: shown once it is configured, and given
+                    // a whole frame then.
+                    win.configured = false;
+                    self.work.frame(FrameEvent::Recreated { id });
+                }
             }
         }
     }
@@ -492,11 +505,13 @@ impl WaylandHost {
             return;
         };
         win.spec.kind = ToplevelKind::Popup { parent };
-        // A popup's parent is fixed in xdg-shell: made again on the new one.
+        // A popup's parent is fixed in xdg-shell: made again on the new one,
+        // shown once it is configured and given a whole frame then.
         if let Some(surface) = win.surface.take() {
             win.configured = false;
             win.placed = None;
             self.client.destroy(surface);
+            self.work.frame(FrameEvent::Recreated { id });
             self.make(id);
         }
     }
