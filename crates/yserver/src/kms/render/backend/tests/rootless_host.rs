@@ -222,3 +222,38 @@ fn what_a_host_queued_between_reads_is_applied_on_the_next_iteration() {
     assert_eq!(state.core_focus.raw, A);
     assert!(host.borrow().queued.is_empty());
 }
+
+/// The host's screen changing size later resizes the root, and the core
+/// tells the host the root it has now.
+#[test]
+fn a_later_host_screen_size_is_the_roots() {
+    let mut b = KmsBackend::for_tests();
+    let mut state = BackendTopology::from_backend(&mut b).into_server_state();
+    yserver_core::backend::install_backend_root_bindings(&mut state, &b);
+    let _peer = kbd_map_client_id(&mut state, CLIENT);
+    let host = std::rc::Rc::new(std::cell::RefCell::new(QueuingHost::default()));
+    b.attach_rootless_host(host.clone()).expect("attach");
+    b.start_rootless(&mut state).expect("rootless");
+
+    let mut work = HostWork::default();
+    work.request(HostRequest::ScreenLayout {
+        outputs: vec![yserver_core::rootless::HostOutput {
+            x: 0,
+            y: 0,
+            width: 1024,
+            height: 700,
+        }],
+    });
+    b.apply_host_work(&mut state, work);
+
+    assert_eq!((b.platform.fb_w, b.platform.fb_h), (1024, 700));
+    assert_eq!(
+        (state.randr.screen_width, state.randr.screen_height),
+        (1024, 700)
+    );
+    let root = state
+        .resources
+        .window(ROOT_WINDOW)
+        .map(|root| (root.width, root.height));
+    assert_eq!(root, Some((1024, 700)));
+}
