@@ -537,9 +537,7 @@ impl Clipboard {
             refuse(state);
             return;
         };
-        let (reader, writer) = match nix::unistd::pipe2(
-            nix::fcntl::OFlag::O_CLOEXEC | nix::fcntl::OFlag::O_NONBLOCK,
-        ) {
+        let (reader, writer) = match paste_pipe() {
             Ok(pipe) => pipe,
             Err(error) => {
                 log::warn!("wayland: a pipe for a paste: {error}");
@@ -772,6 +770,16 @@ fn is_text(mime: &str) -> bool {
     TEXT_TYPES.contains(&mime) || mime.starts_with("text/plain")
 }
 
+/// A pipe for the compositor's selection to be written into: the reading
+/// end the server's, not blocking; the writing end goes to the selection's
+/// owner, which may write blocking and must not see `EAGAIN`; `O_NONBLOCK`
+/// given to `pipe2` would be both ends'.
+fn paste_pipe() -> nix::Result<(OwnedFd, OwnedFd)> {
+    let (reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)?;
+    nonblocking(&reader)?;
+    Ok((reader, writer))
+}
+
 /// Make a pipe's end not block.
 fn nonblocking(fd: &OwnedFd) -> nix::Result<()> {
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
@@ -799,6 +807,20 @@ fn latin1_to_utf8(text: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the server's end of a paste's pipe does not block: the owner
+    /// writing into the other must not be cut short by `EAGAIN`.
+    #[test]
+    fn a_paste_pipe_blocks_only_at_the_owners_end() {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let (reader, writer) = paste_pipe().unwrap();
+        let flags = |fd: &OwnedFd| OFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFL).unwrap());
+        assert!(flags(&reader).contains(OFlag::O_NONBLOCK));
+        assert!(!flags(&writer).contains(OFlag::O_NONBLOCK));
+        let cloexec = |fd: &OwnedFd| fcntl(fd, FcntlArg::F_GETFD).unwrap() & libc::FD_CLOEXEC;
+        assert_ne!(cloexec(&reader), 0);
+        assert_ne!(cloexec(&writer), 0);
+    }
 
     #[test]
     fn text_goes_between_utf8_and_latin1() {
