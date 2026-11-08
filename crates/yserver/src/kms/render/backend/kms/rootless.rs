@@ -27,7 +27,7 @@ use crate::{
     kms::render::backend::KmsBackend,
     rootless::{
         Presenter,
-        display::{HostItem, HostWork, PresenterHandle, SharedHost},
+        display::{HostItem, HostKeyboardState, HostWork, PresenterHandle, SharedHost},
         host::FrameEvent,
         present_clock::{PresentClock, monotonic_us},
     },
@@ -215,6 +215,27 @@ impl KmsBackend {
             }
         }
         self.apply_rootless_frames(frames);
+    }
+
+    /// The host's keyboard state (a Wayland compositor's
+    /// `wl_keyboard.modifiers`), taken as it is: the depressed, latched and
+    /// locked real modifiers and the locked group, as Xwayland sets its
+    /// keyboard's. No key is pressed for it: a key the host holds as its
+    /// window gets the keyboard is depressed in the state alone. The keys
+    /// that follow update the state as they do (`update_key`), and the
+    /// host's next word on it is the truth again.
+    fn set_host_keyboard_state(&mut self, host: HostKeyboardState) {
+        let group = self.clamp_group_to_keymap(host.group);
+        self.core.xkb_state.0.update_mask(
+            u32::from(host.depressed),
+            u32::from(host.latched),
+            u32::from(host.locked),
+            0,
+            0,
+            u32::from(group),
+        );
+        self.core.locked_group = group;
+        self.sync_keyboard_leds();
     }
 
     fn apply_rootless_frames(&mut self, frames: Vec<FrameEvent>) {
