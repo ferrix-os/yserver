@@ -109,6 +109,9 @@ struct Win {
     dismissed: bool,
     /// The popup's parent and placement it was made with.
     placed: Option<(ToplevelId, Placement)>,
+    /// The window the compositor has as this window's parent
+    /// (`xdg_toplevel.set_parent`).
+    parent: Option<ToplevelId>,
 }
 
 /// The connection, what the compositor said about its screens, and the
@@ -281,23 +284,24 @@ impl WaylandHost {
         let spec = win.spec.clone();
         let made = match spec.kind {
             ToplevelKind::Managed => {
-                let parent = spec
-                    .info
-                    .transient_for
-                    .filter(|parent| *parent != id)
-                    .and_then(|parent| self.windows.get(&parent)?.surface);
+                let parent = self.parent_for(id, spec.info.transient_for);
                 let (min_size, max_size) = size_limits(&spec.info);
                 let options = ToplevelOptions {
                     title: title(&spec.info),
                     app_id: app_id(&spec.info),
                     size: size_u32(shown_size(&spec)),
-                    parent,
+                    parent: parent.map(|(_, surface)| surface),
                     min_size,
                     max_size,
                 };
                 self.client
                     .toplevel(&options)
                     .map(|surface| (surface, None))
+                    .inspect(|_| {
+                        if let Some(win) = self.windows.get_mut(&id) {
+                            win.parent = parent.map(|(parent, _)| parent);
+                        }
+                    })
             }
             ToplevelKind::Popup { parent } => {
                 let Some((parent, options)) = self.popup_placement(id, parent, &spec.geometry)
@@ -405,6 +409,7 @@ impl WaylandHost {
                 retry_at: None,
                 dismissed: false,
                 placed: None,
+                parent: None,
             },
         );
         self.order.push(id);
@@ -414,6 +419,13 @@ impl WaylandHost {
     fn unmapped(&mut self, id: ToplevelId) {
         self.order.retain(|other| *other != id);
         if let Some(win) = self.windows.remove(&id) {
+            // Its dialogs are its parent's now, as xdg-shell has the
+            // compositor take them.
+            for other in self.windows.values_mut() {
+                if other.parent == Some(id) {
+                    other.parent = win.parent;
+                }
+            }
             self.seat.forget(&self.client, id);
             if let Some(surface) = win.surface {
                 log::info!("wayland: window {id:?} is gone from the compositor");
@@ -441,10 +453,39 @@ impl WaylandHost {
             self.client.set_size_limits(surface, min, max);
         }
         if changed.contains(InfoFields::TRANSIENT_FOR) && win.spec.kind == ToplevelKind::Managed {
-            let parent = win.spec.info.transient_for.filter(|parent| *parent != id);
-            let parent = parent.and_then(|parent| self.windows.get(&parent)?.surface);
-            self.client.set_parent(surface, parent);
+            let transient_for = win.spec.info.transient_for;
+            let parent = self.parent_for(id, transient_for);
+            self.client
+                .set_parent(surface, parent.map(|(_, surface)| surface));
+            if let Some(win) = self.windows.get_mut(&id) {
+                win.parent = parent.map(|(parent, _)| parent);
+            }
         }
+    }
+
+    /// The compositor's window to make `id` a dialog of for its
+    /// `WM_TRANSIENT_FOR`: a window made already, and none that would make a
+    /// cycle of parents (itself, or a window that has `id` above it), which
+    /// the compositor takes as a protocol error (`invalid_parent`) and ends
+    /// the connection for.
+    fn parent_for(
+        &self,
+        id: ToplevelId,
+        transient_for: Option<ToplevelId>,
+    ) -> Option<(ToplevelId, SurfaceId)> {
+        let parent = transient_for?;
+        let win = self.windows.get(&parent)?;
+        if win.spec.kind != ToplevelKind::Managed {
+            return None;
+        }
+        let surface = win.surface?;
+        if makes_cycle(id, parent, |of| {
+            self.windows.get(&of).and_then(|w| w.parent)
+        }) {
+            log::info!("wayland: window {id:?} is not made a dialog of {parent:?}: a cycle");
+            return None;
+        }
+        Some((parent, surface))
     }
 
     fn configured_by_x(&mut self, id: ToplevelId, geometry: Geometry) {
@@ -904,7 +945,42 @@ fn app_id(info: &WindowInfo) -> String {
 /// floats.
 fn size_limits(info: &WindowInfo) -> ((u32, u32), (u32, u32)) {
     let hints = &info.size_hints;
-    (hints.min.unwrap_or((0, 0)), hints.max.unwrap_or((0, 0)))
+    clamped_limits(hints.min.unwrap_or((0, 0)), hints.max.unwrap_or((0, 0)))
+}
+
+/// Size limits xdg-shell takes: each at most `i32::MAX`, and a greatest
+/// size (0 is none) below the least raised to it, which the compositor
+/// would take as a protocol error (`invalid_size`) and end the connection
+/// for. X takes any `WM_NORMAL_HINTS`.
+fn clamped_limits(min: (u32, u32), max: (u32, u32)) -> ((u32, u32), (u32, u32)) {
+    let int = |value: u32| value.min(i32::MAX.unsigned_abs());
+    let axis = |min: u32, max: u32| {
+        let min = int(min);
+        let max = int(max);
+        (min, if max != 0 && max < min { min } else { max })
+    };
+    let (min_w, max_w) = axis(min.0, max.0);
+    let (min_h, max_h) = axis(min.1, max.1);
+    ((min_w, min_h), (max_w, max_h))
+}
+
+/// Whether making `parent` the parent of `id` closes a cycle: `id` itself,
+/// or `id` among `parent`'s parents (`parent_of`).
+fn makes_cycle(
+    id: ToplevelId,
+    parent: ToplevelId,
+    parent_of: impl Fn(ToplevelId) -> Option<ToplevelId>,
+) -> bool {
+    let mut at = Some(parent);
+    // Bounded: a cycle the windows already have (never made) ends it too.
+    for _ in 0..64 {
+        match at {
+            None => return false,
+            Some(window) if window == id => return true,
+            Some(window) => at = parent_of(window),
+        }
+    }
+    true
 }
 
 /// The `xdg_toplevel.resize_edge` for an EWMH resize edge: xdg-shell's are
@@ -979,6 +1055,36 @@ mod tests {
         );
         assert_eq!(app_id(&info("", Some(("xev", "")))), "xev");
         assert_eq!(app_id(&info("", None)), "");
+    }
+
+    /// A greatest size below the least is raised to it, per axis; none (0)
+    /// stays none, and each fits an int.
+    #[test]
+    fn size_limits_are_ones_xdg_shell_takes() {
+        assert_eq!(
+            clamped_limits((300, 200), (100, 400)),
+            ((300, 200), (300, 400))
+        );
+        assert_eq!(clamped_limits((300, 200), (0, 0)), ((300, 200), (0, 0)));
+        assert_eq!(clamped_limits((0, 0), (50, 60)), ((0, 0), (50, 60)));
+        let big = u32::MAX;
+        let int = i32::MAX.unsigned_abs();
+        assert_eq!(clamped_limits((big, 1), (5, big)), ((int, 1), (int, int)));
+    }
+
+    /// A window is not made a dialog of itself or of a window below it:
+    /// two windows naming each other, or a longer ring.
+    #[test]
+    fn a_cycle_of_parents_is_refused() {
+        let [a, b, c, d] = [1, 2, 3, 4].map(|n| ToplevelId::fake(0x40_0000 + n));
+        // c's parent is b, b's is a.
+        let parents = HashMap::from([(c, b), (b, a)]);
+        let parent_of = |w: ToplevelId| parents.get(&w).copied();
+        assert!(makes_cycle(a, a, parent_of), "itself");
+        assert!(makes_cycle(b, c, parent_of), "each other");
+        assert!(makes_cycle(a, c, parent_of), "a ring of three");
+        assert!(!makes_cycle(d, c, parent_of));
+        assert!(!makes_cycle(c, a, parent_of), "already its grandparent");
     }
 
     #[test]
