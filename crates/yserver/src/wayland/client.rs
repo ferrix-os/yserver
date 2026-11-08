@@ -482,6 +482,25 @@ struct Axis {
     vertical: f64,
     horizontal: f64,
     discrete: (i32, i32),
+    /// The frame is a wheel's (`axis_source` wheel or tilt), or carried
+    /// `axis_value120` for the axis (vertical, horizontal): its clicks are
+    /// the wheel's count, and its continuous value is the same scroll again.
+    counted: (bool, bool),
+}
+
+impl Axis {
+    /// The frame's scroll: a wheel's clicks without the continuous value
+    /// that comes with them, which would count each notch twice (a
+    /// high-resolution wheel's part of a notch is no click yet, and its
+    /// continuous value would have made one).
+    fn scroll(self) -> PointerEvent {
+        let continuous = |counted: bool, value: f64| if counted { 0.0 } else { value };
+        PointerEvent::Axis {
+            vertical: continuous(self.counted.0, self.vertical),
+            horizontal: continuous(self.counted.1, self.horizontal),
+            discrete: self.discrete,
+        }
+    }
 }
 
 /// The compositor's keymap as it sent it.
@@ -1206,11 +1225,7 @@ impl State {
             return;
         };
         if self.seat.pointer_focus.is_some() {
-            self.pending.push(Event::Pointer(PointerEvent::Axis {
-                vertical: axis.vertical,
-                horizontal: axis.horizontal,
-                discrete: axis.discrete,
-            }));
+            self.pending.push(Event::Pointer(axis.scroll()));
         }
     }
 }
@@ -1676,8 +1691,22 @@ impl Dispatch<WlPointer, ()> for State {
                     sum.discrete.1 += discrete;
                 }
             }
+            wl_pointer::Event::AxisSource { axis_source } => {
+                if matches!(
+                    axis_source,
+                    WEnum::Value(wl_pointer::AxisSource::Wheel | wl_pointer::AxisSource::WheelTilt)
+                ) {
+                    seat.axis.get_or_insert_with(Axis::default).counted = (true, true);
+                }
+            }
             wl_pointer::Event::AxisValue120 { axis, value120 } => {
                 let vertical = axis == WEnum::Value(wl_pointer::Axis::VerticalScroll);
+                let counted = &mut seat.axis.get_or_insert_with(Axis::default).counted;
+                if vertical {
+                    counted.0 = true;
+                } else {
+                    counted.1 = true;
+                }
                 let residue = if vertical {
                     &mut seat.residue.0
                 } else {
@@ -2150,6 +2179,48 @@ mod tests {
         assert!(keymap_text(open(), 0).is_err());
         assert!(keymap_text(open(), u32::MAX).is_err(), "over the limit");
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// One notch of a high-resolution wheel, in four frames of a quarter
+    /// notch each (`axis_value120` 30, and 3.75 of continuous scroll), is
+    /// one click: with the continuous value counted as well it was two. A
+    /// touchpad's continuous scroll is kept.
+    #[test]
+    fn a_wheel_frame_is_its_clicks_alone() {
+        let mut residue = 0.0;
+        let clicks: i32 = [0, 0, 0, 1]
+            .into_iter()
+            .map(|discrete| {
+                let frame = Axis {
+                    vertical: 3.75,
+                    discrete: (discrete, 0),
+                    counted: (true, false),
+                    ..Axis::default()
+                };
+                let PointerEvent::Axis {
+                    vertical, discrete, ..
+                } = frame.scroll()
+                else {
+                    unreachable!("a scroll")
+                };
+                super::super::input::clicks(&mut residue, vertical, discrete.0)
+            })
+            .sum();
+        assert_eq!(clicks, 1);
+        let touchpad = Axis {
+            vertical: 12.0,
+            horizontal: -3.0,
+            ..Axis::default()
+        };
+        let PointerEvent::Axis {
+            vertical,
+            horizontal,
+            ..
+        } = touchpad.scroll()
+        else {
+            unreachable!("a scroll")
+        };
+        assert!((vertical - 12.0).abs() < f64::EPSILON && (horizontal + 3.0).abs() < f64::EPSILON);
     }
 
     /// A configure that leaves the size to the window answers with the
