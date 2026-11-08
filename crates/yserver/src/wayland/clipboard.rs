@@ -24,14 +24,17 @@
 //!
 //! Text only, as the design says, and no `INCR`: a selection larger than
 //! one property is refused in both directions. Every transfer is read and
-//! written without blocking, a little each loop iteration, and gives up
-//! after [`PATIENCE`].
+//! written without blocking, as its pipe can take it: the pipes are watched
+//! by an epoll descriptor of the bridge's, which the core loop polls
+//! (`DisplayHost::wake_fd`). A transfer gives up after [`PATIENCE`].
 
 use std::{
     collections::VecDeque,
-    os::fd::{AsFd as _, OwnedFd},
+    os::fd::{AsFd as _, AsRawFd as _, OwnedFd, RawFd},
     time::{Duration, Instant},
 };
+
+use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags, EpollTimeout};
 
 use wayland_protocols::ext::data_control::v1::client::{
     ext_data_control_device_v1::ExtDataControlDeviceV1,
@@ -65,6 +68,10 @@ const OWN: &str = "application/x-yserver-selection";
 
 /// How long a transfer may take before it is given up.
 const PATIENCE: Duration = Duration::from_secs(5);
+
+/// How often the loop comes round while a transfer is under way, where the
+/// pipes cannot be watched (no epoll descriptor could be made).
+const POLL: Duration = Duration::from_millis(5);
 
 /// The most a selection may hold: what one property of the server's takes.
 const LIMIT: usize = 16 << 20;
@@ -186,6 +193,48 @@ impl Atoms {
     }
 }
 
+/// The pipes of the transfers under way, watched for the core loop: its
+/// descriptor is readable when one can move (data or its end to read, room
+/// to write).
+#[derive(Debug)]
+struct Wake(Epoll);
+
+impl Wake {
+    fn new() -> nix::Result<Self> {
+        Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).map(Self)
+    }
+
+    fn fd(&self) -> RawFd {
+        self.0.0.as_raw_fd()
+    }
+
+    /// Watch `fd` for reading or writing, until [`Wake::forget`].
+    fn watch(&self, fd: &OwnedFd, writing: bool) {
+        let flags = if writing {
+            EpollFlags::EPOLLOUT
+        } else {
+            EpollFlags::EPOLLIN
+        };
+        if let Err(error) = self.0.add(fd, EpollEvent::new(flags, 0)) {
+            log::warn!("wayland: watching a paste's pipe: {error}");
+        }
+    }
+
+    /// Stop watching `fd`, before it is closed: another process may hold
+    /// the pipe's end too, which would keep it watched.
+    fn forget(&self, fd: &OwnedFd) {
+        let _ = self.0.delete(fd);
+    }
+
+    /// Take what is ready: the pipes are read and written until they would
+    /// block right after, and the core loop, edge-triggered, hears the next
+    /// change.
+    fn clear(&self) {
+        let mut events = [EpollEvent::empty(); 8];
+        let _ = self.0.wait(&mut events, EpollTimeout::ZERO);
+    }
+}
+
 /// The bridge.
 #[derive(Debug)]
 pub(super) struct Clipboard {
@@ -211,6 +260,8 @@ pub(super) struct Clipboard {
     conversions: usize,
     answers: Vec<Answer>,
     writes: Vec<Writing>,
+    /// `None` when no epoll descriptor could be made: the loop polls.
+    wake: Option<Wake>,
 }
 
 impl Clipboard {
@@ -235,16 +286,39 @@ impl Clipboard {
             conversions: 0,
             answers: Vec::new(),
             writes: Vec::new(),
+            wake: Wake::new()
+                .inspect_err(|error| {
+                    log::warn!("wayland: no epoll for the clipboard's pipes ({error}); polling");
+                })
+                .ok(),
         })
     }
 
-    /// Whether a transfer is under way, for which the loop must come round
-    /// again soon even with nothing else to do.
-    pub(super) fn busy(&self) -> bool {
-        !self.sends.is_empty()
-            || self.converting.is_some()
-            || !self.answers.is_empty()
-            || !self.writes.is_empty()
+    /// The descriptor the core loop polls for the transfers' pipes.
+    pub(super) fn wake_fd(&self) -> Option<RawFd> {
+        self.wake.as_ref().map(Wake::fd)
+    }
+
+    /// When the loop must come round for the bridge: a paste waiting to be
+    /// asked for at once, else when the oldest transfer would be given up
+    /// (its pipes wake the loop before that); without the epoll descriptor,
+    /// every few milliseconds while one is under way.
+    pub(super) fn deadline(&self, now: Instant) -> Option<Instant> {
+        if self.converting.is_none() && !self.sends.is_empty() {
+            return Some(now);
+        }
+        let oldest = self
+            .converting
+            .iter()
+            .map(|converting| converting.send.asked)
+            .chain(self.answers.iter().map(|answer| answer.asked))
+            .chain(self.writes.iter().map(|writing| writing.asked))
+            .min()?;
+        Some(match self.wake {
+            // Just past it: a transfer is given up once it took longer.
+            Some(_) => oldest + PATIENCE + Duration::from_millis(1),
+            None => now + POLL,
+        })
     }
 
     /// An event of one of the bridge's objects.
@@ -412,6 +486,9 @@ impl Clipboard {
             }
         }
 
+        if let Some(wake) = &self.wake {
+            wake.clear();
+        }
         self.convert(state, &atoms);
         self.read_answers(state, backend, &atoms);
         self.write_pastes();
@@ -587,6 +664,9 @@ impl Clipboard {
             refuse(state);
             return;
         }
+        if let Some(wake) = &self.wake {
+            wake.watch(&reader, false);
+        }
         self.answers.push(Answer {
             which,
             reader,
@@ -635,6 +715,9 @@ impl Clipboard {
         }
         for (at, whole) in done.into_iter().rev() {
             let answer = self.answers.remove(at);
+            if let Some(wake) = &self.wake {
+                wake.forget(&answer.reader);
+            }
             let (r#type, data) = if answer.target == atoms.string {
                 (atoms.string, latin1(&answer.data))
             } else {
@@ -771,6 +854,9 @@ impl Clipboard {
         } else {
             value.data
         };
+        if let Some(wake) = &self.wake {
+            wake.watch(&converting.send.fd, true);
+        }
         self.writes.push(Writing {
             which: converting.send.which,
             fd: converting.send.fd,
@@ -783,33 +869,44 @@ impl Clipboard {
     /// Write what X's owners gave to the pipes of the Wayland programs that
     /// asked, each closed once all of it is written.
     fn write_pastes(&mut self) {
+        let wake = self.wake.as_ref();
         self.writes.retain_mut(|writing| {
-            loop {
-                let Some(rest) = writing.data.get(writing.at..) else {
-                    return false;
-                };
-                if rest.is_empty() {
-                    log::info!(
-                        "wayland: gave the compositor {} bytes of X's {}",
-                        writing.data.len(),
-                        NAMES[writing.which]
-                    );
-                    return false;
-                }
-                let written = nix::unistd::write(&writing.fd, rest);
-                match written {
-                    Ok(count) => writing.at += count,
-                    Err(nix::errno::Errno::EAGAIN) => {
-                        return writing.asked.elapsed() <= PATIENCE;
-                    }
-                    Err(nix::errno::Errno::EINTR) => {}
-                    Err(error) => {
-                        log::warn!("wayland: writing a paste: {error}");
-                        return false;
-                    }
-                }
+            let keep = write_paste(writing);
+            if !keep && let Some(wake) = wake {
+                wake.forget(&writing.fd);
             }
+            keep
         });
+    }
+}
+
+/// Write what is left of a paste until its pipe would block: whether it
+/// waits for room.
+fn write_paste(writing: &mut Writing) -> bool {
+    loop {
+        let Some(rest) = writing.data.get(writing.at..) else {
+            return false;
+        };
+        if rest.is_empty() {
+            log::info!(
+                "wayland: gave the compositor {} bytes of X's {}",
+                writing.data.len(),
+                NAMES[writing.which]
+            );
+            return false;
+        }
+        let written = nix::unistd::write(&writing.fd, rest);
+        match written {
+            Ok(count) => writing.at += count,
+            Err(nix::errno::Errno::EAGAIN) => {
+                return writing.asked.elapsed() <= PATIENCE;
+            }
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(error) => {
+                log::warn!("wayland: writing a paste: {error}");
+                return false;
+            }
+        }
     }
 }
 
@@ -888,6 +985,30 @@ mod tests {
             !asked.answered_by(clipboard, string, second),
             "another type"
         );
+    }
+
+    /// The bridge's descriptor is readable once a watched pipe has data,
+    /// and not once it is forgotten.
+    #[test]
+    fn the_wake_descriptor_is_readable_when_a_pipe_can_move() {
+        use std::os::fd::BorrowedFd;
+
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        let wake = Wake::new().unwrap();
+        let readable = |wake: &Wake| {
+            // SAFETY: the descriptor is `wake`'s, open for this call.
+            let fd = unsafe { BorrowedFd::borrow_raw(wake.fd()) };
+            let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+            poll(&mut fds, PollTimeout::ZERO).unwrap() == 1
+        };
+        let (reader, writer) = paste_pipe().unwrap();
+        wake.watch(&reader, false);
+        assert!(!readable(&wake), "nothing to read yet");
+        nix::unistd::write(&writer, b"text").unwrap();
+        assert!(readable(&wake));
+        wake.forget(&reader);
+        wake.clear();
+        assert!(!readable(&wake), "forgotten");
     }
 
     /// Only the server's end of a paste's pipe does not block: the owner
