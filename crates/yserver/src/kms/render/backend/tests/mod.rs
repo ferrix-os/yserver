@@ -5,6 +5,7 @@ mod cursor;
 mod cursor_sprites;
 mod deadlines;
 mod detectable_autorepeat;
+mod direct_frames;
 mod dri3;
 mod gc_draw;
 mod keyboard_source;

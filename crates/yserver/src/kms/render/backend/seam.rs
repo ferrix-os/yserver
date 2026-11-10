@@ -24,6 +24,14 @@ use crate::kms::render::{
     store::DrawableId,
 };
 
+/// What an access does with a drawable's pixels
+/// (`Platform::settle_for_access`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Read,
+    Write,
+}
+
 /// A platform the backend runs on. The GPU comes through [`OutputSink`].
 pub trait Platform: OutputSink + Sized + 'static {
     /// Platform-owned backend state, a sibling of `platform` on the backend
@@ -508,6 +516,24 @@ pub trait Platform: OutputSink + Sized + 'static {
     fn dri3_capabilities(_b: &XBackend<Self>) -> Dri3Caps {
         Dri3Caps::unsupported()
     }
+
+    /// The drawable `host_xid`, whose pixels are in `backing` (`None`: its
+    /// own storage, by its XID), is about to be read or, `Access::Write`,
+    /// drawn into: a platform that has left a backing owed a frame copies
+    /// the frame in first, so the access sees it and a draw lands on it.
+    /// Called by `XBackend::resolve_paint_target` and
+    /// `XBackend::resolve_paint_source`, and by `XBackend::settle_drawable`
+    /// where a drawable's storage is read by its XID.
+    fn settle_for_access(
+        _b: &mut XBackend<Self>,
+        _host_xid: u32,
+        _backing: Option<DrawableId>,
+        _access: Access,
+    ) {
+    }
+
+    /// A client freed pixmap `host_xid`; its storage is still there.
+    fn pixmap_freed(_b: &mut XBackend<Self>, _host_xid: u32) {}
 
     fn dri3_import_pixmap(
         _b: &mut XBackend<Self>,

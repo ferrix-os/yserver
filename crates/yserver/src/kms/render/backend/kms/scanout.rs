@@ -3570,7 +3570,7 @@ impl KmsBackend {
                 },
             );
         let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
-        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
+        let paint_target = self.peek_paint_target(candidate.paint_dst_host_xid);
         let paint_id = paint_target.map(|target| target.backing_id());
         let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
         let direct_scope = self.direct_candidate_scope(candidate, target);

@@ -1,3 +1,4 @@
+use super::super::seam::Access;
 use crate::kms::{
     core::PictureRecord,
     cpu_types::Rectangle16,
@@ -117,7 +118,7 @@ impl<P: Platform> XBackend<P> {
                 base
             };
         let after_children = match self
-            .resolve_paint_target(dst_host_xid)
+            .peek_paint_target(dst_host_xid)
             .and_then(|t| self.shared_backing_draw_clip(dst_host_xid, &t))
         {
             Some(keep) => after_children
@@ -215,7 +216,7 @@ impl<P: Platform> XBackend<P> {
             if !participating {
                 continue;
             }
-            let Some(target) = self.resolve_paint_target(child) else {
+            let Some(target) = self.peek_paint_target(child) else {
                 continue;
             };
             let bw = i32::from(g.border_width);
@@ -289,6 +290,7 @@ impl<P: Platform> XBackend<P> {
         let mut pieces = Vec::new();
         self.inferior_pieces(host, (0, 0), &[area], backing, &mut pieces);
         for piece in pieces {
+            self.settle_target(piece.window, piece.target, Access::Read);
             let Some(bbox) = vk_rects_bbox(&piece.rects) else {
                 continue;
             };
@@ -347,7 +349,7 @@ impl<P: Platform> XBackend<P> {
         let Some(geom) = self.windows.get(host_xid) else {
             return Vec::new();
         };
-        let Some(target) = self.resolve_paint_target(*host_xid) else {
+        let Some(target) = self.peek_paint_target(*host_xid) else {
             return Vec::new();
         };
         let content = vk::Rect2D {
@@ -523,7 +525,7 @@ impl<P: Platform> XBackend<P> {
         let mut seen: HashSet<crate::kms::render::store::DrawableId> = HashSet::new();
         // Seed with the host's own target so an inferior routing into the host
         // backing (e.g. a top-level when root itself is redirected) is skipped.
-        if let Some(t) = self.resolve_paint_target(host_xid) {
+        if let Some(t) = self.peek_paint_target(host_xid) {
             seen.insert(t.backing_id());
         }
         let mut out = Vec::new();
@@ -590,7 +592,7 @@ impl<P: Platform> XBackend<P> {
             if child_rects.is_empty() {
                 continue;
             }
-            let Some(target) = self.resolve_paint_target(*child_xid) else {
+            let Some(target) = self.peek_paint_target(*child_xid) else {
                 continue;
             };
             // Emit only when this child introduces a NEW backing; either way,
@@ -778,11 +780,14 @@ impl<P: Platform> XBackend<P> {
             self.fill_solid_rects(target, background, &bg_own);
         }
 
-        // Each distinct inferior backing, exactly once (XOR-safe).
+        // Each distinct inferior backing, exactly once (XOR-safe), made
+        // current first: the walk only looked at it.
         for (child_target, child_rects) in fg_inferiors {
+            self.settle_target(host_xid, child_target, Access::Write);
             self.fill_solid_rects(child_target, foreground, &child_rects);
         }
         for (child_target, child_rects) in bg_inferiors {
+            self.settle_target(host_xid, child_target, Access::Write);
             self.fill_solid_rects(child_target, background, &child_rects);
         }
     }

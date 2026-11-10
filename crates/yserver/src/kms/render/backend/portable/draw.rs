@@ -1,3 +1,4 @@
+use super::super::seam::Access;
 use crate::kms::{
     cpu_types::{Rectangle16, Repeat},
     render::{
@@ -994,6 +995,8 @@ impl<P: Platform> XBackend<P> {
         if rects.is_empty() {
             return true;
         }
+        // A tile may be a window's named pixmap: read by its XID.
+        self.settle_drawable(tile_xid, Access::Read);
         let Some(tile_id) = self.store.lookup(tile_xid) else {
             log::debug!("render try_tiled_fill: tile 0x{tile_xid:x} not in store");
             return false;
@@ -1681,7 +1684,7 @@ impl<P: Platform> XBackend<P> {
         // `src_off` is the source window's offset within its backing;
         // it converts the wire window-local src coords into backing
         // coords.
-        let Some(src_target) = self.resolve_paint_target(src_host_xid) else {
+        let Some(src_target) = self.resolve_paint_source(src_host_xid) else {
             if !self.windows.contains_key(&src_host_xid) {
                 log::warn!(
                     "render copy_area dropped — src unresolvable: src=0x{src_host_xid:x} \
@@ -2156,7 +2159,7 @@ impl<P: Platform> XBackend<P> {
         // hand-reconstructed offset can express nested ancestry. The
         // handle gives all three: the drawable that HOLDS the pixels,
         // the content origin inside it, and the content bounds.
-        let Some(src_target) = self.resolve_paint_target(src_host_xid) else {
+        let Some(src_target) = self.resolve_paint_source(src_host_xid) else {
             log::debug!("render copy_plane gap: src 0x{src_host_xid:x} has no paint target");
             return Ok(());
         };
@@ -2572,7 +2575,7 @@ impl<P: Platform> XBackend<P> {
             self.drain_frame_builder_telemetry();
             return result;
         }
-        let Some(target) = self.resolve_paint_target(host_xid) else {
+        let Some(target) = self.resolve_paint_source(host_xid) else {
             self.log_unresolved_target(host_xid, "get_image_unknown_xid");
             return Ok(None);
         };
@@ -2739,7 +2742,7 @@ impl<P: Platform> XBackend<P> {
         // ShapeMask degrades to a bounding-box rect — and since
         // the scene clips window draws to the bounding shape,
         // shaped popups render wrong (e16 hover clouds).
-        let Some(target) = self.resolve_paint_target(host_xid) else {
+        let Some(target) = self.resolve_paint_source(host_xid) else {
             self.log_unresolved_target(host_xid, "read_depth1_pixmap_unknown_xid");
             return Ok(None);
         };

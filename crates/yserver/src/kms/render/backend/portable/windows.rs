@@ -1,3 +1,4 @@
+use super::super::seam::Access;
 use crate::kms::{
     cpu_types::{Rectangle16, Repeat},
     render::{
@@ -844,6 +845,9 @@ impl<P: Platform> XBackend<P> {
         let Some(dst_target) = self.resolve_paint_target(host_xid) else {
             return Ok(());
         };
+        if let Some(bg_host_xid) = background_pixmap_host_xid {
+            self.settle_drawable(bg_host_xid, Access::Read);
+        }
         if let Some(bg_host_xid) = background_pixmap_host_xid
             && let Some(src) = self.store.lookup(bg_host_xid)
         {
@@ -1219,7 +1223,7 @@ impl<P: Platform> XBackend<P> {
         }
         let parent_bounds = geom
             .parent
-            .and_then(|p| self.resolve_paint_target(p))
+            .and_then(|p| self.peek_paint_target(p))
             .filter(|t| t.backing_id() == backing)
             .and_then(PaintTarget::content_bounds);
         let ring: Vec<vk::Rect2D> = match parent_bounds {
@@ -1406,6 +1410,7 @@ impl<P: Platform> XBackend<P> {
             vk::ops::render::CompositeRect,
         };
 
+        self.settle_drawable(tile_xid, Access::Read);
         let Some(tile_id) = self.store.lookup(tile_xid) else {
             log::debug!(
                 "render paint_border_ring_tiled: border tile 0x{tile_xid:x} not in store for \
@@ -1590,6 +1595,7 @@ impl<P: Platform> XBackend<P> {
             vk::ops::render::CompositeRect,
         };
         let dst = dst_handle.id();
+        self.settle_drawable(host_pixmap_xid, Access::Read);
         let Some(src) = self.store.lookup(host_pixmap_xid) else {
             log::debug!(
                 "render set_container_background_pixmap: pixmap 0x{host_pixmap_xid:x} not in store"
@@ -2149,6 +2155,9 @@ impl<P: Platform> XBackend<P> {
             sibling: None,
             stack_mode: None,
         };
+        if let Some(old) = carry_from {
+            self.settle_drawable(old.as_raw(), Access::Read);
+        }
         let old = carry_from.and_then(|h| self.store.lookup(h.as_raw()));
         let Some(old) = old else {
             for &(host_xid, x, y) in moves {

@@ -844,6 +844,9 @@ impl<P: Platform> Backend for XBackend<P> {
         origin: Option<OriginContext>,
         backing: PixmapHandle,
     ) -> io::Result<()> {
+        // The leaves are restored from the backing, read outside
+        // `resolve_paint_target`.
+        self.settle_drawable(backing.as_raw(), super::seam::Access::Read);
         Self::backend_redirect_release_redirected_backing(self, origin, backing)
     }
 
@@ -895,6 +898,7 @@ impl<P: Platform> Backend for XBackend<P> {
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        P::pixmap_freed(self, host_xid);
         Self::backend_redirect_free_pixmap(self, _origin, host_xid)
     }
 

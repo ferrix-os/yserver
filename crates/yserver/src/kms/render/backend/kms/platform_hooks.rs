@@ -11,7 +11,10 @@ use yserver_core::{
 };
 
 use crate::kms::render::{
-    backend::{DirectScope, KmsBackend, KmsBackendState, seam::Platform},
+    backend::{
+        DirectScope, KmsBackend, KmsBackendState,
+        seam::{Access, Platform},
+    },
     platform::PlatformBackend,
     present_batch::{PendingPresentBatch, PresentBatchWait},
     scene::OutputLayout,
@@ -43,6 +46,8 @@ impl Platform for PlatformBackend {
 
     fn note_drawable_retired(st: &mut KmsBackendState, id: DrawableId) {
         st.retire_scanout_drawable(id);
+        // A backing that went is owed nothing: nothing can read it.
+        st.direct_frames.settled(id, None);
     }
 
     fn set_keyboard_leds(st: &mut KmsBackendState, lit: u32) {
@@ -547,6 +552,11 @@ impl Platform for PlatformBackend {
         candidate: PresentScanoutCandidate,
         event: yserver_core::backend::CompletedPresentEvent,
     ) -> io::Result<bool> {
+        // A rootless server has no scanout: a whole-window present may go
+        // to its host as the client's buffer instead.
+        if b.rootless_active() {
+            return Ok(b.try_direct_frame(&candidate, event));
+        }
         let result = KmsBackend::backend_present_try_present_direct(b, candidate, event);
         b.note_present_outcome(candidate.src_host_xid, matches!(result, Ok(true)));
         result
@@ -778,7 +788,24 @@ impl Platform for PlatformBackend {
         KmsBackend::backend_export_glx_vendor_names(b)
     }
 
+    fn settle_for_access(
+        b: &mut KmsBackend,
+        host_xid: u32,
+        backing: Option<DrawableId>,
+        access: Access,
+    ) {
+        b.settle_direct_access(host_xid, backing, access);
+    }
+
+    fn pixmap_freed(b: &mut KmsBackend, host_xid: u32) {
+        b.forget_direct_pixmap(host_xid);
+    }
+
+    // An export lets a client read the storage on its GPU, outside any
+    // request: a backing owed a frame is settled first, and takes no
+    // direct frames while exported.
     fn acquire_glx_pixmap_export(b: &mut KmsBackend, host_xid: u32) {
+        b.settle_drawable(host_xid, Access::Write);
         KmsBackend::acquire_glx_pixmap_export(b, host_xid);
     }
 
@@ -787,6 +814,7 @@ impl Platform for PlatformBackend {
     }
 
     fn promote_pixmap_exportable(b: &mut KmsBackend, host_xid: u32) -> bool {
+        b.settle_drawable(host_xid, Access::Write);
         KmsBackend::promote_pixmap_exportable(b, host_xid)
     }
 
@@ -831,6 +859,7 @@ impl Platform for PlatformBackend {
         b: &mut KmsBackend,
         host_xid: u32,
     ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
+        b.settle_drawable(host_xid, Access::Write);
         KmsBackend::backend_export_dri3_export_pixmap(b, host_xid)
     }
 
@@ -838,6 +867,7 @@ impl Platform for PlatformBackend {
         b: &mut KmsBackend,
         host_xid: u32,
     ) -> io::Result<Dri3PixmapExport> {
+        b.settle_drawable(host_xid, Access::Write);
         KmsBackend::backend_export_dri3_export_pixmap_buffers(b, host_xid)
     }
 
@@ -845,6 +875,7 @@ impl Platform for PlatformBackend {
         b: &mut KmsBackend,
         host_xid: u32,
     ) -> io::Result<yserver_core::backend::Dri3ExportBegin> {
+        b.settle_drawable(host_xid, Access::Write);
         KmsBackend::backend_export_dri3_begin_export(b, host_xid)
     }
 
@@ -937,7 +968,11 @@ impl Platform for PlatformBackend {
     fn drain_completed_present_events(
         b: &mut KmsBackend,
     ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
-        KmsBackend::backend_present_drain_completed_present_events(b)
+        let completed = KmsBackend::backend_present_drain_completed_present_events(b);
+        for event in &completed {
+            b.pstate.direct_frames.completed(event.present_id);
+        }
+        completed
     }
 
     fn drain_retired_present_idle_events(
@@ -947,6 +982,7 @@ impl Platform for PlatformBackend {
         for owner in &mut b.pstate.direct.outputs {
             idled.append(&mut owner.idled);
         }
+        idled.extend(b.take_direct_idles());
         idled
     }
 

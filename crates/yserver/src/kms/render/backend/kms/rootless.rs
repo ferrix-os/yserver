@@ -238,10 +238,18 @@ impl KmsBackend {
         self.sync_keyboard_leds();
     }
 
-    fn apply_rootless_frames(&mut self, frames: Vec<FrameEvent>) {
+    fn apply_rootless_frames(&mut self, mut frames: Vec<FrameEvent>) {
         if frames.is_empty() {
             return;
         }
+        // A client buffer the window system gave back is the platform's.
+        frames.retain(|event| match event {
+            FrameEvent::DirectReleased { generation } => {
+                self.pstate.direct_frames.released(*generation);
+                false
+            }
+            _ => true,
+        });
         if let Some(presenter) = self
             .pstate
             .rootless
@@ -295,6 +303,9 @@ impl KmsBackend {
         rootless.clock.set_refresh(now, refresh);
         if let Some(presenter) = rootless.presenter.as_mut() {
             presenter.poll_retiring();
+            // Before the presenter reads any window back: a window owed a
+            // direct frame is handed it, or has it settled to be read.
+            self.hand_direct_frames(presenter);
             presenter.tick(self);
             self.flush_rootless_cursor(&mut rootless);
         }
@@ -331,11 +342,15 @@ impl KmsBackend {
             .presenter
             .as_ref()
             .and_then(|p| p.next_wakeup(&self.store, now));
+        let direct = rootless
+            .presenter
+            .as_ref()
+            .and_then(|p| self.direct_next_wakeup(p, now));
         let clock = rootless.clock.wake().map(|wake| {
             now + std::time::Duration::from_micros(wake.saturating_sub(monotonic_us()))
         });
         let host = rootless.host.borrow().next_wakeup();
-        [presenter, clock, host].into_iter().flatten().min()
+        [presenter, direct, clock, host].into_iter().flatten().min()
     }
 
     pub(in crate::kms::render::backend) fn rootless_active(&self) -> bool {

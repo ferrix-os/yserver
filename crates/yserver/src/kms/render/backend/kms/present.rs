@@ -208,7 +208,7 @@ impl KmsBackend {
         let Some(leaf_id) = self.store.lookup(host_xid) else {
             return false;
         };
-        let paint_target = self.resolve_paint_target(host_xid);
+        let paint_target = self.peek_paint_target(host_xid);
         let paint_id = paint_target.map(|target| target.backing_id());
         let target = self.scanout_m0_target(host_xid, Some(leaf_id), paint_id);
         let unbordered = paint_target.is_none_or(|target| !target.has_border_clip());
@@ -264,7 +264,7 @@ impl KmsBackend {
             .all(|frame| {
                 let host_xid = frame.candidate.paint_dst_host_xid;
                 let leaf_id = self.store.lookup(host_xid);
-                let paint_target = self.resolve_paint_target(host_xid);
+                let paint_target = self.peek_paint_target(host_xid);
                 let paint_id = paint_target.map(|target| target.backing_id());
                 let target = self.scanout_m0_target(host_xid, leaf_id, paint_id);
                 self.direct_scope_scene_eligible(host_xid, target, scope)
@@ -314,7 +314,7 @@ impl KmsBackend {
             return false;
         }
         let leaf_id = self.store.lookup(host_window);
-        let paint_target = self.resolve_paint_target(host_window);
+        let paint_target = self.peek_paint_target(host_window);
         let paint_id = paint_target.map(|target| target.backing_id());
         let target = self.scanout_m0_target(host_window, leaf_id, paint_id);
         let unbordered = paint_target.is_none_or(|target| !target.has_border_clip());
@@ -1234,7 +1234,7 @@ impl KmsBackend {
         let present_received_monotonic = crate::drm::atomic::monotonic_timestamp();
         let source_id = self.store.lookup(candidate.src_host_xid);
         let leaf_id = self.store.lookup(candidate.paint_dst_host_xid);
-        let paint_target = self.resolve_paint_target(candidate.paint_dst_host_xid);
+        let paint_target = self.peek_paint_target(candidate.paint_dst_host_xid);
         let paint_id = paint_target.map(|target| target.backing_id());
         let target = self.scanout_m0_target(candidate.paint_dst_host_xid, leaf_id, paint_id);
         let candidate_scope = self.direct_candidate_scope(candidate, target);
@@ -1646,7 +1646,7 @@ impl KmsBackend {
         }
 
         let destination_id = self
-            .resolve_paint_target(dst_window_host_xid)
+            .peek_paint_target(dst_window_host_xid)
             .map(|t| t.backing_id());
         let mut prewaited_destination = None;
         if let Some(dst_id) = destination_id
@@ -1807,7 +1807,7 @@ impl KmsBackend {
             })
             .collect();
         let destination_id = self
-            .resolve_paint_target(dst_window_host_xid)
+            .peek_paint_target(dst_window_host_xid)
             .map(|t| t.backing_id());
         let mut prewaited_destination = None;
         if let Some(dst_id) = destination_id

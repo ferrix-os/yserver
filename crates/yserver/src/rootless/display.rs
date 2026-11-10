@@ -20,7 +20,9 @@ use yserver_core::{
     server::ServerState,
 };
 
-use super::host::{CpuFrame, DmabufFrame, FrameEvent, HandoffKind, RootlessHost};
+use super::host::{
+    CpuFrame, DirectBuffer, DirectFrame, DmabufFrame, FrameEvent, HandoffKind, RootlessHost,
+};
 use crate::kms::vk::device::VkContext;
 
 /// One thing the window system said, for the core or the presenter.
@@ -232,5 +234,21 @@ impl RootlessHost for PresenterHandle {
 
     fn set_cursor(&mut self, cursor: Option<&ActiveCursorImage>) {
         self.0.borrow_mut().set_cursor(cursor);
+    }
+
+    fn takes_direct(&self, depth: u8) -> bool {
+        self.0.borrow().takes_direct(depth)
+    }
+
+    fn import_direct(&mut self, buffer: DirectBuffer) {
+        self.0.borrow_mut().import_direct(buffer);
+    }
+
+    fn submit_direct(&mut self, frame: DirectFrame) -> bool {
+        self.0.borrow_mut().submit_direct(frame)
+    }
+
+    fn forget_direct(&mut self, generations: &[u64]) {
+        self.0.borrow_mut().forget_direct(generations);
     }
 }

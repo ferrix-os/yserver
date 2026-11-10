@@ -1,3 +1,4 @@
+use super::super::seam::Access;
 use crate::kms::render::{
     backend::{XBackend, seam::Platform},
     target::{Dst, Src},
@@ -246,6 +247,8 @@ impl<P: Platform> XBackend<P> {
         &mut self,
         host_xid: u32,
     ) -> Option<(Vec<u8>, u16, u16)> {
+        // RENDER's CreateCursor may name a window's named pixmap.
+        self.settle_drawable(host_xid, Access::Read);
         let id = self.store.lookup(host_xid)?;
         let drawable = self.store.get(id)?;
         let extent = drawable.storage.extent;

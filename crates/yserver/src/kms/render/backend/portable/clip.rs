@@ -1,3 +1,4 @@
+use super::super::seam::Access;
 use crate::kms::{
     core::PictureRecord,
     cpu_types::Rectangle16,
@@ -183,6 +184,7 @@ impl<P: Platform> XBackend<P> {
         host_pixmap_xid: u32,
         origin: (i16, i16),
     ) -> Option<FillPatternCache> {
+        self.settle_drawable(host_pixmap_xid, Access::Read);
         let id = self.store.lookup(host_pixmap_xid)?;
         let (depth, extent) = {
             let d = self.store.get(id)?;
@@ -590,7 +592,7 @@ impl<P: Platform> XBackend<P> {
                 .collect();
         }
         let keep = self
-            .resolve_paint_target(host_xid)
+            .peek_paint_target(host_xid)
             .and_then(|t| self.shared_backing_draw_clip(host_xid, &t));
         if cut.is_empty() && keep.is_none() {
             return None;

@@ -477,6 +477,14 @@ impl KmsBackend {
             ),
         };
         let modifier = vk_modifier;
+        // A buffer the client named LINEAR may go to a rootless host as it
+        // is (`direct_frames.rs`); one whose layout was not named is not
+        // known to be LINEAR.
+        let direct_fd = (!implicit_layout
+            && modifier == crate::kms::vk::dri3::DRM_FORMAT_MOD_LINEAR
+            && bpp == 32
+            && self.host_takes_direct(depth))
+        .then(|| fd.try_clone());
         let drawable = crate::kms::vk::dri3::import_dmabuf_reporting(
             vk.clone(),
             fd,
@@ -538,6 +546,19 @@ impl KmsBackend {
         // the per-second counters stay accurate under DRI3 traffic.
         self.telemetry.record_storage_allocation();
         self.telemetry.record_image_view_create();
+        if let Some(fd) = direct_fd {
+            self.record_direct_buffer(
+                host_xid,
+                fd,
+                super::direct_frames::Layout {
+                    offset,
+                    stride,
+                    width,
+                    height,
+                    depth,
+                },
+            );
+        }
         PixmapHandle::from_raw(host_xid)
             .ok_or_else(|| io::Error::other("DRI3 import: failed to make PixmapHandle"))
     }

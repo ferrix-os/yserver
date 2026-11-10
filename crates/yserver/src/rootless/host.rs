@@ -59,6 +59,40 @@ pub(crate) struct DmabufFrame {
     pub damage: Vec<Rect>,
 }
 
+/// A client's LINEAR DRI3 buffer a host is to make its own object of, for
+/// direct frames (`kms/render/backend/kms/direct_frames.rs`): handed over
+/// once, before its first frame, with the client's descriptor.
+#[cfg(kms)]
+#[derive(Debug)]
+pub(crate) struct DirectBuffer {
+    /// Unique for the server's life: what the host keeps its object by.
+    pub generation: u64,
+    pub width: u16,
+    pub height: u16,
+    /// The one plane's offset and stride, in bytes, checked against the
+    /// dma-buf's size and to fit 32 bits; its layout is
+    /// `DRM_FORMAT_MOD_LINEAR`.
+    pub offset: u32,
+    pub stride: u32,
+    /// 24: alpha undefined; 32: premultiplied ARGB.
+    pub depth: u8,
+    /// The buffer, a dma-buf.
+    pub fd: OwnedFd,
+}
+
+/// A whole-window frame that is a client's own buffer, one the host was
+/// given as a [`DirectBuffer`]: the client presented a buffer of the
+/// window's size, and the window's backing is owed the frame instead of a
+/// copy of it.
+#[cfg(kms)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectFrame {
+    pub id: ToplevelId,
+    pub generation: u64,
+    pub width: u16,
+    pub height: u16,
+}
+
 /// Host → presenter, over the platform link (spec §4.5, §4.5.1).
 #[derive(Debug)]
 pub(crate) enum FrameEvent {
@@ -84,6 +118,11 @@ pub(crate) enum FrameEvent {
         seq: FrameSeq,
         pixels: Vec<u8>,
     },
+    /// The window system gave back the client buffer of a direct frame
+    /// (`wl_buffer.release`): it reads it no more. The platform's, not the
+    /// presenter's.
+    #[cfg(kms)]
+    DirectReleased { generation: u64 },
 }
 
 /// A native window system's side of rootless mode (spec §4.5), driven on the
@@ -124,4 +163,31 @@ pub(crate) trait RootlessHost {
     /// straight-alpha BGRA. For a host with no shell of its own to tell.
     #[cfg_attr(not(kms), allow(dead_code))]
     fn set_cursor(&mut self, _cursor: Option<&ActiveCursorImage>) {}
+    /// Whether the host takes direct frames of buffers of `depth`: its
+    /// window system can show a client's dma-buf of that format as a
+    /// window's buffer. Where no host does, no buffer is kept for them.
+    #[cfg(kms)]
+    fn takes_direct(&self, _depth: u8) -> bool {
+        false
+    }
+    /// Make the host's object for a client's buffer, before its first
+    /// frame; the descriptor is the host's from now on.
+    #[cfg(kms)]
+    fn import_direct(&mut self, buffer: DirectBuffer) {
+        drop(buffer);
+    }
+    /// Show `frame` as its window's next frame: `true` when it was
+    /// committed, after which the host owes a `Ready` as after a CPU frame,
+    /// and a `DirectReleased` once the window system no longer reads the
+    /// buffer. `false` declines it (no object of that buffer yet, one the
+    /// window system refused, a window that cannot show it whole); the
+    /// window is read back instead.
+    #[cfg(kms)]
+    fn submit_direct(&mut self, _frame: DirectFrame) -> bool {
+        false
+    }
+    /// The client buffers of these generations went: the host's objects
+    /// of them may go.
+    #[cfg(kms)]
+    fn forget_direct(&mut self, _generations: &[u64]) {}
 }

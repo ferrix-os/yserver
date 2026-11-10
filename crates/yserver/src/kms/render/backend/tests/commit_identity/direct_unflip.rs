@@ -3607,7 +3607,7 @@ fn root_unflip_barrier_is_per_output_for_output_admission() {
                 fixture
                     .events
                     .backend
-                    .resolve_paint_target(output1.candidate.paint_dst_host_xid)
+                    .peek_paint_target(output1.candidate.paint_dst_host_xid)
                     .map(|target| target.backing_id()),
             ),
         ),

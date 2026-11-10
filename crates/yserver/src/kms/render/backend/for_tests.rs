@@ -260,7 +260,7 @@ impl KmsBackend {
     #[doc(hidden)]
     #[must_use]
     pub fn paint_target_shape_for_tests(&self, host_xid: u32) -> Option<PaintTargetShape> {
-        let t = self.resolve_paint_target(host_xid)?;
+        let t = self.peek_paint_target(host_xid)?;
         Some((
             t.offset(),
             t.content_bounds()
@@ -736,6 +736,7 @@ impl KmsBackend {
             vidmode_gamma: None,
             exported_dmabufs: HashMap::new(),
             dmabuf_export_supported: false,
+            direct_frames: Default::default(),
             rootless: None,
             export_holders: Default::default(),
         };

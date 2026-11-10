@@ -51,6 +51,10 @@ pub(crate) struct CpuState {
     /// The next readback is full-extent: a new window or generation, or a
     /// dropped frame nothing at this generation was delivered after.
     needs_full: bool,
+    /// The host shows a client's buffer (a direct frame), newer than the
+    /// backing, which is owed it: only new damage of the backing is a
+    /// reason to read it back.
+    direct: bool,
     backing: Option<DrawableId>,
 }
 
@@ -114,6 +118,7 @@ impl CpuState {
         self.backing = Some(backing);
         self.canonical = None;
         self.needs_full = true;
+        self.direct = false;
     }
 
     /// The host made the native window again: a readback under way would
@@ -121,6 +126,16 @@ impl CpuState {
     pub(crate) fn restart(&mut self) {
         drop(self.take_in_flight());
         self.needs_full = true;
+        self.direct = false;
+    }
+
+    /// The host shows a direct frame now: the next readback is whole (the
+    /// window system's last buffer is not one this window's damage is
+    /// counted from), and none is owed until the backing is drawn again.
+    #[cfg(kms)]
+    pub(crate) fn direct_shown(&mut self) {
+        self.needs_full = true;
+        self.direct = true;
     }
 
     pub(crate) fn backing(&self) -> Option<DrawableId> {
@@ -141,9 +156,10 @@ impl CpuState {
     }
 
     /// Something to read: a full readback is owed, or the store holds
-    /// damage of the backing.
+    /// damage of the backing. While the host shows a direct frame, only the
+    /// damage: the backing is older than what the host shows.
     pub(crate) fn has_work(&self, store: &DrawableStore) -> bool {
-        self.needs_full()
+        (self.needs_full() && !self.direct)
             || self.backing.is_some_and(|b| {
                 store
                     .peek_presentation_damage(b)
@@ -212,6 +228,8 @@ impl CpuState {
         };
         match g.engine.begin_readback(g.store, g.gpu, backing, &rects) {
             Ok(readback) => {
+                // The frame read back replaces the direct one at the host.
+                self.direct = false;
                 self.in_flight = Some(InFlight {
                     backing_gen: frames.backing_gen(),
                     full,

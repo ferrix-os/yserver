@@ -1,4 +1,5 @@
 mod crtc_config;
+pub(crate) mod direct_frames;
 mod export;
 mod platform_hooks;
 mod present;

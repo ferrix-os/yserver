@@ -74,10 +74,26 @@ pub(crate) enum Note {
     Removed(ToplevelId),
 }
 
+/// A CPU window of the presenter's, as direct frames see it
+/// (`kms/render/backend/kms/direct_frames.rs`).
+#[cfg(kms)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DirectWindow {
+    pub(crate) id: ToplevelId,
+    /// The X window's backend handle.
+    pub(crate) host_xid: u32,
+    pub(crate) readiness: Readiness,
+    /// A readback of it is in flight.
+    pub(crate) reading: bool,
+}
+
 /// The rootless half of the surface platform's backend state.
 pub(crate) struct Presenter {
     pub(crate) host: Box<dyn RootlessHost>,
     pub(crate) windows: HashMap<ToplevelId, Presented>,
+    /// Each window's id by its backend window, for direct frames.
+    #[cfg(kms)]
+    by_host: HashMap<u32, ToplevelId>,
     /// Readbacks started or finished, frames shown: tests of the wakeup rule.
     pub(crate) progress: u64,
     /// Swapchains and surfaces waiting for their presents to finish.
@@ -94,6 +110,8 @@ impl Presenter {
         Self {
             host,
             windows: HashMap::new(),
+            #[cfg(kms)]
+            by_host: HashMap::new(),
             progress: 0,
             retiring: Vec::new(),
             #[cfg(test)]
@@ -142,6 +160,8 @@ impl Presenter {
                         HandoffKind::Cpu => Path::Cpu(CpuState::new()),
                         HandoffKind::VulkanSurface => Path::Gpu(Box::new(GpuState::new())),
                     };
+                    #[cfg(kms)]
+                    self.by_host.insert(host_xid, *id);
                     self.windows.insert(
                         *id,
                         Presented {
@@ -156,6 +176,8 @@ impl Presenter {
                 }
                 RootlessEvent::Unmapped { id } => {
                     if let Some(w) = self.windows.remove(id) {
+                        #[cfg(kms)]
+                        self.by_host.retain(|_, at| at != id);
                         match w.path {
                             // The engine keeps the staging buffer until the copy finished.
                             Path::Cpu(mut cpu) => drop(cpu.take_in_flight()),
@@ -221,6 +243,9 @@ impl Presenter {
                         }
                     }
                 }
+                // The platform's: it holds the client buffers' idles.
+                #[cfg(kms)]
+                FrameEvent::DirectReleased { .. } => {}
                 FrameEvent::Released { id, seq, pixels } => {
                     if let Some(Presented {
                         path: Path::Cpu(cpu),
@@ -314,6 +339,53 @@ impl Presenter {
         }
     }
 
+    /// The CPU window whose backend window is `host_xid`, for direct
+    /// frames: whether it may take one now.
+    #[cfg(kms)]
+    pub(crate) fn direct_window(&self, host_xid: u32) -> Option<DirectWindow> {
+        let id = *self.by_host.get(&host_xid)?;
+        let w = self.windows.get(&id)?;
+        let Path::Cpu(cpu) = &w.path else {
+            return None;
+        };
+        Some(DirectWindow {
+            id,
+            host_xid,
+            readiness: w.frames.readiness(),
+            reading: cpu.in_flight(),
+        })
+    }
+
+    /// Whether `host_xid` is a top-level the presenter shows.
+    #[cfg(kms)]
+    pub(crate) fn shows(&self, host_xid: u32) -> bool {
+        self.by_host.contains_key(&host_xid)
+    }
+
+    /// A direct frame went to the host for `id`: the window waits for its
+    /// `Ready`, as after a CPU frame. The host shows a whole frame newer
+    /// than the backing, which is owed it: the backing's damage so far is
+    /// older than that frame and is acked, and the window is read back
+    /// again only once the backing is drawn (the frame settled into it, or
+    /// something drawn after), and then whole.
+    #[cfg(kms)]
+    pub(crate) fn direct_submitted(&mut self, store: &mut DrawableStore, id: ToplevelId) {
+        let Some(w) = self.windows.get_mut(&id) else {
+            return;
+        };
+        w.frames.wait_for_ready();
+        if let Path::Cpu(cpu) = &mut w.path {
+            cpu.direct_shown();
+            if let Some(snapshot) = cpu
+                .backing()
+                .and_then(|backing| store.peek_presentation_damage(backing))
+            {
+                store.ack_presentation_damage(snapshot);
+            }
+        }
+        self.progress += 1;
+    }
+
     /// Destroy what finished retiring; the host may free a native window
     /// whose surface went.
     pub(crate) fn poll_retiring(&mut self) {
@@ -359,7 +431,7 @@ impl Presenter {
 }
 
 /// Readback completion is polled (D6), as polled Present batches are.
-const READBACK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+pub(crate) const READBACK_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
 impl XBackend<SurfacePlatform> {
     /// Retirement polls at the loop head too (`before_block`).

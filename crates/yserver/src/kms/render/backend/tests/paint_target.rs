@@ -1207,7 +1207,7 @@ fn collect_fill_rects_for_inferiors_translates_root_to_top_level_child() {
 #[test]
 fn resolve_paint_target_unknown_xid_returns_none() {
     let b = KmsBackend::for_tests();
-    assert_eq!(b.resolve_paint_target(0xDEAD_BEEF), None);
+    assert_eq!(b.peek_paint_target(0xDEAD_BEEF), None);
 }
 
 /// Pixmap xid (not in `windows`) with no redirect →
@@ -1382,7 +1382,7 @@ fn shared_backing_draw_clip_takes_out_higher_siblings_and_shapes() {
         })
     };
     let clip_of = |xid| {
-        let t = b.resolve_paint_target(xid).expect("resolve");
+        let t = b.peek_paint_target(xid).expect("resolve");
         b.shared_backing_draw_clip(xid, &t).expect("narrowed")
     };
     let c = clip_of(0x200);

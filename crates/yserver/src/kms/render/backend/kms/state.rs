@@ -1594,6 +1594,10 @@ pub struct KmsBackendState {
     /// `GLX_EXT_texture_from_pixmap`.
     pub(in crate::kms::render::backend) dmabuf_export_supported: bool,
 
+    /// Whole-window presents owed to backings instead of copied, handed to
+    /// the rootless host as the clients' buffers (`direct_frames.rs`).
+    pub(in crate::kms::render::backend) direct_frames: super::direct_frames::DirectFrames,
+
     /// The rootless host this card-less server shows its top-levels on
     /// (`rootless.rs`); `None` on a card.
     pub(in crate::kms::render::backend) rootless: Option<super::rootless::RootlessKms>,

@@ -1,3 +1,4 @@
+use super::super::seam::Access;
 use crate::kms::{
     core::{GradientStop, KmsCore, PictureFilter, PictureRecord},
     cpu_types::{PictTransform, Rectangle16, Repeat},
@@ -26,11 +27,34 @@ use yserver_core::backend::{
 use yserver_protocol::x11::{RENDER_FMT_A1, RENDER_FMT_A8, RENDER_FMT_ARGB32, xfixes};
 
 impl<P: Platform> XBackend<P> {
-    /// Resolve a RENDER source / mask picture into what the engine samples.
-    ///
-    /// Takes `&self` because a picture on a WINDOW must go through
-    /// `resolve_paint_target`: see the `PictureRecord::Drawable` arm.
+    /// Resolve a RENDER source / mask picture into what the engine samples,
+    /// the drawable it wraps made current first
+    /// (`Platform::settle_for_access`, as [`Self::resolve_paint_target`]).
     pub(in crate::kms::render::backend) fn resolve_picture_for_render(
+        &mut self,
+        host_pic: u32,
+    ) -> Option<(
+        crate::kms::render::engine::ResolvedSource,
+        Repeat,
+        Option<PictTransform>,
+        bool, // component_alpha
+    )> {
+        if let Some(PictureRecord::Drawable { host_xid, .. }) = self.core.pictures.get(&host_pic) {
+            let host_xid = *host_xid;
+            let backing = self
+                .peek_paint_target(host_xid)
+                .map(crate::kms::render::target::PaintTarget::backing_id);
+            P::settle_for_access(self, host_xid, backing, Access::Read);
+        }
+        self.peek_picture_for_render(host_pic)
+    }
+
+    /// [`Self::resolve_picture_for_render`] without making the drawable
+    /// current.
+    ///
+    /// A picture on a WINDOW goes through `peek_paint_target`: see the
+    /// `PictureRecord::Drawable` arm.
+    pub(in crate::kms::render::backend) fn peek_picture_for_render(
         &self,
         host_pic: u32,
     ) -> Option<(
@@ -87,7 +111,7 @@ impl<P: Platform> XBackend<P> {
                 // routing they had.
                 let source = match self.windows.get(host_xid) {
                     Some(g) => {
-                        let target = self.resolve_paint_target(*host_xid)?;
+                        let target = self.peek_paint_target(*host_xid)?;
                         SourceDrawable::content(
                             target.backing_id(),
                             target.offset(),
@@ -599,7 +623,7 @@ impl<P: Platform> XBackend<P> {
         area: Option<vk::Rect2D>,
     ) -> Option<u32> {
         let geom = *self.windows.get(&host_xid)?;
-        let target = self.resolve_paint_target(host_xid)?;
+        let target = self.resolve_paint_source(host_xid)?;
         let whole = vk::Rect2D {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D {
@@ -660,6 +684,7 @@ impl<P: Platform> XBackend<P> {
         };
         copy(self, target, (0, 0), content);
         for piece in pieces {
+            self.settle_target(piece.window, piece.target, Access::Read);
             for r in &piece.rects {
                 copy(self, piece.target, piece.origin, *r);
             }

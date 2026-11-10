@@ -19,7 +19,7 @@ use crate::kms::{
 use std::io;
 use yserver_core::host_x11::HostSubwindowConfig;
 
-use super::super::seam::{ResizeFault, resize_fault};
+use super::super::seam::{Access, ResizeFault, resize_fault};
 
 /// Placeholder xids of root/COW storage a resize prepared; no client xid
 /// has the top bits set.
@@ -426,7 +426,46 @@ impl<P: Platform> XBackend<P> {
     /// per-op walk; tree depth bounds cost (typically ≤ 4 for
     /// real apps). Cached-ancestry alternative deferred to
     /// Stage 5 if profiling shows it.
-    pub(crate) fn resolve_paint_target(&self, host_xid: u32) -> Option<PaintTarget> {
+    ///
+    /// This is where every draw finds its destination, so its storage is
+    /// made current first (`Platform::settle_for_access`): a platform that
+    /// left a backing owed a frame copies it in before the draw, in request
+    /// order. A read resolves through [`Self::resolve_paint_source`]; what
+    /// only looks at the target and touches no pixels uses
+    /// [`Self::peek_paint_target`].
+    pub(crate) fn resolve_paint_target(&mut self, host_xid: u32) -> Option<PaintTarget> {
+        self.resolve_for(host_xid, Access::Write)
+    }
+
+    /// [`Self::resolve_paint_target`] for a read of `host_xid`'s pixels.
+    pub(crate) fn resolve_paint_source(&mut self, host_xid: u32) -> Option<PaintTarget> {
+        self.resolve_for(host_xid, Access::Read)
+    }
+
+    fn resolve_for(&mut self, host_xid: u32, access: Access) -> Option<PaintTarget> {
+        let target = self.peek_paint_target(host_xid);
+        P::settle_for_access(self, host_xid, target.map(PaintTarget::backing_id), access);
+        target
+    }
+
+    /// Make `target`, a target of `host_xid` found by
+    /// [`Self::peek_paint_target`] (an inferior's), current before
+    /// `access`.
+    pub(crate) fn settle_target(&mut self, host_xid: u32, target: PaintTarget, access: Access) {
+        P::settle_for_access(self, host_xid, Some(target.backing_id()), access);
+    }
+
+    /// Make the storage of the drawable `host_xid` current before a read
+    /// or write of it by its XID, outside the resolver: a tile, a
+    /// background or border pixmap, a cursor's source, a gravity carry.
+    pub(crate) fn settle_drawable(&mut self, host_xid: u32, access: Access) {
+        P::settle_for_access(self, host_xid, None, access);
+    }
+
+    /// [`Self::resolve_paint_target`] without making the storage current:
+    /// for what reads no pixels and draws none (eligibility checks, where a
+    /// completion is attached, which backing a window has).
+    pub(crate) fn peek_paint_target(&self, host_xid: u32) -> Option<PaintTarget> {
         let leaf_id = self.store.lookup(host_xid);
         let leaf_depth = self
             .windows
@@ -799,7 +838,7 @@ impl<P: Platform> XBackend<P> {
         {
             return None;
         }
-        let target = self.resolve_paint_target(host_xid)?;
+        let target = self.peek_paint_target(host_xid)?;
         if Some(target.backing_id()) == leaf {
             return None;
         }
@@ -974,7 +1013,7 @@ impl<P: Platform> XBackend<P> {
                         {
                             return None;
                         }
-                        let sibling_target = self.resolve_paint_target(*sibling_host_xid)?;
+                        let sibling_target = self.peek_paint_target(*sibling_host_xid)?;
                         (sibling_target.backing_id() == dst_target.backing_id()).then_some((
                             sibling_geom.stack_rank,
                             ash::vk::Rect2D {

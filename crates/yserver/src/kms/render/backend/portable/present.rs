@@ -256,7 +256,7 @@ impl<P: Platform> XBackend<P> {
         // A shared backing may also match another writer's op when this
         // copy clipped to nothing; harmless, the signal still follows it.
         let completion_target = self
-            .resolve_paint_target(dst_host_xid)
+            .peek_paint_target(dst_host_xid)
             .map(PaintTarget::backing_id);
 
         // Phase A: close any open render batch FIRST so its CBs land
