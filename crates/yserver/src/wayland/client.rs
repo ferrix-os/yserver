@@ -12,7 +12,7 @@
 //! pointer motion it belongs to.
 //!
 //! The globals only one part of the host uses (the relative pointer, the
-//! pointer constraints, data control) are that part's to bind, with
+//! pointer constraints, data control, dmabuf) are that part's to bind, with
 //! [`Client::bind`]; their events come back as [`Event`]s too.
 
 use std::{
@@ -53,6 +53,10 @@ use wayland_protocols::{
         cursor_shape::v1::client::{
             wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
             wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+        },
+        linux_dmabuf::zv1::client::{
+            zwp_linux_buffer_params_v1::{self, ZwpLinuxBufferParamsV1},
+            zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1},
         },
         pointer_constraints::zv1::client::{
             zwp_locked_pointer_v1::{self, ZwpLockedPointerV1},
@@ -249,6 +253,24 @@ pub(super) enum ClipboardEvent {
     Cancelled(ExtDataControlSourceV1),
 }
 
+/// What the dmabuf objects said ([`super::direct`]).
+#[derive(Debug)]
+pub(super) enum DirectEvent {
+    /// `zwp_linux_dmabuf_v1.modifier`: the compositor takes `format` laid
+    /// out as `modifier`.
+    Modifier { format: u32, modifier: u64 },
+    /// `zwp_linux_buffer_params_v1.created`: the compositor's buffer for
+    /// what `params` described.
+    Created {
+        params: ZwpLinuxBufferParamsV1,
+        buffer: WlBuffer,
+    },
+    /// `zwp_linux_buffer_params_v1.failed`: it cannot use that buffer.
+    Failed(ZwpLinuxBufferParamsV1),
+    /// The compositor no longer reads a client's buffer.
+    Released(WlBuffer),
+}
+
 /// What happened on the connection, for the host.
 #[derive(Debug)]
 pub(super) enum Event {
@@ -280,6 +302,7 @@ pub(super) enum Event {
         locked: bool,
     },
     Clipboard(ClipboardEvent),
+    Direct(DirectEvent),
 }
 
 /// What a `wl_surface` of the host's is.
@@ -295,6 +318,8 @@ enum BufferData {
     /// One of a window's `wl_shm` buffers.
     Window(SurfaceId),
     Cursor,
+    /// A client's buffer, made by `zwp_linux_buffer_params_v1`.
+    Direct,
 }
 
 /// Memory shared with the compositor: a memfd, mapped.
@@ -1110,6 +1135,29 @@ impl Client {
             damage_buffer(&state.surface, (x, y, width, height));
         }
         Ok(true)
+    }
+
+    /// Attach a buffer that is not one of the surface's own (a client's
+    /// dma-buf, [`super::direct`]) and damage all of it, `width` × `height`;
+    /// [`Client::commit_frame`] shows it. Nothing before the first
+    /// [`Event::Configure`]; whether it was attached.
+    pub(super) fn attach(
+        &self,
+        surface: SurfaceId,
+        buffer: &WlBuffer,
+        (width, height): (u32, u32),
+    ) -> bool {
+        let Some(state) = self
+            .state
+            .surfaces
+            .get(&surface)
+            .filter(|state| state.configured.is_some())
+        else {
+            return false;
+        };
+        state.surface.attach(Some(buffer), 0, 0);
+        damage_buffer(&state.surface, (0, 0, width, height));
+        true
     }
 
     /// Ask for an [`Event::Frame`] when the compositor next wants a frame
@@ -2004,6 +2052,9 @@ impl Dispatch<WlBuffer, BufferData> for State {
                 }
             }
             BufferData::Cursor => {}
+            BufferData::Direct => state
+                .pending
+                .push(Event::Direct(DirectEvent::Released(buffer.clone()))),
         }
     }
 }
@@ -2130,6 +2181,57 @@ impl Dispatch<ExtDataControlSourceV1, ()> for State {
     }
 }
 
+impl Dispatch<ZwpLinuxDmabufV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLinuxDmabufV1,
+        event: zwp_linux_dmabuf_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        // `format` alone (versions 1 and 2) names no layout, and a LINEAR
+        // buffer is sent only where `modifier` named LINEAR.
+        if let zwp_linux_dmabuf_v1::Event::Modifier {
+            format,
+            modifier_hi,
+            modifier_lo,
+        } = event
+        {
+            state.pending.push(Event::Direct(DirectEvent::Modifier {
+                format,
+                modifier: (u64::from(modifier_hi) << 32) | u64::from(modifier_lo),
+            }));
+        }
+    }
+}
+
+impl Dispatch<ZwpLinuxBufferParamsV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        params: &ZwpLinuxBufferParamsV1,
+        event: zwp_linux_buffer_params_v1::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let event = match event {
+            zwp_linux_buffer_params_v1::Event::Created { buffer } => DirectEvent::Created {
+                params: params.clone(),
+                buffer,
+            },
+            zwp_linux_buffer_params_v1::Event::Failed => DirectEvent::Failed(params.clone()),
+            _ => return,
+        };
+        state.pending.push(Event::Direct(event));
+    }
+
+    // The compositor's buffer is made by the event that names it.
+    event_created_child!(State, ZwpLinuxBufferParamsV1, [
+        zwp_linux_buffer_params_v1::EVT_CREATED_OPCODE => (WlBuffer, BufferData::Direct),
+    ]);
+}
+
 /// Objects whose events the host does not need.
 macro_rules! quiet {
     ($($interface:ty),* $(,)?) => {$(
@@ -2171,6 +2273,89 @@ impl Dispatch<WlSurface, SurfaceData> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+impl Client {
+    /// A client on `socket`, whose other end the test plays the
+    /// compositor on: nothing bound yet, the registry object 2.
+    pub(super) fn for_test(socket: std::os::unix::net::UnixStream) -> Self {
+        socket.set_nonblocking(true).expect("non-blocking");
+        let connection = Connection::from_socket(socket).expect("a connection");
+        let queue = connection.new_event_queue::<State>();
+        let qh = queue.handle();
+        let registry = connection.display().get_registry(&qh, ());
+        Self {
+            connection,
+            queue,
+            qh,
+            registry,
+            state: State::default(),
+            next_surface: 1,
+            unsent: Cell::new(false),
+        }
+    }
+
+    /// The configure handshake of `surface` done at `size`, as
+    /// [`Event::Configure`] leaves it.
+    pub(super) fn configure_for_test(&mut self, surface: SurfaceId, size: (u32, u32)) {
+        if let Some(state) = self.state.surfaces.get_mut(&surface) {
+            state.configured = Some(size);
+        }
+    }
+}
+
+/// The wire as the compositor sees it, for the host's tests.
+#[cfg(test)]
+pub(super) mod wire {
+    /// One message: the object, the opcode and its arguments.
+    pub(in crate::wayland) fn message(object: u32, opcode: u16, arguments: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(8 + arguments.len()).unwrap();
+        let mut out = object.to_ne_bytes().to_vec();
+        out.extend_from_slice(&((size << 16) | u32::from(opcode)).to_ne_bytes());
+        out.extend_from_slice(arguments);
+        out
+    }
+
+    /// `wl_registry.global` (the registry is object 2): `name`, `interface`
+    /// at `version`.
+    pub(in crate::wayland) fn global(name: u32, interface: &str, version: u32) -> Vec<u8> {
+        let mut arguments = name.to_ne_bytes().to_vec();
+        let length = u32::try_from(interface.len() + 1).unwrap();
+        arguments.extend_from_slice(&length.to_ne_bytes());
+        arguments.extend_from_slice(interface.as_bytes());
+        arguments.resize(arguments.len() + (4 - interface.len() % 4), 0);
+        arguments.extend_from_slice(&version.to_ne_bytes());
+        message(2, 0, &arguments)
+    }
+
+    /// The requests in `bytes`: each one's object, opcode and arguments.
+    pub(in crate::wayland) fn requests(bytes: &[u8]) -> Vec<(u32, u16, Vec<u8>)> {
+        let word = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
+        let (mut at, mut out) = (0, Vec::new());
+        while at + 8 <= bytes.len() {
+            let head = word(at + 4);
+            let size = usize::try_from(head >> 16).unwrap();
+            out.push((
+                word(at),
+                u16::try_from(head & 0xffff).unwrap(),
+                bytes[at + 8..at + size].to_vec(),
+            ));
+            at += size;
+        }
+        out
+    }
+
+    /// Everything the client sent since the last read.
+    pub(in crate::wayland) fn sent(
+        compositor: &mut std::os::unix::net::UnixStream,
+    ) -> Vec<(u32, u16, Vec<u8>)> {
+        use std::io::Read as _;
+        compositor.set_nonblocking(true).unwrap();
+        let mut bytes = Vec::new();
+        let _ = compositor.read_to_end(&mut bytes);
+        requests(&bytes)
     }
 }
 
@@ -2380,56 +2565,18 @@ mod tests {
         assert_eq!(u32::from_ne_bytes(buf[..4].try_into().unwrap()), 1);
     }
 
-    /// One message on the wire: the object, the opcode and its arguments.
-    fn message(object: u32, opcode: u16, arguments: &[u8]) -> Vec<u8> {
-        let size = u32::try_from(8 + arguments.len()).unwrap();
-        let mut out = object.to_ne_bytes().to_vec();
-        out.extend_from_slice(&((size << 16) | u32::from(opcode)).to_ne_bytes());
-        out.extend_from_slice(arguments);
-        out
-    }
-
-    /// The requests in `bytes`: each one's object and opcode.
-    fn requests(bytes: &[u8]) -> Vec<(u32, u16)> {
-        let word = |at: usize| u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap());
-        let (mut at, mut out) = (0, Vec::new());
-        while at + 8 <= bytes.len() {
-            let head = word(at + 4);
-            out.push((word(at), u16::try_from(head & 0xffff).unwrap()));
-            at += usize::try_from(head >> 16).unwrap();
-        }
-        out
-    }
-
     /// A seat that loses its pointer and keyboard and has them again: the
     /// old objects are released and new ones made, since the compositor
     /// sends nothing to one made before the capability came back. The
     /// pointer leaves the window it was on, and what was made on it goes.
     #[test]
     fn a_seat_device_lost_and_back_is_made_anew() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
+
+        use super::wire::{global, message, sent};
         let (host, mut compositor) = std::os::unix::net::UnixStream::pair().unwrap();
-        host.set_nonblocking(true).unwrap();
-        let connection = Connection::from_socket(host).unwrap();
-        let queue = connection.new_event_queue::<State>();
-        let qh = queue.handle();
-        let registry = connection.display().get_registry(&qh, ());
-        let mut client = Client {
-            connection,
-            queue,
-            qh,
-            registry,
-            state: State::default(),
-            next_surface: 1,
-            unsent: Cell::new(false),
-        };
-        // wl_registry.global: name 7, "wl_seat" (8 bytes with its NUL),
-        // version 8. The registry is object 2.
-        let mut global = 7u32.to_ne_bytes().to_vec();
-        global.extend_from_slice(&8u32.to_ne_bytes());
-        global.extend_from_slice(b"wl_seat\0");
-        global.extend_from_slice(&8u32.to_ne_bytes());
-        compositor.write_all(&message(2, 0, &global)).unwrap();
+        let mut client = Client::for_test(host);
+        compositor.write_all(&global(7, "wl_seat", 8)).unwrap();
         client.dispatch().unwrap();
         let seat = client.seat().expect("the seat is bound").id().protocol_id();
         let mut capabilities = |client: &mut Client, bits: u32| {
@@ -2485,11 +2632,9 @@ mod tests {
         assert_eq!(devices(&client), (Some(new_pointer), Some(new_keyboard)));
 
         client.flush().unwrap();
-        compositor.set_nonblocking(true).unwrap();
-        let mut sent = Vec::new();
-        let _ = compositor.read_to_end(&mut sent);
-        let sent: Vec<(u32, u16)> = requests(&sent)
+        let sent: Vec<(u32, u16)> = sent(&mut compositor)
             .into_iter()
+            .map(|(object, opcode, _)| (object, opcode))
             .filter(|(object, _)| [seat, pointer, keyboard].contains(object))
             .collect();
         assert_eq!(

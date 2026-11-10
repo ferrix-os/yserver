@@ -34,6 +34,12 @@
 //! changed since the last frame shown. A window is paced by its frame
 //! callbacks (`FrameEvent::Ready`).
 //!
+//! A window that presents a whole frame from a client's LINEAR DRI3 buffer
+//! (a game's swapchain) is handed that buffer instead, as a dma-buf
+//! ([`direct`]), where the compositor takes one: the frame is not copied
+//! into the window and read back. The next frame read back after one is
+//! damaged whole, since the compositor's last buffer was the client's.
+//!
 //! A top-level is shown without its X border, which the compositor's frame
 //! takes the place of, as a reparenting window manager's would: its native
 //! window is its content, the backing cropped by the border (and pointer
@@ -67,12 +73,13 @@ use crate::{
     kms::vk::device::VkContext,
     rootless::{
         display::{DisplayHost, HostKeymap, HostScreen, HostWork},
-        host::{CpuFrame, FrameEvent, HandoffKind, RootlessHost},
+        host::{CpuFrame, DirectBuffer, DirectFrame, FrameEvent, HandoffKind, RootlessHost},
     },
 };
 
 mod client;
 mod clipboard;
+mod direct;
 mod input;
 
 use client::{Client, Event, Placement, Rect, SurfaceId, ToplevelOptions};
@@ -113,6 +120,9 @@ struct Win {
     /// The window the compositor has as this window's parent
     /// (`xdg_toplevel.set_parent`).
     parent: Option<ToplevelId>,
+    /// The last commit attached a client's buffer (a direct frame): the
+    /// next frame read back is damaged whole.
+    direct_shown: bool,
 }
 
 /// The connection, what the compositor said about its screens, and the
@@ -125,6 +135,8 @@ pub(crate) struct WaylandHost {
     order: Vec<ToplevelId>,
     seat: input::Seat,
     clipboard: Option<clipboard::Clipboard>,
+    /// Direct frames; `None` when the compositor takes no dma-bufs.
+    direct: Option<direct::Direct>,
     /// What the compositor said, waiting for the core.
     work: HostWork,
     next_serial: u64,
@@ -149,6 +161,7 @@ impl WaylandHost {
         if clipboard.is_none() {
             log::warn!("wayland: the compositor has no ext_data_control_v1; no clipboard");
         }
+        let direct = direct::Direct::bind(&client);
         let mut seat = input::Seat::default();
         seat.bind(&client);
         let mut host = Self {
@@ -157,6 +170,7 @@ impl WaylandHost {
             order: Vec::new(),
             seat,
             clipboard,
+            direct,
             work: HostWork::default(),
             next_serial: 1,
             screen_said: None,
@@ -165,16 +179,19 @@ impl WaylandHost {
         for device in input::announcements() {
             host.work.input(device);
         }
-        if host.client.keymap().is_none() {
+        if host.client.keymap().is_none() || host.direct.is_some() {
             // The keymap comes after the seat's keyboard is made, which the
-            // first round trips only start.
+            // first round trips only start; the formats the compositor
+            // takes dma-bufs in, after the dma-buf global is bound.
             match host.client.roundtrip() {
                 Ok(events) => {
                     for event in events {
                         host.handle(event);
                     }
                 }
-                Err(error) => log::warn!("wayland: waiting for the keymap: {error}"),
+                Err(error) => {
+                    log::warn!("wayland: waiting for the keymap and dma-buf formats: {error}");
+                }
             }
         }
         host.screen_said = host.screen();
@@ -255,6 +272,11 @@ impl WaylandHost {
             Event::Clipboard(event) => {
                 if let Some(clipboard) = self.clipboard.as_mut() {
                     clipboard.event(event);
+                }
+            }
+            Event::Direct(event) => {
+                if let Some(direct) = self.direct.as_mut() {
+                    direct.event(event, &mut self.work);
                 }
             }
             other => log::debug!("wayland: {other:?}"),
@@ -436,6 +458,7 @@ impl WaylandHost {
                 dismissed: false,
                 placed: None,
                 parent: None,
+                direct_shown: false,
             },
         );
         self.order.push(id);
@@ -665,6 +688,9 @@ impl RootlessHost for WaylandHost {
         } = frame;
         let shown = self.windows.get(&id).filter(|win| win.configured);
         let surface = shown.and_then(|win| win.surface);
+        // After a client's buffer, the compositor's last buffer is not the
+        // one this frame's damage is counted from: all of it changed.
+        let whole = shown.is_some_and(|win| win.direct_shown);
         let border = shown.map_or(0, |win| usize::from(crop(&win.spec)));
         let (width, height) = (usize::from(width), usize::from(height));
         let (shown_w, shown_h) = (
@@ -681,7 +707,11 @@ impl RootlessHost for WaylandHost {
                 depth != 32,
                 |out| {
                     copy_cropped(&pixels, width, border, (shown_w, shown_h), out);
-                    Some(cropped_damage(&damage, border, (shown_w, shown_h)))
+                    Some(if whole {
+                        Vec::new()
+                    } else {
+                        cropped_damage(&damage, border, (shown_w, shown_h))
+                    })
                 },
             ) {
                 Ok(drawn) => {
@@ -696,6 +726,9 @@ impl RootlessHost for WaylandHost {
                 }
             }
         });
+        if delivered && let Some(win) = self.windows.get_mut(&id) {
+            win.direct_shown = false;
+        }
         let work = &mut self.work;
         if delivered {
             work.frame(FrameEvent::Delivered { id, seq });
@@ -766,6 +799,47 @@ impl RootlessHost for WaylandHost {
 
     fn set_cursor(&mut self, cursor: Option<&ActiveCursorImage>) {
         self.seat.set_cursor(&mut self.client, cursor);
+    }
+
+    /// Where the compositor named a LINEAR format for the depth.
+    fn takes_direct(&self, depth: u8) -> bool {
+        self.direct
+            .as_ref()
+            .is_some_and(|direct| direct.takes(depth))
+    }
+
+    fn import_direct(&mut self, buffer: DirectBuffer) {
+        if let Some(direct) = self.direct.as_mut() {
+            direct.import(&self.client, buffer);
+        }
+    }
+
+    /// A client's buffer as the window's next frame, where the window shows
+    /// all of it (a top-level with an X border shows less, cropped) at the
+    /// size the compositor has the window; otherwise declined, and read
+    /// back.
+    fn submit_direct(&mut self, frame: DirectFrame) -> bool {
+        let id = frame.id;
+        let Some(win) = self.windows.get(&id).filter(|win| win.configured) else {
+            return false;
+        };
+        let (Some(surface), Some(direct)) = (win.surface, self.direct.as_mut()) else {
+            return false;
+        };
+        if crop(&win.spec) != 0 || shown_size(&win.spec) != (frame.width, frame.height) {
+            return false;
+        }
+        let shown = direct.show(&self.client, surface, &frame);
+        if shown && let Some(win) = self.windows.get_mut(&id) {
+            win.direct_shown = true;
+        }
+        shown
+    }
+
+    fn forget_direct(&mut self, generations: &[u64]) {
+        if let Some(direct) = self.direct.as_mut() {
+            direct.forget(generations);
+        }
     }
 }
 
@@ -1292,5 +1366,253 @@ mod tests {
             border: 2,
         };
         assert_eq!(outer_size(&geometry), (104, 54));
+    }
+
+    /// A host on a compositor the test plays, with a shell, shared memory,
+    /// `zwp_linux_dmabuf_v1` at `version` (none at 0), and `dmabuf` events
+    /// on it once bound: `(opcode, arguments)`.
+    fn host_on(
+        version: u32,
+        dmabuf: &[(u16, Vec<u8>)],
+    ) -> (WaylandHost, std::os::unix::net::UnixStream) {
+        use std::io::Write as _;
+
+        use client::wire::{global, message, sent};
+        let (socket, mut compositor) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut client = Client::for_test(socket);
+        for (name, interface, version) in [
+            (1, "wl_compositor", 6),
+            (2, "wl_shm", 1),
+            (3, "xdg_wm_base", 3),
+            (4, "zwp_linux_dmabuf_v1", version),
+        ] {
+            if version > 0 {
+                compositor
+                    .write_all(&global(name, interface, version))
+                    .unwrap();
+            }
+        }
+        client.dispatch().unwrap();
+        let direct = direct::Direct::bind(&client);
+        if let Some(direct) = &direct {
+            for (opcode, arguments) in dmabuf {
+                compositor
+                    .write_all(&message(direct.dmabuf_for_test(), *opcode, arguments))
+                    .unwrap();
+            }
+        }
+        let mut host = WaylandHost {
+            client,
+            windows: HashMap::new(),
+            order: Vec::new(),
+            seat: input::Seat::default(),
+            clipboard: None,
+            direct,
+            work: HostWork::default(),
+            next_serial: 1,
+            screen_said: None,
+        };
+        host.dispatch(&mut HostWork::default()).unwrap();
+        host.client.flush().unwrap();
+        let _ = sent(&mut compositor);
+        (host, compositor)
+    }
+
+    /// `zwp_linux_dmabuf_v1.modifier` (opcode 1): `fourcc` laid out as
+    /// `modifier`.
+    fn modifier(fourcc: &[u8; 4], modifier: u64) -> (u16, Vec<u8>) {
+        let mut arguments = u32::from_le_bytes(*fourcc).to_ne_bytes().to_vec();
+        arguments.extend_from_slice(&u32::try_from(modifier >> 32).unwrap().to_ne_bytes());
+        arguments.extend_from_slice(&u32::try_from(modifier & 0xffff_ffff).unwrap().to_ne_bytes());
+        (1, arguments)
+    }
+
+    /// A host whose compositor takes LINEAR XRGB8888 dma-bufs.
+    fn host_with_dma_bufs() -> (WaylandHost, std::os::unix::net::UnixStream) {
+        host_on(3, &[modifier(b"XR24", 0)])
+    }
+
+    /// A configured 64×48 window shown with a border of `border`.
+    fn shown_window(host: &mut WaylandHost, raw: u64, border: u16) -> (ToplevelId, SurfaceId) {
+        let id = ToplevelId::fake(raw);
+        host.mapped(
+            id,
+            Spec {
+                kind: ToplevelKind::Managed,
+                geometry: Geometry {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 48,
+                    border,
+                },
+                info: WindowInfo::default(),
+            },
+        );
+        let surface = host.windows[&id].surface.expect("made");
+        host.client.configure_for_test(surface, (64, 48));
+        host.configured(surface, 64, 48);
+        (id, surface)
+    }
+
+    fn direct_frame(id: ToplevelId, generation: u64, width: u16) -> DirectFrame {
+        DirectFrame {
+            id,
+            generation,
+            width,
+            height: 48,
+        }
+    }
+
+    fn direct_buffer(generation: u64, depth: u8) -> DirectBuffer {
+        DirectBuffer {
+            generation,
+            width: 64,
+            height: 48,
+            offset: 0,
+            stride: 256,
+            depth,
+            fd: std::os::fd::OwnedFd::from(std::fs::File::open("/dev/null").unwrap()),
+        }
+    }
+
+    /// A direct frame goes only to a window that shows all of the buffer at
+    /// its size: not to a top-level whose X border its native window
+    /// leaves out, nor at another size. The frame read back after one is
+    /// damaged whole, since the compositor's last buffer was the client's;
+    /// the one after that by its own damage again.
+    #[test]
+    fn a_direct_frame_is_shown_whole_and_the_next_frame_read_back_is_damaged_whole() {
+        use std::io::Write as _;
+
+        use client::wire::{message, sent};
+        let (mut host, mut compositor) = host_with_dma_bufs();
+        let (bordered, _) = shown_window(&mut host, 0x40_0001, 2);
+        let (id, surface) = shown_window(&mut host, 0x40_0002, 0);
+        host.client.flush().unwrap();
+        let _ = sent(&mut compositor);
+
+        assert!(host.takes_direct(24));
+        host.import_direct(direct_buffer(1, 24));
+        assert!(!host.submit_direct(direct_frame(id, 1, 64)), "not made yet");
+        let params = host
+            .direct
+            .as_ref()
+            .and_then(|direct| direct.asked_for_test(1))
+            .expect("asked for");
+        compositor
+            .write_all(&message(params, 0, &0xff00_0000u32.to_ne_bytes()))
+            .unwrap();
+        host.dispatch(&mut HostWork::default()).unwrap();
+        assert!(!host.submit_direct(direct_frame(bordered, 1, 64)));
+        assert!(!host.submit_direct(direct_frame(id, 1, 32)));
+        host.client.flush().unwrap();
+        let sent_now = sent(&mut compositor);
+        assert!(
+            sent_now.iter().all(|(_, opcode, _)| *opcode != 6),
+            "nothing committed for them: {sent_now:?}"
+        );
+        assert!(host.submit_direct(direct_frame(id, 1, 64)));
+        host.client.flush().unwrap();
+        let _ = sent(&mut compositor);
+
+        let window = wayland_client::Proxy::id(host.client.surface(surface).unwrap()).protocol_id();
+        let damage_of =
+            |host: &mut WaylandHost, compositor: &mut std::os::unix::net::UnixStream, seq| {
+                host.submit_cpu(CpuFrame {
+                    id,
+                    seq: crate::rootless::host::FrameSeq(seq),
+                    backing_gen: 1,
+                    width: 64,
+                    height: 48,
+                    stride: 256,
+                    depth: 24,
+                    pixels: vec![0; 64 * 48 * 4],
+                    damage: vec![yserver_core::rootless::Rect {
+                        x: 1,
+                        y: 2,
+                        width: 3,
+                        height: 4,
+                    }],
+                });
+                host.client.flush().unwrap();
+                sent(compositor)
+                    .into_iter()
+                    .filter(|(object, opcode, _)| (*object, *opcode) == (window, 9))
+                    .map(|(_, _, arguments)| {
+                        arguments
+                            .chunks_exact(4)
+                            .map(|word| u32::from_ne_bytes(word.try_into().unwrap()))
+                            .collect::<Vec<u32>>()
+                    })
+                    .collect::<Vec<_>>()
+            };
+        assert_eq!(
+            damage_of(&mut host, &mut compositor, 1),
+            [vec![0, 0, 64, 48]]
+        );
+        assert_eq!(damage_of(&mut host, &mut compositor, 2), [vec![1, 2, 3, 4]]);
+    }
+
+    /// A compositor whose `zwp_linux_dmabuf_v1` is below version 3 names no
+    /// modifiers: no direct frames, and windows are read back as ever.
+    #[test]
+    fn a_dma_buf_global_below_version_3_takes_no_direct_frames() {
+        use client::wire::sent;
+        let (mut host, mut compositor) = host_on(2, &[modifier(b"XR24", 0)]);
+        assert!(host.direct.is_none());
+        assert!(!host.takes_direct(24) && !host.takes_direct(32));
+        let (id, surface) = shown_window(&mut host, 0x40_0001, 0);
+        host.client.flush().unwrap();
+        let _ = sent(&mut compositor);
+        host.submit_cpu(CpuFrame {
+            id,
+            seq: crate::rootless::host::FrameSeq(1),
+            backing_gen: 1,
+            width: 64,
+            height: 48,
+            stride: 256,
+            depth: 24,
+            pixels: vec![0; 64 * 48 * 4],
+            damage: Vec::new(),
+        });
+        host.client.flush().unwrap();
+        let window = wayland_client::Proxy::id(host.client.surface(surface).unwrap()).protocol_id();
+        assert!(
+            sent(&mut compositor)
+                .iter()
+                .any(|(object, opcode, _)| (*object, *opcode) == (window, 6)),
+            "the frame read back is committed"
+        );
+    }
+
+    /// A compositor that names formats with `format` alone (no layout), or
+    /// XRGB8888 and ARGB8888 only tiled, takes no direct frames; one that
+    /// names ARGB8888 LINEAR takes them at depth 32 alone, and a buffer of
+    /// the other depth is refused without a request.
+    #[test]
+    fn only_a_format_the_compositor_named_linear_takes_direct_frames() {
+        use client::wire::sent;
+        const TILED: u64 = 0x0100_0000_0000_0001;
+        let format = (0, u32::from_le_bytes(*b"XR24").to_ne_bytes().to_vec());
+        let (host, _) = host_on(
+            3,
+            &[
+                format,
+                modifier(b"XR24", TILED),
+                modifier(b"AR24", TILED),
+                modifier(b"AB24", 0),
+            ],
+        );
+        assert!(host.direct.is_some());
+        assert!(!host.takes_direct(24) && !host.takes_direct(32));
+
+        let (mut host, mut compositor) = host_on(3, &[modifier(b"AR24", 0)]);
+        assert!(host.takes_direct(32) && !host.takes_direct(24));
+        host.import_direct(direct_buffer(1, 24));
+        host.client.flush().unwrap();
+        assert!(sent(&mut compositor).is_empty(), "nothing asked for");
+        let (id, _) = shown_window(&mut host, 0x40_0001, 0);
+        assert!(!host.submit_direct(direct_frame(id, 1, 64)));
     }
 }
