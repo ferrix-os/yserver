@@ -28,13 +28,15 @@
 //!    comes from the machine's `SessionClientEstablished` event — see
 //!    [`XdmcpService::note_client_established`].
 
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     io::{self, ErrorKind},
     net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket},
-    os::fd::AsRawFd,
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
 use mio::{Interest, unix::SourceFd};
 use yserver_protocol::{
     x11::ClientId,
@@ -255,9 +257,21 @@ impl XdmcpService {
     }
 
     /// Register the socket with the core poller.
+    #[cfg(unix)]
     pub fn register(&self, registry: &mio::Registry) -> io::Result<()> {
         let fd = self.socket.as_raw_fd();
         registry.register(&mut SourceFd(&fd), XDMCP_TOKEN, Interest::READABLE)
+    }
+
+    /// TODO(windows): mio cannot watch a borrowed socket there; the UDP
+    /// socket has to become mio's own first.
+    #[cfg(windows)]
+    #[allow(clippy::unused_self)]
+    pub fn register(&self, _registry: &mio::Registry) -> io::Result<()> {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "XDMCP is unsupported on Windows",
+        ))
     }
 
     /// `XdmcpInit` (`xdmcp.c:600`): send the first query.
@@ -567,9 +581,8 @@ fn describe(message: &XdmcpMessage) -> &'static str {
 
 /// Resolve a host (or literal address) to one IPv4 socket address.
 ///
-/// IPv6 is out of scope for the whole XDMCP stage, consistent with the
-/// IPv4-only listener from stage 1, so an AAAA-only host is a startup
-/// error rather than a silent no-op.
+/// IPv6 is out of scope for the whole XDMCP stage, so an AAAA-only host is
+/// a startup error rather than a silent no-op.
 fn resolve_ipv4(host: &str, port: u16) -> io::Result<SocketAddr> {
     let mut last_err = None;
     // `to_socket_addrs` needs a port; a bare literal address gets one here.
@@ -624,6 +637,11 @@ mod tests {
         auth::{AuthTransport, AuthVerdict},
     };
 
+    const TCP_PEER: crate::peer::PeerIdentity = crate::peer::PeerIdentity {
+        transport: AuthTransport::Tcp,
+        addr: None,
+        cred: None,
+    };
     const COOKIE: &[u8] = b"\x01\x02\x03\x04";
     const OTHER_COOKIE: &[u8] = b"\x09\x09\x09\x09";
     const SESSION: u32 = 0xfeed_face;
@@ -734,6 +752,19 @@ mod tests {
         generations: GenerationCounter,
     }
 
+    /// Block until the service socket holds a datagram. A datagram just
+    /// sent over loopback is not readable at once on every OS (FreeBSD),
+    /// so reading straight away would race the test's own send.
+    fn await_datagram(service: &XdmcpService) {
+        let socket = &service.socket;
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = socket.peek_from(&mut [0_u8; 1]);
+        socket.set_nonblocking(true).unwrap();
+    }
+
     impl Harness {
         /// Bind, start, and consume the first query. The returned harness
         /// is in `CollectQuery` with the manager knowing where to reply.
@@ -758,6 +789,7 @@ mod tests {
         }
 
         fn pump(&mut self) {
+            await_datagram(&self.service);
             let generation = self.now();
             self.service.handle_readable(&self.auth, generation);
         }
@@ -773,12 +805,8 @@ mod tests {
         }
 
         fn tcp_verdict(&self, cookie: &[u8]) -> AuthVerdict {
-            self.auth.check(
-                AuthTransport::Tcp,
-                self.now(),
-                b"MIT-MAGIC-COOKIE-1",
-                cookie,
-            )
+            self.auth
+                .check(&TCP_PEER, self.now(), b"MIT-MAGIC-COOKIE-1", cookie)
         }
     }
 
@@ -861,7 +889,7 @@ mod tests {
         assert!(matches!(h.tcp_verdict(COOKIE), AuthVerdict::Reject(_)));
         assert_eq!(
             h.auth
-                .check(AuthTransport::Tcp, previous, b"MIT-MAGIC-COOKIE-1", COOKIE),
+                .check(&TCP_PEER, previous, b"MIT-MAGIC-COOKIE-1", COOKIE),
             AuthVerdict::Allow,
             "the cookie was cleared rather than invalidated by generation"
         );
@@ -1041,12 +1069,14 @@ mod tests {
                 status: b"no".to_vec(),
             },
         );
+        await_datagram(&service);
         service.handle_readable(&auth, Generation::default());
         assert_eq!(service.state(), XdmcpState::CollectBroadcastQuery);
         assert_eq!(service.take_outcome(), None);
 
         let willing_manager = FakeManager::new();
         willing_manager.send(display, &willing());
+        await_datagram(&service);
         service.handle_readable(&auth, Generation::default());
         assert_eq!(service.state(), XdmcpState::AwaitRequestResponse);
         let (request, _) = willing_manager.expect("Request");

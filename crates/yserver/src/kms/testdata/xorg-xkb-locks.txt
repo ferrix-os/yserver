@@ -1,0 +1,473 @@
+# Xorg's XKB lock state across keymap reloads, and its state/indicator notifies (issue #253):
+# Xvfb -noreset, fresh server per case, layout=gb
+# server: X.Org version 21.1.25 (xdpyinfo); `Xvfb -version` -> "Unrecognized option: -version" (not supported by this build)
+# pacman -Q: xkeyboard-config 2.48-1 xorg-server-xvfb 21.1.25-1
+# each case: setxkbmap -rules evdev -model pc105 -layout gb; then tools/xkb-mutation-probe.c
+# -s DETAILS with the case's steps: lock:AFFECT:MODS = XkbLockModifiers, lockgroup:N =
+# XkbLockGroup, down/up = XTEST, 'run:setxkbmap ... -layout L' = a reload (XkbGetKbdByName),
+# xreq:FILE = that recorded request, state = GetState + GetIndicatorState (Xorg's GetState
+# leaves grab/lookup 0). 'e xkb' is a listener selecting everything, 'e xkbs' one selecting
+# only StateNotify with DETAILS. The probe's per-key map diff and coremodmap lines are
+# filtered out. In raw event hex the sequence number (bytes 2-3) and time (4-7) differ
+# between runs.
+## case reload-numlock-lockmods: -s 08: NumLock locked by request, reload to de, then Caps Lock pressed and released
+> lock:10:10
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=55020900a70f1e17031000001000000000000010101010100000091f00008705
+e xkb IndicatorStateNotify dev=3 state=0x00000002 changed=0x00000002 raw=55040900a70f1e17030000000200000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b0900a70f1e170300100000000000ff3f00000200000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=55020500a70f1e17031000001000000000000010101010100000091f00008705
+> state
+= state mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=55000f00bc0f1e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f00bc0f1e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f00bc0f1e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220003000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200030000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55001500be0f1e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x12 base=0x02 latched=0x00 locked=0x12 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x12 grab=0x12 compatGrab=0x12 lookup=0x12 compatLookup=0x12 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=55021500be0f1e170312020012000000000000121212121200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000003 changed=0x00000001 raw=55041500be0f1e17030000000300000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b1500be0f1e170300100000000000ff3f00000300000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x12 base=0x02 latched=0x00 locked=0x12 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x12 grab=0x12 compatGrab=0x12 lookup=0x12 compatLookup=0x12 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=55020700be0f1e170312020012000000000000121212121200000b1f42020000
+e core MappingNotify request=1 first=8 count=248 raw=220004000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200040000000000000000000000000000000000000000000000000000000000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x12 base=0x00 latched=0x00 locked=0x12 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x12 grab=0x12 compatGrab=0x12 lookup=0x12 compatLookup=0x12 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55021900bf0f1e17031200001200000000000012121212120000020042030000
+> state
+= state mods=0x12 base=0x00 latched=0x00 locked=0x12 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x12 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000003
+## case reload-numlock-lockmods-same: -s 08: NumLock locked by request, reload to the same layout
+> lock:10:10
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=5502090017101e17031000001000000000000010101010100000091f00008705
+e xkb IndicatorStateNotify dev=3 state=0x00000002 changed=0x00000002 raw=5504090017101e17030000000200000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b090017101e170300100000000000ff3f00000200000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=5502050017101e17031000001000000000000010101010100000091f00008705
+> state
+= state mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout gb
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=55000f0023101e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f0023101e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f0023101e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220003000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200030000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+## case reload-capslock-lockmods: -s 08: Caps Lock locked by request, reload to de, then its key unlocks
+> lock:02:02
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=5502090075101e17030200000200000000000002020202020000091f00008705
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=5504090075101e17030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b090075101e170300100000000000ff3f00000100000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=5502050075101e17030200000200000000000002020202020000091f00008705
+> state
+= state mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=55000f0089101e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f0089101e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f0089101e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220003000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200030000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=550015008a101e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=2 req=0.0 raw=550215008a101e17030202000200000000000002020202020000020042020000
+e core MappingNotify request=1 first=8 count=248 raw=220004000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200040000000000000000000000000000000000000000000000000000000000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=550219008a101e170300000000000000000000000000000000000b1f42030000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000001 raw=550419008a101e17030000000000000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b19008a101e170300100000000000ff3f00000000000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=550208008a101e170300000000000000000000000000000000000b1f42030000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+## case reload-numlock-key: -s 08: NumLock locked by its key, reload, then the key unlocks
+> down:77
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000900dc101e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=2 req=0.0 raw=55020900dc101e170310100010000000000000101010101000000b1f4d020000
+e xkb IndicatorStateNotify dev=3 state=0x00000002 changed=0x00000002 raw=55040900dc101e17030000000200000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b0900dc101e170300100000000000ff3f00000200000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=2 req=0.0 raw=55020500dc101e170310100010000000000000101010101000000b1f4d020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> up:77
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x0002 keycode=77 eventType=3 req=0.0 raw=55020d00dc101e1703100000100000000000001010101010000002004d030000
+> state
+= state mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=55001300ea101e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55001300ea101e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55001300ea101e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220004000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200040000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+> down:77
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x0002 keycode=77 eventType=2 req=0.0 raw=55021900eb101e1703101000100000000000001010101010000002004d020000
+> up:77
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=3 req=0.0 raw=55021d00ec101e170300000000000000000000000000000000000b1f4d030000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000002 raw=55041d00ec101e17030000000000000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b1d00ec101e170300100000000000ff3f00000000000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=3 req=0.0 raw=55020900ec101e170300000000000000000000000000000000000b1f4d030000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+## case reload-capslock-key: -s 08: Caps Lock locked by its key, reload, then the key unlocks
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500090037111e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=5502090037111e170302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=5504090037111e17030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b090037111e170300100000000000ff3f00000100000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=5502050037111e170302020002000000000000020202020200000b1f42020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55020d0038111e17030200000200000000000002020202020000020042030000
+> state
+= state mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=550013004b111e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=550013004b111e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=550013004b111e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220004000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200040000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+> down:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=2 req=0.0 raw=550219004d111e17030202000200000000000002020202020000020042020000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=55021d004e111e170300000000000000000000000000000000000b1f42030000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000001 raw=55041d004e111e17030000000000000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b1d004e111e170300100000000000ff3f00000000000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=550209004e111e170300000000000000000000000000000000000b1f42030000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+## case reload-numlock-held: -s 08: NumLock key held (its press locked) across the reload, then released
+> down:77
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000900a9111e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=2 req=0.0 raw=55020900a9111e170310100010000000000000101010101000000b1f4d020000
+e xkb IndicatorStateNotify dev=3 state=0x00000002 changed=0x00000002 raw=55040900a9111e17030000000200000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b0900a9111e170300100000000000ff3f00000200000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=2 req=0.0 raw=55020500a9111e170310100010000000000000101010101000000b1f4d020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=55000f00cf111e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f00cf111e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f00cf111e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220003000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200030000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+> up:77
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x0002 keycode=77 eventType=3 req=0.0 raw=55021500d1111e1703100000100000000000001010101010000002004d030000
+> state
+= state mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+## case reload-numlock-held-unlocking: -s 08: NumLock locked, its key pressed again and held across the reload, then released
+> down:77
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500090039121e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=2 req=0.0 raw=5502090039121e170310100010000000000000101010101000000b1f4d020000
+e xkb IndicatorStateNotify dev=3 state=0x00000002 changed=0x00000002 raw=5504090039121e17030000000200000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b090039121e170300100000000000ff3f00000200000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=2 req=0.0 raw=5502050039121e170310100010000000000000101010101000000b1f4d020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> up:77
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x0002 keycode=77 eventType=3 req=0.0 raw=55020d003b121e1703100000100000000000001010101010000002004d030000
+> down:77
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x0002 keycode=77 eventType=2 req=0.0 raw=550211003d121e1703101000100000000000001010101010000002004d020000
+> state
+= state mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=5500170056121e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500170056121e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500170056121e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220005000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200050000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000002
+> up:77
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=3 req=0.0 raw=55021d0056121e170300000000000000000000000000000000000b1f4d030000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000002 raw=55041d0056121e17030000000000000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b1d0056121e170300100000000000ff3f00000000000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=3 req=0.0 raw=5502090056121e170300000000000000000000000000000000000b1f4d030000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+## case reload-capslock-held: -s 08: Caps Lock key held (its press locked) across the reload, then released
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=550009009e121e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=550209009e121e170302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=550409009e121e17030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b09009e121e170300100000000000ff3f00000100000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=550205009e121e170302020002000000000000020202020200000b1f42020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=55000f00af121e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f00af121e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000f00b0121e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220003000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200030000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55021500b0121e17030200000200000000000002020202020000020042030000
+> state
+= state mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+## case reload-capslock-held-unlocking: -s 08: Caps Lock locked, its key pressed again and held across the reload, then released
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500090006131e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=5502090006131e170302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=5504090006131e17030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b090006131e170300100000000000ff3f00000100000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=5502050006131e170302020002000000000000020202020200000b1f42020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55020d0007131e17030200000200000000000002020202020000020042030000
+> down:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=2 req=0.0 raw=5502110007131e17030202000200000000000002020202020000020042020000
+> state
+= state mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=5500170020131e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500170020131e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500170020131e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220005000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200050000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=55021d0021131e170300000000000000000000000000000000000b1f42030000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000001 raw=55041d0021131e17030000000000000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b1d0021131e170300100000000000ff3f00000000000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=5502090021131e170300000000000000000000000000000000000b1f42030000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+## case reload-group-lock: -s 08: group 2 locked, reload to two groups, then to one
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout gb,de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=55000900a3131e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000900a3131e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000900a3131e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> lockgroup:1
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=1 baseGroup=0 latchedGroup=0 lockedGroup=1 compat=0x80 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x80 ptrBtn=0x0000 changed=0x1190 keycode=0 eventType=0 req=135.5 raw=55020d00a5131e17030000000001000000000180000000800000901100008705
+e xkb IndicatorStateNotify dev=3 state=0x00001000 changed=0x00001000 raw=55040d00a5131e17030000000010000000100000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b0d00a5131e170300100000000000ff3f00000010000000001f0000000000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=1 baseGroup=0 latchedGroup=0 lockedGroup=1 compat=0x80 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00001000
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout us,ru
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=55001300c2131e17030308ff08ff871703000000400a00003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55001300c2131e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55001300c2131e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220004000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200040000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=1 baseGroup=0 latchedGroup=0 lockedGroup=1 compat=0x80 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00001000
+> run:setxkbmap -display :92 -rules evdev -model pc105 -layout de
+= exit=0
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.23 changed=0x0003 raw=55001900de131e17030308ff08ff871703000000400900003f00000000000040
+e xkb NewKeyboardNotify dev=5 oldDev=5 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55001900de131e17050508ff08ff870903000000000000000000000000000000
+e xkb NewKeyboardNotify dev=7 oldDev=7 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55001900de131e17070708ff08ff870903000000000000000000000000000000
+e core MappingNotify request=1 first=8 count=248 raw=220005000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200050000000000000000000000000000000000000000000000000000000000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=1 baseGroup=0 latchedGroup=0 lockedGroup=1 compat=0x80 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00001000
+## case key-caps-lockdetail: -s 08: Caps Lock pressed and released twice
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000b0028141e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=55020b0028141e170302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=55040b0028141e17030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b0b0028141e170300100000000000ff3f00000100000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=5502050028141e170302020002000000000000020202020200000b1f42020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55020f0029141e17030200000200000000000002020202020000020042030000
+> down:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=2 req=0.0 raw=5502130029141e17030202000200000000000002020202020000020042020000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=550217002a141e170300000000000000000000000000000000000b1f42030000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000001 raw=550417002a141e17030000000000000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b17002a141e170300100000000000ff3f00000000000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=550208002a141e170300000000000000000000000000000000000b1f42030000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+## case key-caps-basedetail: -s 02: Caps Lock pressed and released twice
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=550009007a141e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=550209007a141e170302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=550409007a141e17030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b09007a141e170300100000000000ff3f00000100000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=550205007a141e170302020002000000000000020202020200000b1f42020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55020d007b141e17030200000200000000000002020202020000020042030000
+e xkbs StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=550206007b141e17030200000200000000000002020202020000020042030000
+> down:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=2 req=0.0 raw=550211007d141e17030202000200000000000002020202020000020042020000
+e xkbs StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=2 req=0.0 raw=550207007d141e17030202000200000000000002020202020000020042020000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=550215007e141e170300000000000000000000000000000000000b1f42030000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000001 raw=550415007e141e17030000000000000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b15007e141e170300100000000000ff3f00000000000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=550208007e141e170300000000000000000000000000000000000b1f42030000
+## case key-shift-lockdetail: -s 08: Shift pressed and released
+> down:50
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=55000900d1141e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x01 base=0x01 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x01 grab=0x01 compatGrab=0x01 lookup=0x01 compatLookup=0x01 ptrBtn=0x0000 changed=0x1f03 keycode=50 eventType=2 req=0.0 raw=55020900d1141e17030101000000000000000001010101010000031f32020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> up:50
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f03 keycode=50 eventType=3 req=0.0 raw=55020d00d2141e17030000000000000000000000000000000000031f32030000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+## case key-shift-numlock: -s 08: NumLock pressed and released while Shift is held, then alone
+> down:50
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=550009001d151e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x01 base=0x01 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x01 grab=0x01 compatGrab=0x01 lookup=0x01 compatLookup=0x01 ptrBtn=0x0000 changed=0x1f03 keycode=50 eventType=2 req=0.0 raw=550209001d151e17030101000000000000000001010101010000031f32020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> down:77
+= ok
+e xkb StateNotify dev=3 mods=0x11 base=0x11 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x11 grab=0x11 compatGrab=0x11 lookup=0x11 compatLookup=0x11 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=2 req=0.0 raw=55020d001e151e170311110010000000000000111111111100000b1f4d020000
+e xkb IndicatorStateNotify dev=3 state=0x00000002 changed=0x00000002 raw=55040d001e151e17030000000200000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b0d001e151e170300100000000000ff3f00000200000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x11 base=0x11 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x11 grab=0x11 compatGrab=0x11 lookup=0x11 compatLookup=0x11 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=2 req=0.0 raw=550206001e151e170311110010000000000000111111111100000b1f4d020000
+> up:77
+= ok
+e xkb StateNotify dev=3 mods=0x11 base=0x01 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x11 grab=0x11 compatGrab=0x11 lookup=0x11 compatLookup=0x11 ptrBtn=0x0000 changed=0x0002 keycode=77 eventType=3 req=0.0 raw=550211001e151e1703110100100000000000001111111111000002004d030000
+> up:50
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f03 keycode=50 eventType=3 req=0.0 raw=550215001f151e17031000001000000000000010101010100000031f32030000
+> down:77
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x10 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x0002 keycode=77 eventType=2 req=0.0 raw=5502190020151e1703101000100000000000001010101010000002004d020000
+> up:77
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=3 req=0.0 raw=55021d0020151e170300000000000000000000000000000000000b1f4d030000
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000002 raw=55041d0020151e17030000000000000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b1d0020151e170300100000000000ff3f00000000000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=77 eventType=3 req=0.0 raw=55020a0020151e170300000000000000000000000000000000000b1f4d030000
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+## case lockmods-numlock: -s 01: NumLock locked, locked again (no change), unlocked
+> lock:10:10
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=5502090078151e17031000001000000000000010101010100000091f00008705
+e xkb IndicatorStateNotify dev=3 state=0x00000002 changed=0x00000002 raw=5504090078151e17030000000200000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b090078151e170300100000000000ff3f00000200000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=5502050078151e17031000001000000000000010101010100000091f00008705
+> lock:10:10
+= ok
+> lock:10:00
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=5502110079151e17030000000000000000000000000000000000091f00008705
+e xkb IndicatorStateNotify dev=3 state=0x00000000 changed=0x00000002 raw=5504110079151e17030000000000000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b110079151e170300100000000000ff3f00000000000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=5502070079151e17030000000000000000000000000000000000091f00008705
+> state
+= state mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000000
+## case lockmods-latchdetail: -s 04: NumLock then Caps Lock locked by request
+> lock:10:10
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=55020900d1151e17031000001000000000000010101010100000091f00008705
+e xkb IndicatorStateNotify dev=3 state=0x00000002 changed=0x00000002 raw=55040900d1151e17030000000200000002000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b0900d1151e170300100000000000ff3f00000200000000001f0000000000
+> lock:02:02
+= ok
+e xkb StateNotify dev=3 mods=0x12 base=0x00 latched=0x00 locked=0x12 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x12 grab=0x12 compatGrab=0x12 lookup=0x12 compatLookup=0x12 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=55020d00d2151e17031200001200000000000012121212120000091f00008705
+e xkb IndicatorStateNotify dev=3 state=0x00000003 changed=0x00000001 raw=55040d00d2151e17030000000300000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b0d00d2151e170300100000000000ff3f00000300000000001f0000000000
+> state
+= state mods=0x12 base=0x00 latched=0x00 locked=0x12 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x12 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000003
+## case indmaps-cleared: -s 08: Caps Lock locked, every indicator map cleared, then Caps Lock unlocked and NumLock locked
+> down:66
+= ok
+e xkb NewKeyboardNotify dev=3 oldDev=3 min=8 max=255 oldMin=8 oldMax=255 req=135.9 changed=0x0003 raw=5500090036161e17030308ff08ff870903000000000000000000000000000000
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=5502090036161e170302020002000000000000020202020200000b1f42020000
+e xkb IndicatorStateNotify dev=3 state=0x00000001 changed=0x00000001 raw=5504090036161e17030000000100000001000000000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b090036161e170300100000000000ff3f00000100000000001f0000000000
+e xkbs StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=2 req=0.0 raw=5502050036161e170302020002000000000000020202020200000b1f42020000
+e core MappingNotify request=1 first=8 count=248 raw=220002000108f800000000000000000000000000000000000000000000000000
+e core MappingNotify request=0 first=0 count=0 raw=2200020000000000000000000000000000000000000000000000000000000000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=3 req=0.0 raw=55020d0037161e17030200000200000000000002020202020000020042030000
+> xreq:xkb-setcompat/indmap-none-in-use.bin
+= ok
+e xkb IndicatorMapNotify dev=3 state=0x00000001 changed=0xffffffff raw=5505110037161e170300000001000000ffffffff000000000000000000000000
+e xkb xkbType=11 dev=3 raw=550b110037161e170300080000000000ff3f00000100000000001f0000000000
+> state
+= state mods=0x02 base=0x00 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001
+> down:66
+= ok
+e xkb StateNotify dev=3 mods=0x02 base=0x02 latched=0x00 locked=0x02 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x02 grab=0x02 compatGrab=0x02 lookup=0x02 compatLookup=0x02 ptrBtn=0x0000 changed=0x0002 keycode=66 eventType=2 req=0.0 raw=5502170038161e17030202000200000000000002020202020000020042020000
+> up:66
+= ok
+e xkb StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=55021b0038161e170300000000000000000000000000000000000b1f42030000
+e xkbs StateNotify dev=3 mods=0x00 base=0x00 latched=0x00 locked=0x00 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x00 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 changed=0x1f0b keycode=66 eventType=3 req=0.0 raw=5502090038161e170300000000000000000000000000000000000b1f42030000
+> lock:10:10
+= ok
+e xkb StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=55021f0039161e17031000001000000000000010101010100000091f00008705
+e xkbs StateNotify dev=3 mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x10 compatGrab=0x10 lookup=0x10 compatLookup=0x10 ptrBtn=0x0000 changed=0x1f09 keycode=0 eventType=0 req=135.5 raw=55020a0039161e17031000001000000000000010101010100000091f00008705
+> state
+= state mods=0x10 base=0x00 latched=0x00 locked=0x10 group=0 baseGroup=0 latchedGroup=0 lockedGroup=0 compat=0x10 grab=0x00 compatGrab=0x00 lookup=0x00 compatLookup=0x00 ptrBtn=0x0000 indicators=0x00000001

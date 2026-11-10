@@ -8,8 +8,11 @@
 //! `CompOverlayClientRec` owned by the calling client
 //! (`composite/compoverlay.c`) and the resource system frees them all
 //! when that client goes away. We keep the equivalent list in
-//! [`ServerState::cow_claims`] and the backend counts nothing: it sees
-//! only the 0 → 1 materialize edge and the 1 → 0 teardown edge.
+//! [`ServerState::cow_claims`] and the backend counts nothing. Existence
+//! is separate, as in Xorg: the overlay exists while its core record does.
+//! GetOverlayWindow materializes it whenever the record is absent, and it
+//! is destroyed through a destroy plan, by the last release or by
+//! `DestroyWindow` / `DestroySubwindows`, which leave the claims alone.
 //!
 //! Two things in the tree carry confusingly similar names and are **not**
 //! this: `scene.root_overlay` / `root_overlay_on_disconnect`
@@ -20,12 +23,15 @@ use yserver_protocol::x11::ClientId;
 
 use crate::{
     backend::{Backend, OriginContext},
-    resources::COMPOSITE_OVERLAY_WINDOW,
+    core_loop::fanout::emit_window_event_to_state,
+    resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_WINDOW},
     server::ServerState,
 };
 
+const SUBSTRUCTURE_NOTIFY: u32 = 0x0008_0000;
+
 /// Ask the backend to materialize the overlay, then mirror it on the
-/// resources side. Called on the 0 → 1 claim edge only.
+/// resources side. Called only while no core COW record exists.
 ///
 /// The caller must have already recorded the claim, and must roll it
 /// back if this returns `Err` — a claim recorded against an overlay that
@@ -53,55 +59,81 @@ pub(crate) fn materialize_overlay(
         .materialize_cow_resource(crate::backend::WindowHandle::from_raw_panicking(
             cow_host_xid,
         ));
-    state.materialize_cow_input_shape();
+    // Xorg compCreateOverlayWindow (composite/compoverlay.c:125-141) is a
+    // CreateWindow and a MapWindow of an override-redirect root child, so
+    // root's SubstructureNotify listeners see CreateNotify then MapNotify.
+    // It has no input shape: it takes the pointer until the compositor
+    // empties its input region.
+    if let Some(geometry) =
+        state
+            .resources
+            .window(COMPOSITE_OVERLAY_WINDOW)
+            .map(|w| yserver_protocol::x11::Geometry {
+                root: ROOT_WINDOW,
+                x: w.x,
+                y: w.y,
+                width: w.width,
+                height: w.height,
+                border_width: w.border_width,
+                depth: w.depth,
+            })
+    {
+        let _dropped =
+            emit_window_event_to_state(state, ROOT_WINDOW, SUBSTRUCTURE_NOTIFY, |buf, seq, o| {
+                yserver_protocol::x11::encode_create_notify_event(
+                    buf,
+                    seq,
+                    o,
+                    ROOT_WINDOW,
+                    COMPOSITE_OVERLAY_WINDOW,
+                    geometry,
+                    true,
+                );
+            });
+        let _dropped =
+            emit_window_event_to_state(state, ROOT_WINDOW, SUBSTRUCTURE_NOTIFY, |buf, seq, o| {
+                yserver_protocol::x11::encode_map_notify_event(
+                    buf,
+                    seq,
+                    o,
+                    ROOT_WINDOW,
+                    COMPOSITE_OVERLAY_WINDOW,
+                    true,
+                );
+            });
+    }
     // The COW is now a core root child (capped on top); reproject the
     // backend top-level order from core so it enters the projection at
     // the top. Must run AFTER materialize_cow_resource — the backend COW
     // hook no longer pushes to top_level_order itself.
     backend.sync_top_level_order(state);
+    // The MapWindow ends in WindowsRestructured (`dix/window.c:2695`).
+    backend.windows_restructured(state);
     Ok(())
 }
 
-/// Tear the overlay down: backend first, then the resources-side mirror.
-///
-/// Called on the 1 → 0 claim edge only. Backend first is load-bearing:
-/// the claim is the thing keeping the overlay alive, so a caller must not
-/// drop the last claim unless this succeeded.
+/// Destroy the overlay on the last claim's release: plan, prepare,
+/// execute, as any destroy of the COW (Xorg `compDestroyOverlayWindow`,
+/// `composite/compoverlay.c:167-173`, frees it through `DeleteWindow`).
+/// A COW already destroyed by `DestroyWindow` / `DestroySubwindows` leaves
+/// nothing to do (`FreeResource` of a freed id, `dix/resource.c:906-924`).
 ///
 /// # Errors
 ///
-/// From the backend's teardown — on `KmsBackend` the
-/// `materialize_direct_shadow_for_unflip` allocation that has to succeed
-/// before a scanned-out buffer can be released.
+/// From the plan's preparation — on `KmsBackend` the unflip shadow that
+/// has to exist before a scanned-out buffer can be released. Nothing
+/// changed: the overlay is still up.
 pub(crate) fn teardown_overlay(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     origin: Option<OriginContext>,
 ) -> std::io::Result<()> {
-    if !backend.release_overlay_window(origin)? {
-        // Backend never materialized a COW (v1, ynest, trait default):
-        // nothing to mirror down either, because nothing ever reached
-        // `materialize_cow_resource`.
-        return Ok(());
-    }
-    // Xorg frees the overlay through DeleteWindow, so its Pictures die with it.
-    crate::core_loop::process_request::free_pictures_on_destroyed_windows(
+    crate::core_loop::process_request::destroy_window_subtree(
         state,
         backend,
         origin,
-        &[COMPOSITE_OVERLAY_WINDOW],
-    );
-    crate::core_loop::process_request::purge_present_for_destroyed_windows(
-        state,
-        backend,
-        &[COMPOSITE_OVERLAY_WINDOW],
-    );
-    state.resources.destroy_cow_resource();
-    state.destroy_cow_input_shape();
-    // The COW is no longer a core root child; reproject so it leaves the
-    // backend top-level order.
-    backend.sync_top_level_order(state);
-    Ok(())
+        COMPOSITE_OVERLAY_WINDOW,
+    )
 }
 
 /// Release **every** overlay claim held by `client`, and tear the overlay

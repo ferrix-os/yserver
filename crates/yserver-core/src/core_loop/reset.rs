@@ -15,8 +15,11 @@
 //!   with the generation counter, the setup registry, the loop-local
 //!   per-client collections and a freshly seeded `ServerState`.
 
-use std::{collections::VecDeque, os::fd::AsRawFd};
+use std::collections::VecDeque;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
+#[cfg(unix)]
 use mio::unix::SourceFd;
 use yserver_protocol::x11::ClientId;
 
@@ -27,6 +30,7 @@ use crate::{
         process_disconnect::{
             HostPixmapFrees, destroy_zombie_resources_reporting, process_disconnect_reporting,
         },
+        process_request::{install_default_font, reinstall_vidmode_gamma},
         run::{
             DeferredRequest, FairRequestQueue, LoopTelemetry, PendingBackendRequests,
             cancel_all_pending_backend_requests,
@@ -224,7 +228,13 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
         // entry reads as DestroyAll.
         state.close_down_modes.remove(&id);
         process_disconnect_reporting(state, backend, ClientId(id), Some(&mut frees));
+        // A teardown that could not complete stops the forced one too; the
+        // boundary then refuses (step 5) and the server shuts down.
+        if state.fatal_teardown.is_some() {
+            return;
+        }
     }
+    backend.note_client_count(state.counted_clients());
 
     // Zombies parked by *earlier* disconnects in this session. They have no
     // `state.clients` entry, so the loop above never reaches them; their
@@ -232,7 +242,11 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
     let mut zombies: Vec<u32> = state.zombie_clients.keys().copied().collect();
     zombies.sort_unstable();
     for id in zombies {
-        destroy_zombie_resources_reporting(state, backend, ClientId(id), Some(&mut frees));
+        if destroy_zombie_resources_reporting(state, backend, ClientId(id), Some(&mut frees))
+            .is_err()
+        {
+            return;
+        }
     }
     state.zombie_clients.clear();
     state.close_down_modes.clear();
@@ -241,9 +255,8 @@ pub fn force_destroy_all_clients(state: &mut ServerState, backend: &mut dyn Back
     // is per-reference, not per-client: client A's tile stays allocated while
     // client B's GC or window border still names it. In a normal disconnect
     // that is the whole answer — B is still running. In a reset B is destroyed
-    // too, and nothing reports the tile a second time (a GC teardown yields no
-    // freeable candidates), so without this sweep it survives the session that
-    // owned it.
+    // too, and a reference its teardown does not hand back as a candidate
+    // would, without this sweep, survive the session that owned it.
     let freed: std::collections::BTreeSet<u32> = frees.freed.into_iter().collect();
     let mut leftovers: Vec<u32> = frees
         .deferred
@@ -336,6 +349,14 @@ pub(crate) fn reset_generation(
     // against the destroyed session.
     setup_thread::shutdown_all(setup_registry);
 
+    // -- 2a. Retire backend-owned input-session state. ---------------
+    // This runs after the generation bump quarantines old producers,
+    // while the old facets and resources still exist, and before forced
+    // client teardown. KMS sends guarded releases through the old XI
+    // topology here; the subsequent disconnect path sees empty held-state
+    // maps.
+    backend.reset_input_session(state);
+
     // -- 3. Force-close every established client. -------------------
     // Deregister first: `epoll_ctl(DEL)` needs a live fd, and the
     // teardown below drops the last `ClientState` reference to the
@@ -343,14 +364,10 @@ pub(crate) fn reset_generation(
     let mut live: Vec<u32> = state.clients.keys().copied().collect();
     live.sort_unstable();
     for id in &live {
-        let Some(client) = state.clients.get(id) else {
+        let Some(client) = state.clients.get_mut(id) else {
             continue;
         };
-        let raw = match client.writer.lock() {
-            Ok(writer) => writer.as_raw_fd(),
-            Err(poisoned) => poisoned.into_inner().as_raw_fd(),
-        };
-        if let Err(err) = registry.deregister(&mut SourceFd(&raw))
+        if let Err(err) = deregister_writer(registry, client)
             && err.kind() != std::io::ErrorKind::NotFound
         {
             log::warn!("reset: deregister client {id} from the poller: {err}");
@@ -387,6 +404,13 @@ pub(crate) fn reset_generation(
     // lives in `ServerState`, so a check after the swap reads a fresh state
     // with the flag clear: the reset would destroy the evidence and then
     // proceed on the strength of its absence.
+    if let Some(cause) = &state.fatal_teardown {
+        log::error!(
+            "reset: refusing to install {generation:?} -- a client teardown \
+             could not complete ({cause}). Terminating."
+        );
+        return None;
+    }
     if state.cow_teardown_failed || !state.cow_claims.is_empty() {
         log::error!(
             "reset: refusing to install {generation:?} -- the composite overlay \
@@ -404,26 +428,59 @@ pub(crate) fn reset_generation(
     // re-derived from the LIVE backend through the same snapshot type
     // startup uses, so the second generation is built exactly the way
     // the first one was.
+    // Rootless: the host hears that this generation's top-levels are gone;
+    // the id counter survives so no `ToplevelId` is reused.
+    crate::rootless::reconcile_and_dispatch(state, backend);
+    let rootless = state
+        .rootless
+        .as_ref()
+        .map(crate::rootless::Rootless::for_next_generation);
     let topology = BackendTopology::from_backend(backend);
     let mut fresh = topology.into_server_state();
-    // The single field that survives literally. X11 timestamps must not
+    // The one session field that survives literally (the VidMode gamma
+    // below is the screen's, not the session's). X11 timestamps must not
     // go backwards: a client reconnecting a millisecond after a reset
     // would otherwise see the server clock jump.
     fresh.start_instant = state.start_instant;
-    // Input is seeded from the process-lifetime inventory, not
-    // re-probed: `probe_input_devices` is a no-op in Direct mode
-    // (libinput's enumeration burst is one-shot, at process start), so
-    // a generation that re-probed would come back with no devices at
-    // all. Property-name atoms are interned HERE, against the fresh
-    // table -- carrying `xi_devices` across instead would leave every
-    // device property pointing at an atom id that no longer exists.
-    for info in inventory.devices_by_node() {
-        fresh.xi_seed_touchpad(info);
+    // The access state is process-lifetime; the new generation makes its
+    // next use apply Xorg's `ResetHosts` (`AuthState::check`'s `enter`).
+    fresh.host_access = crate::core_loop::auth::HostAccessHandle {
+        auth: std::sync::Arc::clone(&state.host_access.auth),
+        generation,
+        policies: state.host_access.policies.clone(),
+    };
+    // Rebuild physical facets from the process-lifetime inventory. Disabled
+    // continuation facts remain registered but disabled, matching their live
+    // state before the server-generation reset.
+    for info in inventory.devices_by_source() {
+        fresh.xi_register_source(info);
+    }
+    // Xorg's `pScrn->gamma` outlives regeneration; step 7 rebuilds the
+    // VidMode table from it.
+    fresh.vidmode_gamma = state.vidmode_gamma;
+    // The old generation's fonts go with it, the default one included;
+    // step 7 reopens that.
+    for host_xid in state.resources.take_all_fonts() {
+        let _ = backend.close_font(None, host_xid);
     }
     *state = fresh;
 
     // -- 7. Re-attach the backend to the new state. -----------------
     install_backend_root_bindings(state, backend);
+    // Fatal at startup as in Xorg, so the boundary refuses rather than
+    // serving a generation whose GCs have no font.
+    if let Err(err) = install_default_font(state, backend) {
+        log::error!("reset: refusing to install {generation:?} -- {err}. Terminating.");
+        return None;
+    }
+    // The fresh state carries identity transforms, as Xorg's reset does.
+    backend.randr_layout_changed(state);
+    // The VidMode table from the carried gamma, as ScreenInit's
+    // `xf86HandleColormaps` builds it; no table at 1.0.
+    reinstall_vidmode_gamma(state, backend);
+    if let Some(rootless) = rootless {
+        crate::rootless::resume(state, backend, rootless);
+    }
 
     // -- 8. Repaint the root. ---------------------------------------
     // The fresh constructor creates a root window, but that leaves the
@@ -433,6 +490,7 @@ pub(crate) fn reset_generation(
     backend.mark_dirty();
 
     // -- 9. Listeners are left bound and untouched. -----------------
+    state.notify_policies(|policy, _context| policy.generation_ended());
     Some(generation)
 }
 
@@ -441,6 +499,31 @@ pub(crate) fn reset_generation(
 /// Deliberately the same call the protocol's `ClearArea` makes, against
 /// the same resolved background, so KMS records the damage its
 /// composite path needs rather than relying on `mark_dirty` alone.
+/// Take a client's writer out of the poller.
+#[cfg(unix)]
+fn deregister_writer(
+    registry: &mio::Registry,
+    client: &mut crate::server::ClientState,
+) -> std::io::Result<()> {
+    let raw = match client.writer.lock() {
+        Ok(writer) => writer.as_raw_fd(),
+        Err(poisoned) => poisoned.into_inner().as_raw_fd(),
+    };
+    registry.deregister(&mut SourceFd(&raw))
+}
+
+/// Take a client's writer out of the poller.
+#[cfg(windows)]
+fn deregister_writer(
+    registry: &mio::Registry,
+    client: &mut crate::server::ClientState,
+) -> std::io::Result<()> {
+    match client.writable_source.take() {
+        Some(mut source) => registry.deregister(&mut source),
+        None => Err(std::io::ErrorKind::NotFound.into()),
+    }
+}
+
 fn clear_root(state: &mut ServerState, backend: &mut dyn Backend) {
     let Some((width, height)) = state
         .resources
@@ -509,15 +592,48 @@ mod tests {
             setup_thread,
         },
         randr::{RandrMode, RandrOutput},
-        resources::ROOT_WINDOW,
+        resources::{DEFAULT_FONT, ROOT_WINDOW},
         server::{ClientState, GlxContext, GlxDrawable, GlxDrawableKind, ServerState},
     };
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum LifecycleEvent {
+        ConnectionGone(ClientId),
+        OwnerGone(ClientId),
+        GenerationEnded,
+    }
+
+    struct LifecycleRecordingPolicy(Arc<Mutex<Vec<LifecycleEvent>>>);
+
+    impl crate::access::AccessPolicy for LifecycleRecordingPolicy {
+        fn connection_gone(&self, _ctx: &crate::access::AccessContext<'_>, client: ClientId) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(LifecycleEvent::ConnectionGone(client));
+        }
+
+        fn owner_gone(&self, client: ClientId) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(LifecycleEvent::OwnerGone(client));
+        }
+
+        fn generation_ended(&self) {
+            self.0
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(LifecycleEvent::GenerationEnded);
+        }
+    }
 
     fn install_client(state: &mut ServerState, id: u32) {
         let (a, _b) = UnixStream::pair().expect("socketpair");
         state.clients.insert(
             id,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -530,13 +646,28 @@ mod tests {
                 xi1_event_classes: HashSet::new(),
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
+                outbound_fds: Default::default(),
                 watching_writable: false,
+                write_failed: false,
+                gone: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
                 fd_passing: true,
+                internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
+    }
+
+    fn lifecycle_recording_policy(
+        state: &mut ServerState,
+        events: Arc<Mutex<Vec<LifecycleEvent>>>,
+    ) -> Arc<dyn crate::access::AccessPolicy> {
+        let policy: Arc<dyn crate::access::AccessPolicy> =
+            Arc::new(LifecycleRecordingPolicy(events));
+        state.install_access_policy(Arc::clone(&policy));
+        policy
     }
 
     /// Everything one client of a session holds that costs the BACKEND
@@ -863,10 +994,18 @@ mod tests {
     }
 
     /// Mirrors `xinput::tests::touchpad_info`: tap must be *available*
-    /// for `seed_touchpad` to intern `libinput Tapping Enabled`, which
+    /// for source registration to intern `libinput Tapping Enabled`, which
     /// is the property this module's atom assertion turns on.
     fn touchpad(node: &str, name: &str) -> DeviceInfo {
         DeviceInfo {
+            source_id: crate::xinput::InputSourceId(u64::from(line!())),
+            enabled: true,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard: false,
+                pointer: true,
+                touch: false,
+            },
             name: name.into(),
             device_node: node.into(),
             sysname: node.trim_start_matches("/dev/input/").into(),
@@ -884,6 +1023,40 @@ mod tests {
                     current: false,
                     default: true,
                 },
+                ..Default::default()
+            },
+        }
+    }
+
+    fn dynamic_source(
+        source_id: u64,
+        name: &str,
+        keyboard: bool,
+        pointer: bool,
+        enabled: bool,
+    ) -> DeviceInfo {
+        DeviceInfo {
+            source_id: crate::xinput::InputSourceId(source_id),
+            enabled,
+            resume_key: None,
+            capabilities: crate::xinput::InputCapabilities {
+                keyboard,
+                pointer,
+                touch: false,
+            },
+            name: name.into(),
+            device_node: format!("/dev/input/event{source_id}"),
+            sysname: format!("event{source_id}"),
+            vendor_id: 0x046d,
+            product_id: u32::try_from(source_id).unwrap_or_default(),
+            is_touchpad: false,
+            config: LibinputConfigSnapshot {
+                accel_profile: crate::core_loop::message::OneHot2 {
+                    available: pointer,
+                    current: Some(0),
+                    default: Some(0),
+                },
+                accel_profile_available_mask: if pointer { 0b011 } else { 0 },
                 ..Default::default()
             },
         }
@@ -911,6 +1084,9 @@ mod tests {
             mm_height: 290,
             mode_ids: vec![0x42],
             num_preferred: 1,
+            pending_transform: Default::default(),
+            current_transform: Default::default(),
+            rotation: crate::randr::RR_ROTATE_0,
         }];
         backend.randr_modes = vec![RandrMode {
             mode_id: 0x42,
@@ -932,7 +1108,14 @@ mod tests {
         let mut backend = backend_with_topology();
         let f = seed_client_session(&mut state, &mut backend, 7);
         let session_atom = state.atoms.intern("_SESSION_ONLY_ATOM", false);
-        state.selections.insert(session_atom, (f.window, 1));
+        state.selections.insert(
+            session_atom,
+            crate::server::SelectionOwner {
+                window: f.window,
+                last_time_changed: 1,
+                client: Some(ClientId(7)),
+            },
+        );
         state.server_grab_owner = Some(ClientId(7));
         state.set_pointer_grab(crate::server::ActivePointerGrab {
             owner: ClientId(7),
@@ -993,9 +1176,409 @@ mod tests {
 
         assert_eq!(
             state.start_instant, epoch,
-            "start_instant is the ONLY field that survives literally — \
+            "start_instant is the only session field that survives literally — \
              X11 timestamps must not go backwards across a reset"
         );
+    }
+
+    /// The VidMode gamma outlives a reset, as Xorg's `pScrn->gamma` does:
+    /// the new generation reports the same values to `GetGamma`, and its
+    /// table is rebuilt from them and pushed to the backend, so the display
+    /// and the protocol agree. A ramp set only by `SetGammaRamp` falls back
+    /// to the gamma curve, which at 1.0 is no table at all.
+    #[test]
+    fn reset_generation_carries_the_vidmode_gamma_and_rebuilds_its_table() {
+        use crate::backend::gamma::VidModeGammaTable;
+
+        let run_reset = |state: &mut ServerState, backend: &mut RecordingBackend| {
+            let generations = GenerationCounter::new();
+            let registry = setup_thread::make_registry();
+            let inventory = InputInventory::new();
+            let mut locals = Locals::new();
+            let p = poll();
+            reset_generation(
+                state,
+                backend,
+                p.registry(),
+                &generations,
+                &registry,
+                &inventory,
+                locals.borrow(),
+            )
+            .expect("the reset must proceed: this test holds no overlay claim");
+        };
+        let ramp: Vec<u16> = (0..1024u16).map(|i| (1023 - i) << 6).collect();
+
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let gamma = [2.0, 1.0, 0.5];
+        state.vidmode_gamma = gamma;
+        let ramp_table = VidModeGammaTable::from_ramp(&ramp, &ramp, &ramp);
+        state.vidmode_gamma_table = Some(ramp_table.clone());
+        backend.vidmode_gamma = Some(ramp_table);
+        run_reset(&mut state, &mut backend);
+        let expected = Some(VidModeGammaTable::from_gamma(gamma));
+        assert_eq!(state.vidmode_gamma, gamma, "GetGamma keeps its values");
+        assert_eq!(
+            state.vidmode_gamma_table, expected,
+            "the table is the gamma curve"
+        );
+        assert_eq!(backend.vidmode_gamma, expected, "and the display loads it");
+
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let ramp_table = VidModeGammaTable::from_ramp(&ramp, &ramp, &ramp);
+        state.vidmode_gamma_table = Some(ramp_table.clone());
+        backend.vidmode_gamma = Some(ramp_table);
+        run_reset(&mut state, &mut backend);
+        assert_eq!(state.vidmode_gamma, [1.0; 3]);
+        assert_eq!(state.vidmode_gamma_table, None, "gamma 1.0 builds no table");
+        assert_eq!(
+            backend.vidmode_gamma, None,
+            "the CRTCs load their RANDR ramps alone"
+        );
+    }
+
+    /// The access state outlives a reset: the fresh state holds the same
+    /// `AuthState`, tagged with the new generation.
+    #[test]
+    fn reset_generation_carries_the_host_access_handle_into_the_new_generation() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let auth = std::sync::Arc::clone(&state.host_access.auth);
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        let generation = reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
+
+        assert_eq!(state.host_access.generation, generation);
+        assert!(std::sync::Arc::ptr_eq(&state.host_access.auth, &auth));
+    }
+
+    /// Mutation: omit `policies` from the reset carry-over; these pointer/order assertions must fail.
+    #[test]
+    fn reset_generation_carries_installed_policies_in_order() {
+        use crate::access::AccessPolicy;
+
+        struct Policy;
+        impl AccessPolicy for Policy {}
+
+        let mut state = ServerState::new();
+        let first: Arc<dyn AccessPolicy> = Arc::new(Policy);
+        let second: Arc<dyn AccessPolicy> = Arc::new(Policy);
+        state.install_access_policy(Arc::clone(&first));
+        state.install_access_policy(Arc::clone(&second));
+
+        let mut backend = backend_with_topology();
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("the reset must proceed: this test holds no overlay claim");
+
+        assert_eq!(state.host_access.policies.len(), 2);
+        assert!(Arc::ptr_eq(&state.host_access.policies[0], &first));
+        assert!(Arc::ptr_eq(&state.host_access.policies[1], &second));
+    }
+
+    // Mutation: call generation_ended at reset entry before client teardown; it must be last.
+    #[test]
+    fn reset_tells_policies_after_every_client() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut state = ServerState::new();
+        let policy = lifecycle_recording_policy(&mut state, events.clone());
+        install_client(&mut state, 7);
+        install_client(&mut state, 8);
+        state.close_down_modes.insert(7, 1);
+        state.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap: ResourceId(0x0070_0001),
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        let mut backend = backend_with_topology();
+
+        crate::core_loop::process_disconnect::process_disconnect_reporting(
+            &mut state,
+            &mut backend,
+            ClientId(7),
+            None,
+        );
+        assert_eq!(state.zombie_clients.get(&7), Some(&1));
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset succeeds");
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                LifecycleEvent::ConnectionGone(ClientId(7)),
+                LifecycleEvent::ConnectionGone(ClientId(8)),
+                LifecycleEvent::OwnerGone(ClientId(8)),
+                LifecycleEvent::OwnerGone(ClientId(7)),
+                LifecycleEvent::GenerationEnded,
+            ],
+        );
+        assert_eq!(state.host_access.policies.len(), 1);
+        assert!(Arc::ptr_eq(&state.host_access.policies[0], &policy));
+        assert!(state.clients.is_empty());
+        assert!(state.zombie_clients.is_empty());
+        assert!(!state.resources.xid_in_use(ResourceId(0x0070_0001)));
+    }
+
+    // Mutation: notify owner_gone when FreePixmap frees one zombie resource; it must wait until reset closes the owner.
+    #[test]
+    fn freeing_a_zombie_resource_does_not_end_its_owner() {
+        use crate::core_loop::process_request::process_request;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut state = ServerState::new();
+        lifecycle_recording_policy(&mut state, events.clone());
+        install_client(&mut state, 7);
+        install_client(&mut state, 8);
+        state.close_down_modes.insert(7, 1);
+        let pixmap = ResourceId(0x0070_0051);
+        state.resources.create_pixmap(
+            ClientId(7),
+            CreatePixmapRequest {
+                pixmap,
+                drawable: ROOT_WINDOW,
+                width: 16,
+                height: 16,
+                depth: 24,
+            },
+        );
+        let mut backend = backend_with_topology();
+
+        crate::core_loop::process_disconnect::process_disconnect_reporting(
+            &mut state,
+            &mut backend,
+            ClientId(7),
+            None,
+        );
+        let _outcome = process_request(
+            &mut state,
+            &mut backend,
+            ClientId(8),
+            yserver_protocol::x11::SequenceNumber(1),
+            yserver_protocol::x11::RequestHeader {
+                opcode: 54,
+                data: 0,
+                length_units: 2,
+            },
+            &pixmap.0.to_le_bytes(),
+            None,
+        )
+        .expect("FreePixmap processes");
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![LifecycleEvent::ConnectionGone(ClientId(7))],
+        );
+        assert!(!state.resources.xid_in_use(pixmap));
+        assert_eq!(state.zombie_clients.get(&7), Some(&1));
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset succeeds");
+
+        let recorded = events.lock().unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|event| **event == LifecycleEvent::OwnerGone(ClientId(7)))
+                .count(),
+            1,
+        );
+        assert_eq!(recorded.last(), Some(&LifecycleEvent::GenerationEnded));
+        assert!(state.clients.is_empty());
+        assert!(state.zombie_clients.is_empty());
+    }
+
+    // Mutation: emit generation_ended immediately after installing the fresh state; a later font refusal must not announce success.
+    #[test]
+    fn refused_reset_sends_no_generation_end() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut state = ServerState::new();
+        lifecycle_recording_policy(&mut state, events.clone());
+        install_client(&mut state, 7);
+        let mut backend = backend_with_topology();
+        backend.fail_open_font = Some(std::io::ErrorKind::NotFound);
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        assert!(
+            reset_generation(
+                &mut state,
+                &mut backend,
+                p.registry(),
+                &generations,
+                &registry,
+                &inventory,
+                locals.borrow(),
+            )
+            .is_none(),
+            "the failed default-font reinstall refuses the boundary"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .contains(&LifecycleEvent::GenerationEnded)
+        );
+        assert!(state.clients.is_empty());
+        assert!(state.zombie_clients.is_empty());
+    }
+
+    /// Rootless (plan RL0 Task 3): a reset tells the host every mapped
+    /// top-level is gone, and the next generation's ids are fresh (spec §4.2:
+    /// an id is never reused). Mutation: rebuild `Rootless::new()` on reset.
+    #[test]
+    fn reset_flushes_destroyed_and_keeps_ids_fresh() {
+        use crate::{
+            backend::recording::RecordedCall,
+            resources::MapState,
+            rootless::{self, CoordinatePolicy, RootlessEvent},
+        };
+        let mapped_ids = |events: &[RootlessEvent]| -> Vec<u64> {
+            events
+                .iter()
+                .filter_map(|e| match e {
+                    RootlessEvent::Mapped { id, .. } => Some(id.get()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let last_events = |backend: &RecordingBackend| -> Vec<RootlessEvent> {
+            backend
+                .calls()
+                .iter()
+                .rev()
+                .find_map(|c| match c {
+                    RecordedCall::RootlessEvents(e) => Some(e.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology().with_redirect_activation();
+        let f = seed_client_session(&mut state, &mut backend, 7);
+        rootless::enable(&mut state, &mut backend, CoordinatePolicy::Opaque).unwrap();
+        state.resources.window_mut(f.window).unwrap().map_state = MapState::Viewable;
+        rootless::reconcile_and_dispatch(&mut state, &mut backend);
+        let old = mapped_ids(&last_events(&backend));
+        assert_eq!(old.len(), 1);
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset proceeds");
+
+        let flushed = last_events(&backend);
+        assert!(
+            matches!(flushed.as_slice(),
+                [RootlessEvent::Unmapped { id: a }, RootlessEvent::Destroyed { id: b }]
+                    if a.get() == old[0] && b.get() == old[0]),
+            "{flushed:?}"
+        );
+        assert!(state.rootless.is_some(), "rootless survives the reset");
+        let check = state
+            .atoms
+            .id_for("_NET_SUPPORTING_WM_CHECK")
+            .expect("re-announced");
+        assert!(
+            state
+                .resources
+                .window_property(ROOT_WINDOW, check)
+                .is_some(),
+            "the WM is re-announced on the new root"
+        );
+
+        let window = ResourceId(0x0060_0001);
+        state.resources.create_window(
+            ClientId(8),
+            CreateWindowRequest {
+                depth: 24,
+                window,
+                parent: ROOT_WINDOW,
+                width: 10,
+                height: 10,
+                class: 1,
+                visual: crate::resources::ROOT_VISUAL,
+                ..Default::default()
+            },
+        );
+        state.resources.window_mut(window).unwrap().map_state = MapState::Viewable;
+        rootless::reconcile_and_dispatch(&mut state, &mut backend);
+        let new = mapped_ids(&last_events(&backend));
+        assert_eq!(new.len(), 1);
+        assert!(new[0] > old[0], "{new:?} vs {old:?}");
     }
 
     /// Topology is re-derived from the live backend, not carried: the
@@ -1043,12 +1626,53 @@ mod tests {
         );
     }
 
-    /// The devices come back — from the process-lifetime inventory, not
-    /// a re-probe — and their property-name atoms are interned in the
-    /// NEW atom table. Carrying `xi_devices` instead would leave those
-    /// properties pointing at ids the fresh table never issued.
+    /// Xorg reopens the default font each generation (`dix/main.c:226`):
+    /// the old one is closed on the backend, the new state has its own.
     #[test]
-    fn reset_generation_reseeds_devices_with_atoms_in_the_new_table() {
+    fn reset_generation_reopens_the_default_font() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        crate::core_loop::process_request::install_default_font(&mut state, &mut backend)
+            .expect("default font");
+        let old = state
+            .resources
+            .font(DEFAULT_FONT)
+            .expect("installed")
+            .host_xid
+            .as_raw();
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset proceeds");
+
+        assert!(
+            backend
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::CloseFont(xid) if *xid == old)),
+            "the old generation's default font must be closed"
+        );
+        let font = state.resources.font(DEFAULT_FONT).expect("reopened");
+        assert_eq!(font.name, "fixed");
+        assert_ne!(font.host_xid.as_raw(), old);
+    }
+
+    /// Reset replays the live physical touchpad onto its registry-allocated
+    /// facet while leaving virtual XTEST pointer 4 independent.
+    #[test]
+    fn reset_generation_keeps_virtual_xtest_pointer_intact() {
         let mut state = ServerState::new();
         let mut backend = backend_with_topology();
         // Burn atom ids in the OLD table so a carried-over property atom
@@ -1079,27 +1703,228 @@ mod tests {
         let slave = state
             .xi_devices
             .iter()
-            .find(|d| d.id == crate::xinput::DEVICEID_SLAVE_POINTER)
-            .expect("slave pointer");
+            .find(|d| d.id == crate::xinput::DEVICEID_XTEST_POINTER)
+            .expect("XTEST pointer");
+        // Kills the mutation that omits Device Enabled seeding from a fresh server generation.
+        let enabled_atom = state
+            .atoms
+            .id_for("Device Enabled")
+            .expect("reset re-interns Device Enabled");
+        for device_id in [
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            crate::xinput::DEVICEID_XTEST_POINTER,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
+        ] {
+            let property = state
+                .xi_devices
+                .device(device_id)
+                .unwrap()
+                .properties
+                .get(&enabled_atom)
+                .expect("base XI devices retain Device Enabled after reset");
+            assert_eq!(property.type_atom, crate::xinput::XA_INTEGER);
+            assert_eq!(property.format, 8);
+            assert_eq!(property.data, [1]);
+            assert!(!property.deletable);
+        }
         assert_eq!(
-            slave.name, "SynPS/2 Touchpad",
-            "the device set must be present again after a reset"
+            slave.name,
+            crate::xinput::registry::NAME_XTEST_POINTER,
+            "reset must keep the virtual device as XTEST instead of publishing a source there"
         );
-        assert!(slave.is_touchpad);
-
-        // `intern(only_if_exists = true)` returns the live id: the
-        // property must resolve through the NEW table.
+        assert!(!slave.is_touchpad);
+        assert!(slave.properties.contains_key(&state.xtest_device_atom));
         let tap = state.atoms.intern("libinput Tapping Enabled", true);
+        let holders = state
+            .xi_devices
+            .iter()
+            .filter(|device| device.properties.contains_key(&tap))
+            .map(|device| device.id)
+            .collect::<Vec<_>>();
+        println!(
+            "AtomId({}) is {} and is held by XI device maps {:?}",
+            tap.0,
+            state.atoms.name(tap).unwrap_or("<unknown>"),
+            holders
+        );
+        assert_eq!(state.atoms.name(tap), Some("libinput Tapping Enabled"));
+        assert_eq!(
+            holders,
+            [6],
+            "the physical touchpad pointer facet owns the property"
+        );
+        assert!(!slave.properties.contains_key(&tap));
+        assert_eq!(state.xi_devices.devices().len(), 5);
+        assert_eq!(state.xi_devices.source_ids().len(), 1);
+        assert!(state.clients.is_empty());
+        assert!(state.selections.is_empty());
+        assert!(state.keys_down.iter().all(|byte| *byte == 0));
+        assert_eq!(state.buttons_down, 0);
+        assert!(state.key_down_by_device.is_empty());
+        assert!(state.xi1_device_input_state.is_empty());
+        assert!(state.xi2_detached_masters.is_empty());
+        assert!(state.floating_pointer_positions.is_empty());
+    }
+
+    #[test]
+    fn xi_dynamic_reset_replays_current_live_inventory_and_recreates_property_atoms() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        for i in 0..32 {
+            state.atoms.intern(&format!("_PRE_RESET_ATOM_{i}"), false);
+        }
+
+        let source_20 = dynamic_source(20, "Mouse twenty", false, true, true);
+        let source_10 = dynamic_source(10, "Mouse ten", false, true, true);
+        let mixed_suspended = dynamic_source(30, "Mixed keyboard pointer", true, true, false);
+        let removed = dynamic_source(40, "Removed mouse", false, true, true);
+        let old_profile_atom = state.atoms.intern("libinput Accel Profile Enabled", true);
+
+        // The old generation observed devices in a different order from the
+        // inventory's source order, and still contains the source removed
+        // before reset. The new generation must allocate from current facts.
+        let mut inventory = InputInventory::new();
+        for info in [&source_20, &source_10, &mixed_suspended, &removed] {
+            inventory.add(info.clone());
+        }
+        inventory.update_config(
+            source_20.source_id,
+            crate::xinput::libinput_props::DeviceConfigChange::AccelProfile(Some(1)),
+        );
+        state.xi_register_source(&source_20);
+        state.xi_register_source(&source_10);
+        state.xi_register_source(&mixed_suspended);
+        state.xi_register_source(&removed);
+        let old_id_6_source = state
+            .xi_devices
+            .device(6)
+            .and_then(|device| device.source_id);
+        assert_eq!(old_id_6_source, Some(source_20.source_id));
+        inventory.remove(removed.source_id);
+        state.xi_unregister_source(removed.source_id);
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let mut locals = Locals::new();
+        let p = poll();
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset must proceed without a retained overlay");
+
+        let source_10_id = state
+            .xi_devices
+            .facet(
+                source_10.source_id,
+                crate::xinput::XiFacetKind::PointerTouch,
+            )
+            .expect("mouse ten pointer facet");
+        let source_20_id = state
+            .xi_devices
+            .facet(
+                source_20.source_id,
+                crate::xinput::XiFacetKind::PointerTouch,
+            )
+            .expect("mouse twenty pointer facet");
+        assert_eq!(source_10_id, 6);
+        assert_eq!(source_20_id, 7);
+        assert_ne!(source_10_id, source_20_id);
+        assert_eq!(
+            state.xi_devices.device(6).unwrap().source_id,
+            Some(source_10.source_id)
+        );
         assert_ne!(
-            tap,
-            yserver_protocol::x11::AtomId(0),
-            "the property atom must exist in the new table"
+            old_id_6_source,
+            state.xi_devices.device(6).unwrap().source_id
+        );
+        assert!(state.xi_devices.source(removed.source_id).is_none());
+        assert!(
+            state
+                .xi_devices
+                .facet(
+                    mixed_suspended.source_id,
+                    crate::xinput::XiFacetKind::Keyboard
+                )
+                .is_some()
         );
         assert!(
-            slave.properties.contains_key(&tap),
-            "device properties must be keyed by atoms interned in the new \
-             table, not ids carried from the destroyed one"
+            state
+                .xi_devices
+                .facet(
+                    mixed_suspended.source_id,
+                    crate::xinput::XiFacetKind::PointerTouch
+                )
+                .is_some()
         );
+        assert!(
+            !state
+                .xi_devices
+                .source(mixed_suspended.source_id)
+                .unwrap()
+                .enabled
+        );
+
+        let current_profile_atom = state
+            .atoms
+            .id_for("libinput Accel Profile Enabled")
+            .expect("new generation interns the profile property");
+        assert_ne!(old_profile_atom, current_profile_atom);
+        assert_eq!(
+            state.atoms.name(current_profile_atom),
+            Some("libinput Accel Profile Enabled")
+        );
+        let profile = state.xi_devices.device(source_20_id).unwrap();
+        assert_eq!(profile.properties[&current_profile_atom].data, [0, 1, 0]);
+        assert!(!profile.properties.contains_key(&old_profile_atom));
+        assert!(profile.properties.contains_key(&current_profile_atom));
+        assert_eq!(state.xi_devices.source_ids().len(), 3);
+    }
+
+    #[test]
+    fn xi_dynamic_reset_runs_backend_input_cleanup_before_client_teardown() {
+        let mut state = ServerState::new();
+        let mut backend = backend_with_topology();
+        let fixture = seed_client_session(&mut state, &mut backend, 7);
+        backend.calls.lock().unwrap().clear();
+
+        let generations = GenerationCounter::new();
+        let registry = setup_thread::make_registry();
+        let inventory = InputInventory::new();
+        let mut locals = Locals::new();
+        let p = poll();
+        reset_generation(
+            &mut state,
+            &mut backend,
+            p.registry(),
+            &generations,
+            &registry,
+            &inventory,
+            locals.borrow(),
+        )
+        .expect("reset must proceed without a retained overlay");
+
+        let calls = backend.calls.lock().unwrap().clone();
+        let reset_at = calls
+            .iter()
+            .position(|call| matches!(call, RecordedCall::ResetInputSession))
+            .expect("reset must invoke the backend input-session cleanup hook");
+        let teardown_at = calls
+            .iter()
+            .position(|call| matches!(call, RecordedCall::DestroySubwindow(xid) if *xid == fixture.host_window))
+            .expect("forced reset teardown must destroy the old client window");
+        assert!(
+            reset_at < teardown_at,
+            "held input is retired before client resources are destroyed: {calls:#?}"
+        );
+        assert!(state.clients.is_empty());
+        assert!(!state.resources.xid_in_use(fixture.window));
     }
 
     /// The quarantine case with teeth. `release_server_grab_waiters`
@@ -1201,10 +2026,12 @@ mod tests {
 
         // A worker completion racing the reset arrives now.
         backend.ready_crtc_configs = vec![token];
+        let mut xi_config_lane = crate::core_loop::run::XiConfigLane::default();
         drain_ready_crtc_configs(
             &mut state,
             &mut backend,
             &mut locals.pending_backend_requests,
+            &mut xi_config_lane,
             &mut ResetTrigger::new(ResetPolicy::NoReset),
         );
         assert!(
@@ -1452,7 +2279,7 @@ mod tests {
     #[test]
     fn a_client_refused_for_a_bad_cookie_arms_nothing() {
         // Same shape, and the one a stranger can reach: the TCP
-        // listener binds 0.0.0.0, so a port scan or a wrong cookie must
+        // listener binds every interface, so a port scan or a wrong cookie must
         // not be able to make the server erase its session.
         let mut trigger = ResetTrigger::new(ResetPolicy::Reset);
         for _ in 0..10 {

@@ -22,7 +22,7 @@
 
 use std::{
     collections::HashMap,
-    io::{self, ErrorKind},
+    io::{self, ErrorKind, Write},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -34,10 +34,11 @@ use yserver_protocol::x11::{self, ClientId};
 
 use crate::{
     core_loop::{
-        auth::{AuthState, AuthTransport, AuthVerdict},
+        auth::AuthState,
         message::{Message, SetupAllocateResponse},
         sender::BoundSender,
     },
+    peer::PeerIdentity,
     resources::{ARGB_VISUAL, GLMARK_VISUAL, ROOT_COLORMAP, ROOT_VISUAL, ROOT_WINDOW},
     transport::Transport,
 };
@@ -66,6 +67,7 @@ pub fn make_registry() -> SetupRegistry {
 /// it happens to wake.
 ///
 /// [`CoreSender::bind`]: crate::core_loop::sender::CoreSender::bind
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     id: ClientId,
     stream: impl Into<Transport>,
@@ -74,8 +76,12 @@ pub fn spawn(
     auth: Arc<AuthState>,
     is_local: bool,
     fd_passing: bool,
+    internal: bool,
 ) -> io::Result<()> {
     let stream = stream.into();
+    // BSD `accept` (macOS has no `accept4`) inherits the listener's O_NONBLOCK;
+    // the setup thread's timed blocking reads need a blocking socket.
+    stream.set_nonblocking(false)?;
     let cloned = stream.try_clone()?;
     registry
         .lock()
@@ -90,7 +96,8 @@ pub fn spawn(
                 id,
                 registry: registry_for_thread,
             };
-            if let Err(e) = run_setup(id, stream, &sender, &auth, is_local, fd_passing) {
+            if let Err(e) = run_setup(id, stream, &sender, &auth, (is_local, fd_passing, internal))
+            {
                 // ConnectionAborted/UnexpectedEof on shutdown is
                 // expected; anything else is worth a warn.
                 if !matches!(
@@ -140,11 +147,14 @@ fn run_setup(
     mut stream: Transport,
     sender: &BoundSender,
     auth: &AuthState,
-    is_local: bool,
-    fd_passing: bool,
+    (is_local, fd_passing, internal): (bool, bool, bool),
 ) -> io::Result<()> {
     stream.set_read_timeout(Some(SETUP_TIMEOUT))?;
     stream.set_write_timeout(Some(SETUP_TIMEOUT))?;
+
+    // The peer's identity, read once from the socket; the client never
+    // gets a say in it.
+    let peer = PeerIdentity::of(&stream);
 
     let setup = x11::read_setup_request(&mut stream)?;
     debug!(
@@ -152,32 +162,38 @@ fn run_setup(
         id.0, setup.byte_order, setup.protocol_major, setup.protocol_minor
     );
 
-    // Authorization follows the actual socket, independently of extension
-    // capability metadata: TCP must never take the local-open fallback.
-    let auth_transport = match &stream {
-        Transport::Unix(_) => AuthTransport::Unix,
-        Transport::Tcp(_) => AuthTransport::Tcp,
-    };
+    // Authorization follows the socket `peer` was read from, independently
+    // of extension capability metadata: TCP never takes the host list.
     // The generation handed to `check` is THIS thread's producer binding,
     // captured at accept — never the counter's current value. An XDMCP
     // session credential is bound to the generation its `Accept` belonged to,
     // so a connection accepted in a destroyed session fails the comparison
     // even if it reaches this line long after the reset, and even though the
-    // new session has by then installed a credential of its own.
-    if let AuthVerdict::Reject(reason) = auth.check(
-        auth_transport,
-        sender.generation(),
-        &setup.auth_protocol_name,
-        &setup.auth_protocol_data,
-    ) {
-        warn!(
-            "client {} auth rejected ({reason:?}); presented proto {:?}",
-            id.0,
-            String::from_utf8_lossy(&setup.auth_protocol_name)
-        );
-        x11::write_setup_failed(&mut stream, setup.byte_order, reason)?;
-        return Ok(()); // drop stream → connection closes
-    }
+    // new session has by then installed a credential of its own. The
+    // server's own client is not authorized: it never came through a
+    // listener.
+    let admission = if internal {
+        crate::access::Admission::Internal
+    } else {
+        match auth.admit(
+            &peer,
+            sender.generation(),
+            &setup.auth_protocol_name,
+            &setup.auth_protocol_data,
+        ) {
+            Ok(admission) => admission,
+            Err(reason) => {
+                warn!(
+                    "client {} auth rejected ({:?}); presented proto {:?}",
+                    id.0,
+                    reason.trim_end(),
+                    String::from_utf8_lossy(&setup.auth_protocol_name)
+                );
+                x11::write_setup_failed(&mut stream, setup.byte_order, reason)?;
+                return Ok(()); // drop stream → connection closes
+            }
+        }
+    };
 
     // Sync rendezvous with the core: allocate ids + snapshot geometry.
     let (response_tx, response_rx) = bounded::<SetupAllocateResponse>(1);
@@ -203,29 +219,19 @@ fn run_setup(
         id.0, setup.protocol_major, setup.protocol_minor, resp.resource_id_base
     );
 
-    // mm = px * 25.4 / 96 (integer form: (px*254 + 480) / 960).
-    // Matches Xorg's and Xwayland's SETUP-reply convention: 5120 px →
-    // 1354 mm, 1440 px → 381 mm. Matches xts5's tetexec.cfg
-    // XT_WIDTH_MM/XT_HEIGHT_MM expectations. Real per-monitor mm
-    // (from EDID via DRM connector) is reported separately via RANDR
-    // GetOutputInfo.
-    let screen_width_mm = ((u32::from(resp.screen_width_px) * 254 + 480) / 960)
-        .max(1)
-        .min(u32::from(u16::MAX)) as u16;
-    let screen_height_mm = ((u32::from(resp.screen_height_px) * 254 + 480) / 960)
-        .max(1)
-        .min(u32::from(u16::MAX)) as u16;
+    // The screen's physical size as RANDR holds it: 96 DPI at startup,
+    // then whatever `RRSetScreenSize` set (`xrandr --dpi`), as Xorg's
+    // `pScreen->mmWidth` (dispatch.c SendConnSetup). Real per-monitor mm
+    // (EDID) is reported separately via RANDR GetOutputInfo.
+    let screen_width_mm = resp.screen_width_mm.max(1);
+    let screen_height_mm = resp.screen_height_mm.max(1);
 
-    x11::write_setup_success(
-        &mut stream,
+    let setup_reply = x11::encode_setup_success(
         setup.byte_order,
         x11::SetupSuccess {
             protocol_major: setup.protocol_major,
             protocol_minor: setup.protocol_minor,
-            // Mirror a recent X.Org release (1.24.1.1 = 12401011).
-            // xts5 Xlib3.XVendorRelease keys on this; many apps use it
-            // for X.Org-specific compat workarounds.
-            release_number: 12_401_011,
+            release_number: vendor_release(),
             resource_id_base: resp.resource_id_base,
             resource_id_mask: resp.resource_id_mask,
             motion_buffer_size: 0,
@@ -236,10 +242,7 @@ fn run_setup(
             bitmap_format_scanline_pad: 32,
             min_keycode: 8,
             max_keycode: 255,
-            // xts5 Xlib3.XServerVendor expects this exact string. Real
-            // X.Org reports the same — using it here keeps Xlib clients
-            // that key off vendor for compat workarounds happy.
-            vendor: "The X.Org Foundation",
+            vendor: "yserver",
             root: x11::Screen {
                 root: ROOT_WINDOW,
                 default_colormap: ROOT_COLORMAP,
@@ -259,6 +262,7 @@ fn run_setup(
             },
         },
     )?;
+    stream.write_all(&setup_reply)?;
 
     // Clear timeouts before handing the stream to the core; the reader
     // thread (C3) treats EAGAIN as "wait on poll(2) and retry", but
@@ -277,14 +281,31 @@ fn run_setup(
         byte_order: setup.byte_order,
         is_local,
         fd_passing,
+        internal,
+        peer,
+        admission,
+        setup_reply,
     })?;
     Ok(())
+}
+
+/// Our own version, encoded the way Xorg encodes its release
+/// (major·10⁷ + minor·10⁵ + patch·10³): 1.8.0 → 10800000.
+fn vendor_release() -> u32 {
+    let part = |s: &str| s.parse::<u32>().unwrap_or(0);
+    part(env!("CARGO_PKG_VERSION_MAJOR")) * 10_000_000
+        + part(env!("CARGO_PKG_VERSION_MINOR")) * 100_000
+        + part(env!("CARGO_PKG_VERSION_PATCH")) * 1_000
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{core_loop::sender::channel, xauth::MIT_MAGIC_COOKIE};
+    use crate::{
+        access::{Admission, CredentialSource},
+        core_loop::{auth::AuthTransport, sender::channel},
+        xauth::MIT_MAGIC_COOKIE,
+    };
     use std::{
         io::{Read, Write},
         os::unix::net::UnixStream,
@@ -292,6 +313,55 @@ mod tests {
         time::Instant,
     };
     use yserver_protocol::x11::ClientByteOrder;
+
+    #[test]
+    fn vendor_release_encodes_the_crate_version() {
+        let n = |s: &str| s.parse::<u32>().unwrap();
+        let expected = format!(
+            "{}{:02}{:02}000",
+            n(env!("CARGO_PKG_VERSION_MAJOR")),
+            n(env!("CARGO_PKG_VERSION_MINOR")),
+            n(env!("CARGO_PKG_VERSION_PATCH")),
+        );
+        assert_eq!(vendor_release().to_string(), expected);
+    }
+
+    #[test]
+    fn setup_on_a_nonblocking_accepted_socket_waits_for_the_late_request() {
+        let (server, mut peer) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let (_poll, sender, rx) = channel().unwrap();
+        let registry = make_registry();
+        spawn(
+            ClientId(1),
+            Transport::Unix(server),
+            sender.bind(),
+            registry.clone(),
+            AuthState::new(None),
+            true,
+            true,
+            false,
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let mut setup = [0; 12];
+        setup[0] = b'l';
+        setup[2] = 11;
+        peer.write_all(&setup).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut allocated = false;
+        while !allocated && Instant::now() < deadline {
+            allocated = rx
+                .try_recv_all()
+                .any(|m| matches!(m, Message::SetupAllocate { .. }));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        shutdown_all(&registry);
+        assert!(
+            allocated,
+            "a setup request sent after accept must still be read"
+        );
+    }
 
     #[test]
     fn tcp_setup_without_loaded_auth_never_allocates_a_client() {
@@ -307,6 +377,7 @@ mod tests {
             sender.bind(),
             registry.clone(),
             AuthState::new(None),
+            false,
             false,
             false,
         )
@@ -355,9 +426,185 @@ mod tests {
         s.write_all(&buf)
     }
 
+    fn write_setup_request_with_auth(
+        s: &mut UnixStream,
+        auth_name: &[u8],
+        auth_data: &[u8],
+    ) -> io::Result<()> {
+        let mut header = [0u8; 12];
+        header[0] = b'l';
+        header[2] = 11;
+        header[6..8].copy_from_slice(&(auth_name.len() as u16).to_le_bytes());
+        header[8..10].copy_from_slice(&(auth_data.len() as u16).to_le_bytes());
+        s.write_all(&header)?;
+        s.write_all(auth_name)?;
+        if !auth_name.len().is_multiple_of(4) {
+            s.write_all(&[0; 4][..4 - auth_name.len() % 4])?;
+        }
+        s.write_all(auth_data)?;
+        if !auth_data.len().is_multiple_of(4) {
+            s.write_all(&[0; 4][..4 - auth_data.len() % 4])?;
+        }
+        Ok(())
+    }
+
+    fn setup_admission_on_stream(
+        auth: Arc<AuthState>,
+        id: ClientId,
+        server_side: UnixStream,
+        mut client_side: UnixStream,
+        auth_name: &[u8],
+        auth_data: &[u8],
+        internal: bool,
+    ) -> Admission {
+        let (_poll, sender, rx) = channel().unwrap();
+        let registry = make_registry();
+        spawn(
+            id,
+            server_side,
+            sender.bind(),
+            registry.clone(),
+            auth,
+            true,
+            true,
+            internal,
+        )
+        .unwrap();
+        write_setup_request_with_auth(&mut client_side, auth_name, auth_data).unwrap();
+
+        let alloc_msg = wait_for_message(&rx, Duration::from_secs(2)).unwrap();
+        let response_tx = match alloc_msg {
+            Message::SetupAllocate { response_tx, .. } => response_tx,
+            other => panic!("expected SetupAllocate, got {other:?}"),
+        };
+        response_tx
+            .send(SetupAllocateResponse {
+                resource_id_base: 0x0010_0000,
+                resource_id_mask: 0x000F_FFFF,
+                screen_width_px: 800,
+                screen_height_px: 600,
+                screen_width_mm: 212,
+                screen_height_mm: 159,
+                current_input_masks: 0,
+            })
+            .unwrap();
+
+        let head = read_n_with_timeout(&mut client_side, 8, Duration::from_secs(2)).unwrap();
+        assert_eq!(head[0], 1, "setup should succeed");
+        let extra_words = u16::from_le_bytes([head[6], head[7]]);
+        let extra_bytes = usize::from(extra_words) * 4;
+        if extra_bytes > 0 {
+            read_n_with_timeout(&mut client_side, extra_bytes, Duration::from_secs(2)).unwrap();
+        }
+
+        match wait_for_message(&rx, Duration::from_secs(2)).unwrap() {
+            Message::ClientSetupComplete { admission, .. } => admission,
+            other => panic!("expected ClientSetupComplete, got {other:?}"),
+        }
+    }
+
+    fn xauth_record(number: &[u8], cookie: &[u8]) -> Vec<u8> {
+        let mut record = Vec::new();
+        record.extend_from_slice(&256u16.to_be_bytes()); // FamilyLocal
+        for field in [
+            b"host".as_slice(),
+            number,
+            MIT_MAGIC_COOKIE.as_bytes(),
+            cookie,
+        ] {
+            record.extend_from_slice(&(field.len() as u16).to_be_bytes());
+            record.extend_from_slice(field);
+        }
+        record
+    }
+
+    fn auth_file(tag: &str, cookies: &[(&[u8], &[u8])]) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("yserver-setup-auth-{}-{tag}", std::process::id()));
+        let mut data = Vec::new();
+        for (number, cookie) in cookies {
+            data.extend_from_slice(&xauth_record(number, cookie));
+        }
+        std::fs::write(&path, data).unwrap();
+        path
+    }
+
+    // Mutation: returning one constant CredentialId makes C1 and C2 compare equal.
+    #[test]
+    fn two_file_cookies_admit_with_distinct_stable_credentials() {
+        let c1 = [0x11u8; 16];
+        let c2 = [0x22u8; 16];
+        let path = auth_file("two-cookies", &[(b"1", &c1), (b"2", &c2)]);
+        let auth = AuthState::new(Some(path.clone()));
+        // Use distinct socket pairs for each complete setup handshake.
+        let first = setup_file_cookie(auth.clone(), ClientId(701), &c1);
+        let second = setup_file_cookie(auth.clone(), ClientId(702), &c2);
+        let first_again = setup_file_cookie(auth, ClientId(703), &c1);
+
+        let credential = |admission| match admission {
+            Admission::Cookie {
+                credential, source, ..
+            } => {
+                assert_eq!(source, CredentialSource::File);
+                credential
+            }
+            other => panic!("expected file-cookie admission, got {other:?}"),
+        };
+        assert_eq!(credential(first), credential(first_again));
+        assert_ne!(credential(first), credential(second));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn setup_file_cookie(auth: Arc<AuthState>, id: ClientId, cookie: &[u8]) -> Admission {
+        let (server_side, client_side) = crate::peer::connected_unix_pair();
+        setup_admission_on_stream(
+            auth,
+            id,
+            server_side,
+            client_side,
+            MIT_MAGIC_COOKIE.as_bytes(),
+            cookie,
+            false,
+        )
+    }
+
+    // Mutation: labelling a session-cookie match as File makes this assertion fail.
+    #[test]
+    fn session_cookie_admits_as_session() {
+        let cookie = [0x31u8; 16];
+        let auth = AuthState::new_with_xdmcp(None, true);
+        assert!(auth.install_session_cookie(
+            crate::core_loop::generation::Generation::default(),
+            MIT_MAGIC_COOKIE.as_bytes(),
+            &cookie,
+        ));
+        let admission = setup_file_cookie(auth, ClientId(704), &cookie);
+        assert!(matches!(
+            admission,
+            Admission::Cookie {
+                source: CredentialSource::Session,
+                ..
+            }
+        ));
+    }
+
+    // Mutation: recording the presented cookie instead of the host-list fallback makes this fail.
+    #[test]
+    fn failed_cookie_then_host_list_admits_as_host_access() {
+        let auth = AuthState::new(None);
+        let wrong_cookie = [0x41u8; 16];
+        let admission = setup_file_cookie(auth, ClientId(705), &wrong_cookie);
+        assert_eq!(admission, Admission::HostAccess);
+    }
+
     /// Drain `n` bytes from `s` with a deadline; returns the bytes.
     fn read_n_with_timeout(s: &mut UnixStream, n: usize, timeout: Duration) -> io::Result<Vec<u8>> {
-        s.set_read_timeout(Some(timeout))?;
+        // macOS fails SO_RCVTIMEO with EINVAL once the peer has closed; the
+        // read below then reports the buffered bytes or EOF itself.
+        match s.set_read_timeout(Some(timeout)) {
+            Err(e) if e.kind() != io::ErrorKind::InvalidInput => return Err(e),
+            _ => {}
+        }
         let mut buf = vec![0u8; n];
         s.read_exact(&mut buf)?;
         Ok(buf)
@@ -368,7 +615,9 @@ mod tests {
         let (poll, sender, rx) = channel().unwrap();
         let _ = poll; // keep the poll alive (waker borrows from registry)
         let registry = make_registry();
-        let (server_side, mut client_side) = UnixStream::pair().unwrap();
+        // Through a listener, so the peer credentials below are the
+        // production ones on every platform.
+        let (server_side, mut client_side) = crate::peer::connected_unix_pair();
         let id = ClientId(7);
 
         spawn(
@@ -379,6 +628,7 @@ mod tests {
             AuthState::new(None),
             true,
             true,
+            false,
         )
         .unwrap();
 
@@ -405,6 +655,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 screen_width_px: 800,
                 screen_height_px: 600,
+                screen_width_mm: 212,
+                screen_height_mm: 159,
                 current_input_masks: 0,
             })
             .unwrap();
@@ -430,12 +682,17 @@ mod tests {
                 resource_id_base,
                 resource_id_mask,
                 byte_order,
+                peer,
                 ..
             } => {
                 assert_eq!(got, id);
                 assert_eq!(resource_id_base, 0x0010_0000);
                 assert_eq!(resource_id_mask, 0x000F_FFFF);
                 assert_eq!(byte_order, ClientByteOrder::LittleEndian);
+                assert_eq!(peer.transport, AuthTransport::Unix);
+                // SAFETY: plain getter with no preconditions.
+                let euid = unsafe { libc::geteuid() };
+                assert_eq!(peer.cred.map(|cred| cred.uid), Some(euid));
             }
             other => panic!("expected ClientSetupComplete, got {other:?}"),
         }
@@ -465,6 +722,7 @@ mod tests {
             AuthState::new(None),
             true,
             true,
+            false,
         )
         .unwrap();
         write_big_endian_setup(&mut client_side).unwrap();
@@ -481,6 +739,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 screen_width_px: 800,
                 screen_height_px: 600,
+                screen_width_mm: 212,
+                screen_height_mm: 159,
                 current_input_masks: 0,
             })
             .unwrap();
@@ -529,6 +789,7 @@ mod tests {
             AuthState::new(None),
             true,
             true,
+            false,
         )
         .unwrap();
 
@@ -566,6 +827,7 @@ mod tests {
             AuthState::new(None),
             true,
             true,
+            false,
         )
         .unwrap();
         write_setup_request(&mut client_side).unwrap();
@@ -580,6 +842,8 @@ mod tests {
                 resource_id_mask: 0x000F_FFFF,
                 screen_width_px: 800,
                 screen_height_px: 600,
+                screen_width_mm: 212,
+                screen_height_mm: 159,
                 current_input_masks: 0,
             })
             .unwrap();
@@ -683,6 +947,7 @@ mod tests {
             AuthState::new(Some(path.clone())),
             true,
             true,
+            false,
         )
         .unwrap();
 
@@ -711,6 +976,7 @@ mod tests {
             AuthState::new(Some(path.clone())),
             true,
             true,
+            false,
         )
         .unwrap();
 
@@ -739,9 +1005,10 @@ mod tests {
 
         // Connection is closed by the server after reject (read → 0 bytes / EOF).
         let mut tail = [0u8; 1];
-        client_side
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
+        // macOS fails SO_RCVTIMEO with EINVAL once the peer has closed.
+        if let Err(e) = client_side.set_read_timeout(Some(Duration::from_secs(2))) {
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "read timeout: {e}");
+        }
         let n = client_side.read(&mut tail).unwrap_or(0);
         assert_eq!(n, 0, "server closed the connection after reject");
         let _ = std::fs::remove_file(&path);

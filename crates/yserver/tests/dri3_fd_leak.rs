@@ -8,7 +8,7 @@
 //! Marked `#[ignore]` because it needs a working Vulkan ICD (lavapipe
 //! suffices). Run with `cargo test -p yserver --test dri3_fd_leak --
 //! --ignored` under vng or on bare metal.
-
+#![cfg(kms)]
 #![cfg(target_os = "linux")]
 // Test-side client buffers, outside the server's memory ledger.
 #![allow(clippy::disallowed_methods)]
@@ -28,6 +28,16 @@ fn dri3_import_loop_does_not_leak_fds() {
     use yserver::kms::vk::{device::VkContext, dri3::DRM_FORMAT_MOD_LINEAR, target::DrawableImage};
 
     let vk = VkContext::new().expect("VkContext init failed — install lavapipe or run under vng");
+
+    // Some lavapipe builds (e.g. GitHub's Ubuntu runner) advertise dma-buf
+    // export but cannot back it; skip there instead of failing.
+    match create_dmabuf_export(&vk, 64, 64) {
+        Ok(probe) => drop(probe),
+        Err(e) => {
+            eprintln!("skipping: this Vulkan ICD cannot export dma-bufs ({e})");
+            return;
+        }
+    }
 
     let baseline = fd_count();
     let iterations = 10_000usize;

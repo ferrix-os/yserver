@@ -1,0 +1,822 @@
+//! The platform seam: what the portable half of the backend needs from the
+//! platform under it (KMS today). No DRM, GBM or window-system type crosses it.
+//!
+//! Accessors come first. The hooks after them are the `Backend` methods
+//! whose behaviour depends on the platform; each takes the whole backend and
+//! defaults to the plain `Backend` default (no VT, no DPMS, no DRI3, one
+//! fixed output).
+
+use std::io;
+
+use yserver_core::{
+    backend::{
+        Backend, BackendFdKind, CrtcConfigApply, CrtcConfigToken, Dri3Caps, Dri3ImportModifier,
+        Dri3PixmapExport, PixmapHandle, PresentCaps, PresentClockSample, PresentClockSource,
+        PresentScanoutCandidate, PresentSourceWait,
+    },
+    server::ServerState,
+};
+
+use crate::kms::render::{
+    backend::XBackend,
+    present_batch::{PendingPresentBatch, PresentBatchWait},
+    scene::{OutputLayout, OutputSink},
+    store::DrawableId,
+};
+
+/// What an access does with a drawable's pixels
+/// (`Platform::settle_for_access`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Access {
+    Read,
+    Write,
+}
+
+/// A platform the backend runs on. The GPU comes through [`OutputSink`].
+pub trait Platform: OutputSink + Sized + 'static {
+    /// Platform-owned backend state, a sibling of `platform` on the backend
+    /// so platform code keeps disjoint field borrows.
+    type BackendState;
+
+    /// The logical screen size in pixels.
+    fn fb_size(&self) -> (u16, u16);
+    /// What the scene reads of every live output, in output order.
+    fn output_layouts(&self) -> Vec<OutputLayout>;
+
+    /// A drawable's storage is gone; forget platform caches keyed by it.
+    fn note_drawable_retired(_st: &mut Self::BackendState, _id: DrawableId) {}
+    /// Drop platform-owned per-client state when an X connection closes.
+    fn client_disconnected(
+        _st: &mut Self::BackendState,
+        _client_id: yserver_protocol::x11::ClientId,
+    ) {
+    }
+    /// The keyboard LEDs should show `lit`, the lit XKB indicators (bit 0
+    /// Caps Lock, bit 1 Num Lock, bit 2 Scroll Lock).
+    fn set_keyboard_leds(_st: &mut Self::BackendState, _lit: u32) {}
+    /// Whether the screen shows a client buffer directly, bypassing the scene.
+    fn direct_scanout_owns_frame(_b: &XBackend<Self>) -> bool {
+        false
+    }
+    /// Whether KMS tearing owns the cursor policy for the current frame.
+    fn tearing_active(_b: &XBackend<Self>) -> bool {
+        false
+    }
+    /// Per-output hardware-cursor suppression for a direct tearing owner.
+    fn tearing_cursor_suppression_mask(_b: &XBackend<Self>, output_count: usize) -> Vec<bool> {
+        vec![false; output_count]
+    }
+    /// Whether the tearing owner overlaps this cursor footprint.
+    fn tearing_cursor_intersects_owner(
+        _b: &XBackend<Self>,
+        _cursor_x: i64,
+        _cursor_y: i64,
+        _hot_x: i64,
+        _hot_y: i64,
+        _width: i64,
+        _height: i64,
+    ) -> bool {
+        false
+    }
+    /// Whether the effective cursor sprite overlaps any live output.
+    fn cursor_intersects_outputs(
+        _b: &XBackend<Self>,
+        _output_indices: &[usize],
+        _cursor_x: i64,
+        _cursor_y: i64,
+        _hot_x: i64,
+        _hot_y: i64,
+        _width: i64,
+        _height: i64,
+    ) -> bool {
+        false
+    }
+    /// Route pointer motion while KMS tearing owns cursor composition.
+    fn cursor_motion_during_tearing(_b: &mut XBackend<Self>, _cursor_visible: bool) {}
+    /// Record the current root pointer position for delayed platform cursor shows.
+    fn note_root_pointer_position(_b: &mut XBackend<Self>, _x: i32, _y: i32) {}
+    /// Whether `mark_dirty` should leave a cursor-only tearing cap intact
+    /// instead of converting it into scene damage.
+    fn tearing_cursor_compose_cap_applies(_b: &XBackend<Self>) -> bool {
+        false
+    }
+    /// Record copy damage relevant to an active tearing stream.
+    fn note_tearing_copy_damage(_b: &mut XBackend<Self>, _dst_window_xid: u32) {}
+    /// Leave tearing when a portable window lifecycle change affects its owner.
+    fn exit_tearing_for_window(_b: &mut XBackend<Self>, _host_xid: u32, _reason: &'static str) {}
+    /// Leave direct scanout for the composed scene.
+    fn request_direct_unflip(_b: &mut XBackend<Self>, _reason: &'static str) {}
+    /// Leave only owners whose retained target or paint chain uses this drawable.
+    fn request_direct_unflip_for_host_drawable(
+        _b: &mut XBackend<Self>,
+        _host_xid: u32,
+        _reason: &'static str,
+    ) {
+    }
+    /// A projected top-level stacking order changed.
+    fn on_top_level_order_changed(_b: &mut XBackend<Self>) {}
+    /// A Bounding or Clip shape changed.
+    fn on_direct_shape_changed(_b: &mut XBackend<Self>) {}
+    /// Hand cursor visibility back from Root tearing scanout.
+    fn request_tearing_cursor_handoff(_b: &mut XBackend<Self>) {}
+    /// Whether every direct frame is the COW or one of its descendants.
+    fn direct_frames_are_under_cow(_b: &XBackend<Self>) -> bool {
+        false
+    }
+    /// Rebind the cursor planes to `record` under direct scanout; `false` on
+    /// failure.
+    fn refresh_direct_cursor(
+        _b: &mut XBackend<Self>,
+        _record: &std::sync::Arc<crate::kms::render::cursor::CursorRecord>,
+    ) -> Vec<usize> {
+        Vec::new()
+    }
+    /// XFIXES HideCursor while no compose runs: detach the cursor planes.
+    fn hide_cursor_under_direct_scanout(_b: &mut XBackend<Self>) {}
+    /// Reapply a hidden cursor policy after output resume, including stale
+    /// plane bindings left by a failed best-effort suspend hide.
+    fn recover_hidden_cursor_on_resume(_b: &mut XBackend<Self>) {}
+    /// The cursor sprite's size or hotspot changed.
+    fn note_cursor_sprite(
+        _b: &mut XBackend<Self>,
+        _width: u16,
+        _height: u16,
+        _hot_x: u16,
+        _hot_y: u16,
+    ) {
+    }
+    /// Re-read a KMS window property whose value affects live scanout policy.
+    fn on_window_property_changed(
+        _b: &mut XBackend<Self>,
+        _state: &ServerState,
+        _host_xid: u32,
+        _property: yserver_protocol::x11::AtomId,
+    ) {
+    }
+    /// `XWarpPointer` moved the X pointer to root `(x, y)`; a windowed
+    /// platform moves the host pointer to match.
+    fn host_pointer_warped(_b: &mut XBackend<Self>, _x: i32, _y: i32) {}
+    /// XTEST motion moved the X pointer to root `(x, y)`; a platform whose
+    /// host pointer follows it (rootless) warps it.
+    fn host_pointer_moved_by_server(_b: &mut XBackend<Self>, _x: i32, _y: i32) {}
+    /// Move a hardware-plane cursor (scene cursor mode Hw, or Mixed).
+    fn move_hw_cursor(
+        b: &mut XBackend<Self>,
+        _mixed: bool,
+        _pos: (i32, i32),
+        _hot: (u16, u16),
+        _size: (i32, i32),
+    ) {
+        b.scene.wake_for_damage();
+    }
+    /// Whether the platform may present now (KMS: holds DRM master).
+    fn scanout_allowed(_b: &XBackend<Self>) -> bool {
+        true
+    }
+    /// The fallible part of a COW release: what must exist before a direct
+    /// frame's buffers can go. Must leave nothing that needs undoing.
+    fn prepare_cow_release(_b: &mut XBackend<Self>) -> io::Result<()> {
+        Ok(())
+    }
+    /// The COW release while a direct frame still owns the screen: defer
+    /// the teardown and return `true`, or `false` to tear down now.
+    fn defer_cow_release(_b: &mut XBackend<Self>) -> bool {
+        false
+    }
+    /// A pixmap backing lost a reference; drop its dma-buf export if unused.
+    fn maybe_teardown_export(_b: &mut XBackend<Self>, _id: DrawableId) {}
+    /// Watch a Present batch's wait; returns the wait the queue keeps.
+    fn register_present_batch_wait(
+        _b: &mut XBackend<Self>,
+        wait: PresentBatchWait,
+    ) -> PresentBatchWait {
+        match wait {
+            PresentBatchWait::Fd(_) => PresentBatchWait::Poll,
+            other => other,
+        }
+    }
+    /// Stop watching a drained batch's wait.
+    fn release_present_batch_wait(_b: &mut XBackend<Self>, _batch: &PendingPresentBatch) {}
+    /// Wake the core loop to drain Present completions.
+    fn wake_present_completion(_b: &XBackend<Self>, _context: &str) {}
+    /// Reset the Present completion wake before a drain.
+    fn clear_present_completion_wake(_b: &XBackend<Self>) {}
+    /// What is on screen under the root rect `rect`, which lies in one output.
+    fn read_on_screen_region(
+        _b: &mut XBackend<Self>,
+        _rect: ash::vk::Rect2D,
+    ) -> io::Result<Vec<u8>> {
+        Err(io::Error::other("no on-screen output to read"))
+    }
+    /// Diagnostic dump of what each output scans out.
+    fn dump_scanout_files(_b: &mut XBackend<Self>) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn randr_outputs_and_modes(
+        b: &mut XBackend<Self>,
+    ) -> (
+        Vec<yserver_core::randr::RandrOutput>,
+        Vec<yserver_core::randr::RandrMode>,
+    ) {
+        crate::kms::render::backend::seam::single_output_randr(b.platform.fb_size(), 60)
+    }
+
+    fn randr_providers(_b: &mut XBackend<Self>) -> Vec<yserver_core::randr::RandrProvider> {
+        Vec::new()
+    }
+
+    fn crtc_gamma_size(_b: &XBackend<Self>, _crtc: u32) -> u16 {
+        0
+    }
+
+    fn set_crtc_gamma(
+        _b: &mut XBackend<Self>,
+        _crtc: u32,
+        _red: &[u16],
+        _green: &[u16],
+        _blue: &[u16],
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn get_crtc_gamma(_b: &XBackend<Self>, _crtc: u32) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
+        (Vec::new(), Vec::new(), Vec::new())
+    }
+
+    fn set_vidmode_gamma(
+        _b: &mut XBackend<Self>,
+        _table: Option<&yserver_core::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn on_scanout_render_completion(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
+
+    fn on_page_flip_ready(
+        _b: &mut XBackend<Self>,
+        _state: &mut ServerState,
+        _drm_fd: yserver_core::fd::RawFd,
+    ) {
+    }
+
+    fn before_block(_b: &mut XBackend<Self>) {}
+
+    fn flush_before_damage_notify(_b: &mut XBackend<Self>) {}
+
+    fn next_wakeup(_b: &XBackend<Self>) -> Option<std::time::Instant> {
+        None
+    }
+
+    fn maybe_composite(_b: &mut XBackend<Self>) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Drain the platform's queue after it posted `Message::PlatformEvent`.
+    fn on_platform_event(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
+
+    /// Rootless top-level events of this iteration (spec §4.1); only a
+    /// rootless presenter takes them.
+    fn on_rootless_events(
+        _b: &mut XBackend<Self>,
+        _state: &ServerState,
+        _events: &[yserver_core::rootless::RootlessEvent],
+    ) {
+    }
+
+    /// The core's established-client count changed.
+    fn note_client_count(_b: &mut XBackend<Self>, _count: usize) {}
+
+    fn dump_scanout(_b: &mut XBackend<Self>) {}
+
+    fn report_export_holders(
+        _b: &mut XBackend<Self>,
+        _core: &dyn Fn() -> yserver_core::backend::export_holders::CoreHolders,
+    ) -> bool {
+        false
+    }
+
+    fn note_present_pixmap(_b: &mut XBackend<Self>, _src_pixmap_xid: u32, _dst_window_xid: u32) {}
+
+    fn note_present_scanout_candidate(
+        _b: &mut XBackend<Self>,
+        _candidate: PresentScanoutCandidate,
+    ) {
+    }
+
+    fn try_present_direct(
+        _b: &mut XBackend<Self>,
+        _candidate: PresentScanoutCandidate,
+        _event: yserver_core::backend::CompletedPresentEvent,
+    ) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn arm_present_source_wait(
+        _b: &mut XBackend<Self>,
+        _src_pixmap_host_xid: u32,
+        _dst_window_host_xid: u32,
+    ) -> io::Result<PresentSourceWait> {
+        Ok(PresentSourceWait::Ready)
+    }
+
+    fn arm_present_syncobj_wait(
+        _b: &mut XBackend<Self>,
+        _src_pixmap_host_xid: u32,
+        _dst_window_host_xid: u32,
+        _acquire_syncobj: u32,
+        _acquire_value: u64,
+    ) -> io::Result<PresentSourceWait> {
+        Ok(PresentSourceWait::Ready)
+    }
+
+    fn drain_ready_present_source_waits(_b: &mut XBackend<Self>) -> Vec<u64> {
+        Vec::new()
+    }
+
+    fn begin_ready_present_destination_write(_b: &mut XBackend<Self>, _wait_id: u64) {}
+
+    fn finish_present_source_wait(_b: &mut XBackend<Self>, _wait_id: u64) {}
+
+    /// `Backend::present_supersedes_same_msc`.
+    fn present_supersedes_same_msc(_b: &XBackend<Self>) -> bool {
+        true
+    }
+
+    fn present_flip_in_flight(_b: &XBackend<Self>, _crtc_id: u32) -> bool {
+        false
+    }
+
+    fn present_display_idle(_b: &XBackend<Self>, _crtc_id: u32) -> bool {
+        true
+    }
+
+    fn present_absolute_vblank_arm_supported(_b: &XBackend<Self>, _crtc_id: u32) -> bool {
+        false
+    }
+
+    fn arm_present_shared_wake(_b: &mut XBackend<Self>, _randr_crtc_id: u32) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn present_scanout_blackout(_b: &XBackend<Self>) -> bool {
+        false
+    }
+
+    fn poll_fds(_b: &XBackend<Self>) -> Vec<(yserver_core::fd::RawFd, BackendFdKind)> {
+        Vec::new()
+    }
+
+    fn vt_switching_armed(_b: &XBackend<Self>) -> bool {
+        false
+    }
+
+    fn set_input_sender(_b: &mut XBackend<Self>, _sender: yserver_core::core_loop::CoreSender) {}
+
+    fn request_vt_switch(_b: &mut XBackend<Self>, _vt: u32) {}
+
+    fn begin_vt_release(_b: &mut XBackend<Self>) -> bool {
+        false
+    }
+
+    fn finish_vt_release(
+        b: &mut XBackend<Self>,
+        state: &mut ServerState,
+        _input_inventory: &yserver_core::core_loop::input_inventory::InputInventory,
+    ) {
+        Backend::on_vt_release(b, state);
+    }
+
+    fn on_vt_acquire(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
+
+    fn on_display_hotplug(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
+
+    fn reprobe_connectors(_b: &mut XBackend<Self>, _state: &mut ServerState) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn set_provider_output_source(
+        _b: &mut XBackend<Self>,
+        _state: &mut ServerState,
+        _provider: u32,
+        _source_provider: Option<u32>,
+    ) -> io::Result<bool> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "provider output-source relationships are unsupported",
+        ))
+    }
+
+    fn begin_crtc_config(
+        b: &mut XBackend<Self>,
+        output_id: u32,
+        connector: &str,
+        mode: Option<yserver_core::backend::ModeSpec>,
+        x: i32,
+        y: i32,
+    ) -> io::Result<CrtcConfigApply> {
+        Self::apply_crtc_config(b, output_id, connector, mode, x, y).map(CrtcConfigApply::Applied)
+    }
+
+    fn drain_ready_crtc_configs(_b: &mut XBackend<Self>) -> Vec<CrtcConfigToken> {
+        Vec::new()
+    }
+
+    fn finish_crtc_config(_b: &mut XBackend<Self>, _token: CrtcConfigToken) -> io::Result<bool> {
+        Err(io::Error::other(
+            "unknown asynchronous CRTC configuration token",
+        ))
+    }
+
+    fn cancel_crtc_config(_b: &mut XBackend<Self>, _token: CrtcConfigToken) {}
+
+    fn apply_crtc_config(
+        _b: &mut XBackend<Self>,
+        _output_id: u32,
+        _connector: &str,
+        _mode: Option<yserver_core::backend::ModeSpec>,
+        _x: i32,
+        _y: i32,
+    ) -> io::Result<bool> {
+        Ok(false)
+    }
+
+    fn refresh_randr_state_set_time(
+        _b: &mut XBackend<Self>,
+        _state: &mut yserver_core::server::ServerState,
+        _set_time: u32,
+    ) {
+    }
+
+    fn randr_layout_changed(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
+
+    fn output_identity(_b: &XBackend<Self>, _output_id: u32) -> Option<(Vec<u8>, String)> {
+        None
+    }
+
+    fn set_logical_screen_size(_b: &mut XBackend<Self>, _w: u16, _h: u16) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn randr_limits(_b: &XBackend<Self>) -> yserver_core::randr::RandrLimits {
+        yserver_core::randr::RandrLimits::default()
+    }
+
+    /// `Backend::on_host_display_ready`: a rootless host's display
+    /// connection is readable, or writable while it has output queued;
+    /// `false` when it closed.
+    fn on_host_display_ready(_b: &mut XBackend<Self>, _state: &mut ServerState) -> bool {
+        true
+    }
+
+    /// `Backend::host_display_wants_writable`.
+    fn host_display_wants_writable(_b: &XBackend<Self>) -> bool {
+        false
+    }
+
+    fn poll_deferred_input(_b: &mut XBackend<Self>, _state: &mut ServerState) {}
+
+    fn start_device_config(
+        _b: &mut XBackend<Self>,
+        _source: yserver_core::xinput::InputSourceId,
+        _change: yserver_core::xinput::libinput_props::DeviceConfigChange,
+        _cancel: yserver_core::xinput::libinput_props::DeviceConfigCancelToken,
+    ) -> Result<
+        yserver_core::xinput::libinput_props::DeviceConfigStart,
+        yserver_core::xinput::libinput_props::DeviceConfigError,
+    > {
+        Ok(yserver_core::xinput::libinput_props::DeviceConfigStart::Applied)
+    }
+
+    fn supports_dmabuf_export(_b: &XBackend<Self>) -> bool {
+        false
+    }
+
+    fn glx_vendor_names(_b: &XBackend<Self>) -> &'static str {
+        yserver_protocol::x11::glx::VENDOR_NAMES
+    }
+
+    fn acquire_glx_pixmap_export(_b: &mut XBackend<Self>, _host_xid: u32) {}
+
+    fn release_glx_pixmap_export(_b: &mut XBackend<Self>, _host_xid: u32) {}
+
+    fn promote_pixmap_exportable(_b: &mut XBackend<Self>, _host_xid: u32) -> bool {
+        false
+    }
+
+    fn dri3_open(_b: &mut XBackend<Self>, _drawable: u32) -> io::Result<yserver_core::fd::OwnedFd> {
+        Err(io::Error::other("DRI3 unsupported on this backend"))
+    }
+
+    /// Whether GLX is advertised: only where a GL client stack can use it.
+    fn glx_available(_b: &XBackend<Self>) -> bool {
+        false
+    }
+
+    fn dri3_capabilities(_b: &XBackend<Self>) -> Dri3Caps {
+        Dri3Caps::unsupported()
+    }
+
+    /// The drawable `host_xid`, whose pixels are in `backing` (`None`: its
+    /// own storage, by its XID), is about to be read or, `Access::Write`,
+    /// drawn into: a platform that has left a backing owed a frame copies
+    /// the frame in first, so the access sees it and a draw lands on it.
+    /// Called by `XBackend::resolve_paint_target` and
+    /// `XBackend::resolve_paint_source`, and by `XBackend::settle_drawable`
+    /// where a drawable's storage is read by its XID.
+    fn settle_for_access(
+        _b: &mut XBackend<Self>,
+        _host_xid: u32,
+        _backing: Option<DrawableId>,
+        _access: Access,
+    ) {
+    }
+
+    /// A client freed pixmap `host_xid`; its storage is still there.
+    fn pixmap_freed(_b: &mut XBackend<Self>, _host_xid: u32) {}
+
+    fn dri3_import_pixmap(
+        _b: &mut XBackend<Self>,
+        _fd: yserver_core::fd::OwnedFd,
+        _width: u16,
+        _height: u16,
+        _stride: u32,
+        _offset: u32,
+        _modifier: Dri3ImportModifier,
+        _depth: u8,
+        _bpp: u8,
+    ) -> io::Result<PixmapHandle> {
+        Err(io::Error::other("DRI3 import unsupported on this backend"))
+    }
+
+    fn dri3_supported_modifiers(
+        _b: &XBackend<Self>,
+        _window: u32,
+        _depth: u8,
+        _bpp: u8,
+    ) -> (Vec<u64>, Vec<u64>) {
+        // 0 == DRM_FORMAT_MOD_LINEAR.
+        (vec![0], vec![0])
+    }
+
+    fn dri3_export_pixmap(
+        _b: &mut XBackend<Self>,
+        _host_xid: u32,
+    ) -> io::Result<(u32, u16, u16, u16, u8, u8, yserver_core::fd::OwnedFd)> {
+        Err(io::Error::other("DRI3 export unsupported on this backend"))
+    }
+
+    fn dri3_export_pixmap_buffers(
+        _b: &mut XBackend<Self>,
+        _host_xid: u32,
+    ) -> io::Result<Dri3PixmapExport> {
+        Err(io::Error::other(
+            "DRI3 BuffersFromPixmap unsupported on this backend",
+        ))
+    }
+
+    fn dri3_begin_export_pixmap_buffers(
+        b: &mut XBackend<Self>,
+        host_xid: u32,
+    ) -> io::Result<yserver_core::backend::Dri3ExportBegin> {
+        Self::dri3_export_pixmap_buffers(b, host_xid)
+            .map(yserver_core::backend::Dri3ExportBegin::Ready)
+    }
+
+    fn drain_ready_dri3_exports(
+        _b: &mut XBackend<Self>,
+    ) -> Vec<yserver_core::backend::Dri3ExportToken> {
+        Vec::new()
+    }
+
+    fn finish_dri3_export(
+        _b: &mut XBackend<Self>,
+        _token: yserver_core::backend::Dri3ExportToken,
+    ) -> io::Result<Dri3PixmapExport> {
+        Err(io::Error::other("unknown deferred DRI3 export token"))
+    }
+
+    fn release_dri3_export(
+        _b: &mut XBackend<Self>,
+        _token: yserver_core::backend::Dri3ExportToken,
+    ) {
+    }
+
+    fn dri3_fence_from_fd(
+        _b: &mut XBackend<Self>,
+        _fence_xid: u32,
+        _fd: yserver_core::fd::OwnedFd,
+    ) -> io::Result<()> {
+        Err(io::Error::other("DRI3 FenceFromFD unsupported"))
+    }
+
+    fn dri3_trigger_fence(_b: &mut XBackend<Self>, _fence_xid: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn dri3_fence_triggered(_b: &XBackend<Self>, _fence_xid: u32) -> Option<bool> {
+        None
+    }
+
+    fn dri3_reset_fence(_b: &mut XBackend<Self>, _fence_xid: u32) {}
+
+    fn dri3_destroy_fence(_b: &mut XBackend<Self>, _fence_xid: u32) {}
+
+    fn dri3_xshmfence_handle(
+        _b: &XBackend<Self>,
+        _fence_xid: u32,
+    ) -> Option<std::sync::Arc<dyn yserver_core::backend::XshmfenceHandle>> {
+        None
+    }
+
+    fn dri3_syncobj_handle(
+        _b: &XBackend<Self>,
+        _syncobj_xid: u32,
+    ) -> Option<std::sync::Arc<dyn yserver_core::backend::SyncobjHandle>> {
+        None
+    }
+
+    fn dri3_syncobj_owned(
+        _b: &XBackend<Self>,
+        _client_id: yserver_protocol::x11::ClientId,
+        _syncobj_xid: u32,
+    ) -> bool {
+        false
+    }
+
+    fn dri3_fd_from_fence(
+        _b: &mut XBackend<Self>,
+        _fence_xid: u32,
+    ) -> io::Result<yserver_core::fd::OwnedFd> {
+        Err(io::Error::other("DRI3 FDFromFence unsupported"))
+    }
+
+    fn dri3_import_syncobj(
+        _b: &mut XBackend<Self>,
+        _client_id: yserver_protocol::x11::ClientId,
+        _syncobj_xid: u32,
+        _fd: yserver_core::fd::OwnedFd,
+    ) -> io::Result<()> {
+        Err(io::Error::other("DRI3 ImportSyncobj unsupported"))
+    }
+
+    fn dri3_free_syncobj(
+        _b: &mut XBackend<Self>,
+        _client_id: yserver_protocol::x11::ClientId,
+        _syncobj_xid: u32,
+    ) -> io::Result<()> {
+        Err(io::Error::other("DRI3 FreeSyncobj unsupported"))
+    }
+
+    fn dri3_signal_syncobj(
+        _b: &mut XBackend<Self>,
+        _syncobj_xid: u32,
+        _value: u64,
+    ) -> io::Result<()> {
+        Err(io::Error::other("DRI3 SignalSyncobj unsupported"))
+    }
+
+    fn drain_completed_present_events(
+        b: &mut XBackend<Self>,
+    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+        b.drain_completed_present_events_impl()
+    }
+
+    fn drain_retired_present_idle_events(
+        _b: &mut XBackend<Self>,
+    ) -> Vec<yserver_core::backend::CompletedPresentEvent> {
+        Vec::new()
+    }
+
+    fn present_crtc_clock_epoch(_b: &XBackend<Self>, _crtc_id: u32) -> u64 {
+        0
+    }
+
+    fn present_get_ust_msc(_b: &XBackend<Self>, _crtc_id: u32) -> (u64, u64) {
+        (0, 0)
+    }
+
+    fn present_get_completion_clock(
+        b: &XBackend<Self>,
+        crtc_id: u32,
+    ) -> yserver_core::backend::PresentClockSample {
+        let (msc, ust) = Self::present_get_ust_msc(b, crtc_id);
+        PresentClockSample {
+            msc,
+            ust,
+            source: PresentClockSource::BackendVblank,
+        }
+    }
+
+    fn arm_idle_vblanks(
+        _b: &mut XBackend<Self>,
+        _crtc_id: u32,
+        _target_mscs: &[u64],
+    ) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    fn arm_present_completion_idle_vblanks(
+        _b: &mut XBackend<Self>,
+        _crtc_id: u32,
+        _target_mscs: &[u64],
+    ) -> std::io::Result<usize> {
+        Ok(0)
+    }
+
+    fn present_capabilities(_b: &XBackend<Self>, _window: u32, _crtc_id: u32) -> PresentCaps {
+        PresentCaps::default()
+    }
+
+    fn dpms_capable(_b: &XBackend<Self>) -> bool {
+        false
+    }
+
+    fn set_dpms_power(_b: &mut XBackend<Self>, _level: u8) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// RANDR for a platform with one fixed output covering the screen.
+#[must_use]
+pub(crate) fn single_output_randr(
+    (width, height): (u16, u16),
+    vrefresh: u32,
+) -> (
+    Vec<yserver_core::randr::RandrOutput>,
+    Vec<yserver_core::randr::RandrMode>,
+) {
+    let outputs = vec![yserver_core::randr::RandrOutput {
+        name: "WINDOW-0".to_string(),
+        output_id: 1,
+        crtc_id: 2,
+        mode_id: 3,
+        connected: true,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        vrefresh,
+        timing: None,
+        // No EDID: `RandrState::output_info` synthesises 96 DPI.
+        mm_width: 0,
+        mm_height: 0,
+        mode_ids: vec![3],
+        num_preferred: 1,
+        pending_transform: Default::default(),
+        current_transform: Default::default(),
+        rotation: yserver_core::randr::RR_ROTATE_0,
+    }];
+    let modes = yserver_core::randr::RandrState::from_outputs(0, outputs.clone()).mode_table;
+    (outputs, modes)
+}
+
+/// A prepare stage of a screen resize that a test makes fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResizeFault {
+    /// Allocating root, COW or slot images.
+    Alloc,
+    /// Filling or tiling the new root or COW.
+    Fill,
+    /// Building the scene's new output state.
+    #[cfg_attr(all(kms, not(test)), allow(dead_code))] // The surface's.
+    Outputs,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The stage a resize fails at, after passing it this many times.
+    static RESIZE_FAULT: std::cell::Cell<Option<(ResizeFault, u32)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Make the resize step at `stage` fail once on this thread, after `skip`
+/// passes of it (tests).
+#[cfg(test)]
+pub(crate) fn inject_resize_fault(stage: ResizeFault, skip: u32) {
+    RESIZE_FAULT.with(|fault| fault.set(Some((stage, skip))));
+}
+
+/// Whether a test asked this pass of `stage` to fail; the fault is consumed.
+#[must_use]
+pub(crate) fn resize_fault(stage: ResizeFault) -> bool {
+    #[cfg(test)]
+    {
+        RESIZE_FAULT.with(|fault| match fault.get() {
+            Some((at, 0)) if at == stage => {
+                fault.set(None);
+                true
+            }
+            Some((at, skip)) if at == stage => {
+                fault.set(Some((at, skip - 1)));
+                false
+            }
+            _ => false,
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = stage;
+        false
+    }
+}

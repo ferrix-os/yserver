@@ -5,34 +5,38 @@
 //! B.3 close). Implements the `Backend` trait directly; `lib.rs`
 //! constructs `KmsBackend` at startup.
 
+// The KMS platform is still the only caller of parts of the portable backend
+// (cursor animation, VT input release, pointer re-confinement).
+#[cfg_attr(not(kms), allow(dead_code))]
 mod backend;
-pub(crate) mod batch_resource;
+#[cfg(kms)]
 pub(crate) mod completion_poller;
-pub(crate) mod composite_pool_ring;
-pub(crate) mod cursor;
-pub(crate) mod descriptor_pool_ring;
-pub(crate) mod engine;
+#[cfg(kms)]
 pub(crate) mod export_holders;
-pub(crate) mod frame_builder;
-pub(crate) mod glyph_atlas;
-pub(crate) mod glyph_pixels;
+#[cfg(kms)]
 pub(crate) mod imported_syncobj;
-pub(crate) mod owned_semaphore;
+#[cfg(kms)]
 pub(crate) mod platform;
+#[cfg_attr(not(kms), allow(dead_code))]
+pub(crate) mod pointer_confine;
 pub(crate) mod present_completion;
+#[cfg(kms)]
 pub(crate) mod present_source_wait;
+#[cfg(kms)]
 pub(crate) mod probe_executor;
-pub(crate) mod region;
-pub(crate) mod root_overlay;
-pub(crate) mod scanout_damage;
-pub(crate) mod scene;
-pub(crate) mod scene_diff;
-pub(crate) mod store;
-pub(crate) mod stroke;
-pub(crate) mod submit_group;
-pub(crate) mod submit_trace;
-pub(crate) mod target;
-pub(crate) mod telemetry;
-pub(crate) mod upload_arena;
 
+#[cfg(kms)]
 pub use backend::KmsBackend;
+#[cfg(test)]
+pub(crate) use backend::seam::inject_resize_fault;
+pub(crate) use backend::{
+    XBackend,
+    seam::{Platform, ResizeFault, resize_fault},
+};
+pub use yserver_render::kms::render::cpu_types;
+pub(crate) use yserver_render::kms::render::{
+    cursor, engine, frame_builder, geometry, glyph_pixels, gpu, present_batch, root_overlay, scene,
+    store, stroke, submit_group, submit_trace, target, telemetry, window_geometry,
+};
+#[cfg(kms)]
+pub(crate) use yserver_render::kms::render::{owned_semaphore, region};

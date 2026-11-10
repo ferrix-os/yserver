@@ -9,6 +9,19 @@ pub struct PropertyValue {
     pub data: Vec<u8>,
 }
 
+/// Whether `_VARIABLE_REFRESH` has the Xorg-compatible format-32, one-item,
+/// nonzero representation. Both Present admission and live KMS property
+/// changes must use this same predicate; Xorg ignores the property's type.
+#[must_use]
+pub fn variable_refresh_property_enabled(value: Option<&PropertyValue>) -> bool {
+    value.is_some_and(|value| {
+        value.format == PropertyFormat::F32
+            && value.data.len() == 4
+            && <[u8; 4]>::try_from(value.data.as_slice())
+                .is_ok_and(|bytes| u32::from_le_bytes(bytes) != 0)
+    })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PropertyFormat {
     F8,
@@ -149,10 +162,12 @@ pub fn slice_for_get<'a>(
     let any = requested_type.0 == 0;
     let matches = any || requested_type == p.r#type;
     if !matches {
+        // Xorg answers a type mismatch with the item count, not the byte
+        // length: `reply.bytesAfter = pProp->size` (`dix/property.c:492-501`).
         return Ok(GetPropertySlice {
             r#type: p.r#type,
             format: p.format.protocol_value(),
-            bytes_after: total as u32,
+            bytes_after: (total / p.format.bytes() as u64) as u32,
             value: &[],
         });
     }
@@ -186,6 +201,47 @@ pub fn slice_for_get<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    // Mutation: restore the CARDINAL type check or the `== 1` check; INTEGER/1 or CARDINAL/2 must fail.
+    fn variable_refresh_property_reads_like_xorg() {
+        use yserver_protocol::x11::AtomId;
+
+        let property = |r#type, format, data| PropertyValue {
+            r#type: AtomId(r#type),
+            format,
+            data,
+        };
+
+        let cardinal = crate::xinput::XA_CARDINAL.0;
+        let integer = crate::xinput::XA_INTEGER.0;
+        assert!(variable_refresh_property_enabled(Some(&property(
+            integer,
+            PropertyFormat::F32,
+            1_u32.to_le_bytes().to_vec(),
+        ))));
+        assert!(variable_refresh_property_enabled(Some(&property(
+            cardinal,
+            PropertyFormat::F32,
+            2_u32.to_le_bytes().to_vec(),
+        ))));
+        assert!(!variable_refresh_property_enabled(Some(&property(
+            cardinal,
+            PropertyFormat::F32,
+            0_u32.to_le_bytes().to_vec(),
+        ))));
+        assert!(!variable_refresh_property_enabled(Some(&property(
+            cardinal,
+            PropertyFormat::F8,
+            vec![1],
+        ))));
+        assert!(!variable_refresh_property_enabled(Some(&property(
+            cardinal,
+            PropertyFormat::F32,
+            [1_u32.to_le_bytes(), 2_u32.to_le_bytes()].concat(),
+        ))));
+        assert!(!variable_refresh_property_enabled(None));
+    }
 
     mod apply_change_tests {
         use super::*;
@@ -471,6 +527,18 @@ mod tests {
         }
 
         #[test]
+        fn type_mismatch_bytes_after_is_the_item_count() {
+            let p = PropertyValue {
+                r#type: AtomId(6),
+                format: PropertyFormat::F32,
+                data: vec![0; 20],
+            };
+            let s = slice_for_get(Some(&p), AtomId(19), 0, 1024).unwrap();
+            assert_eq!(s.format, 32);
+            assert_eq!(s.bytes_after, 5);
+        }
+
+        #[test]
         fn read_format32_long_length_one_returns_4_bytes() {
             let p = PropertyValue {
                 r#type: AtomId(31),
@@ -578,7 +646,7 @@ mod tests {
                 prop_assume!(other_t != p.r#type.0);
                 let s = slice_for_get(Some(&p), AtomId(other_t), 0, u32::MAX / 4).unwrap();
                 prop_assert!(s.value.is_empty());
-                prop_assert_eq!(s.bytes_after as usize, p.data.len());
+                prop_assert_eq!(s.bytes_after as usize, p.data.len() / p.format.bytes());
                 prop_assert_eq!(s.r#type, p.r#type);
             }
 

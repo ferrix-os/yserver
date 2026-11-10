@@ -1,0 +1,254 @@
+//! A rootless host served on the core thread: a window system the server
+//! is a client of over a socket the core loop polls
+//! (`BackendFdKind::HostDisplay`), such as a Wayland compositor. It runs on
+//! the card-less KMS platform, which keeps DRI3 and Present on a render
+//! node.
+//!
+//! Its events reach the core as they would from a host with a UI thread of
+//! its own, only without the hop: [`DisplayHost::dispatch`] collects what
+//! the window system said as [`HostWork`] -- host requests, input and frame
+//! events, in the order it said them -- and the platform applies it in that
+//! order with the state in hand, after the host is no longer borrowed.
+
+use std::{cell::RefCell, io, os::fd::RawFd, rc::Rc, time::Instant};
+
+use ash::vk;
+use yserver_core::{
+    backend::{ActiveCursorImage, Backend},
+    core_loop::HostInputEvent,
+    rootless::{HostRequest, RootlessEvent, ToplevelId},
+    server::ServerState,
+};
+
+use super::host::{
+    CpuFrame, DirectBuffer, DirectFrame, DmabufFrame, FrameEvent, HandoffKind, RootlessHost,
+};
+use crate::kms::vk::device::VkContext;
+
+/// One thing the window system said, for the core or the presenter.
+#[derive(Debug)]
+pub(crate) enum HostItem {
+    Request(HostRequest),
+    Input(HostInputEvent),
+    /// The window system's keyboard state, which X's takes as it is.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host passes its keyboard's state")
+    )]
+    Keyboard(HostKeyboardState),
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues its frame events")
+    )]
+    Frame(FrameEvent),
+}
+
+/// What one dispatch of the host's connection asks of the core and the
+/// presenter, in the order the window system said it. One queue, not one
+/// per kind: a key press read before a focus change must reach the window
+/// that had the focus when it was pressed.
+#[derive(Debug, Default)]
+pub(crate) struct HostWork(Vec<HostItem>);
+
+impl HostWork {
+    pub(crate) fn request(&mut self, request: HostRequest) {
+        self.0.push(HostItem::Request(request));
+    }
+
+    pub(crate) fn input(&mut self, event: HostInputEvent) {
+        self.0.push(HostItem::Input(event));
+    }
+
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host passes its keyboard's state")
+    )]
+    pub(crate) fn keyboard(&mut self, state: HostKeyboardState) {
+        self.0.push(HostItem::Keyboard(state));
+    }
+
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues its frame events")
+    )]
+    pub(crate) fn frame(&mut self, event: FrameEvent) {
+        self.0.push(HostItem::Frame(event));
+    }
+
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues work between reads")
+    )]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `other`'s items after this queue's.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host queues work between reads")
+    )]
+    pub(crate) fn append(&mut self, mut other: HostWork) {
+        self.0.append(&mut other.0);
+    }
+
+    #[cfg(all(test, wayland_host))]
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, HostItem> {
+        self.0.iter()
+    }
+}
+
+impl IntoIterator for HostWork {
+    type Item = HostItem;
+    type IntoIter = std::vec::IntoIter<HostItem>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+/// The host's screen: the root's size and the refresh of its one RandR
+/// output (spec §5: one host output until per-output RandR).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HostScreen {
+    pub width: u16,
+    pub height: u16,
+    /// Millihertz; 0 when the window system gave none.
+    pub refresh_mhz: u64,
+}
+
+/// The window system's keyboard state as X's: the real modifiers (X's
+/// eight, Shift to Mod5) depressed, latched and locked, and the group in
+/// force. The server's keyboard takes it as it is, as Xwayland takes
+/// `wl_keyboard.modifiers`: no key is pressed or released for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct HostKeyboardState {
+    pub depressed: u8,
+    pub latched: u8,
+    pub locked: u8,
+    pub group: u8,
+}
+
+/// The window system's keymap: XKB's text form, which the server's keymap
+/// is from start, and the layout and variant the XKB rules call its group
+/// in force, where they name it (`_XKB_RULES_NAMES`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HostKeymap {
+    pub text: String,
+    pub layout: Option<(String, String)>,
+}
+
+/// A host whose display connection the core loop polls.
+pub(crate) trait DisplayHost: RootlessHost {
+    /// The connection the core loop polls.
+    fn fd(&self) -> RawFd;
+    /// A descriptor the core loop polls besides the connection (as
+    /// `BackendFdKind::HostDisplay` too), readable when the host's own work
+    /// can move: the pipes of a clipboard's transfers. Taken once, as the
+    /// loop starts.
+    fn wake_fd(&self) -> Option<RawFd> {
+        None
+    }
+    /// Read what the window system sent into `work`, until a read would
+    /// block: the core loop polls the fd edge-triggered, so what is left
+    /// unread is not reported again.
+    ///
+    /// # Errors
+    ///
+    /// The window system closed the connection.
+    fn dispatch(&mut self, work: &mut HostWork) -> io::Result<()>;
+    /// What the host queued since its connection was last read, into
+    /// `work`: the frame events of the presenter's last tick, which come
+    /// back from the host's own calls rather than from the window system.
+    /// The platform takes it each loop iteration; a host that has some
+    /// asks for one with [`DisplayHost::next_wakeup`].
+    fn take_queued(&mut self, _work: &mut HostWork) {}
+    /// Once per loop iteration, with the state in hand, for work that is not
+    /// a window's (a clipboard bridge). The host must not call back into the
+    /// platform's rootless state from here.
+    fn service(&mut self, _state: &mut ServerState, _backend: &mut dyn Backend) {}
+    /// Send what is queued, without blocking: it runs on the core thread.
+    /// What the socket does not take now stays queued, and
+    /// [`DisplayHost::unsent`] says so; the next call (the platform calls
+    /// this at least once each loop iteration, before the loop blocks) sends
+    /// it.
+    fn flush(&mut self) {}
+    /// The last [`DisplayHost::flush`] left output queued: the core loop
+    /// watches [`DisplayHost::fd`] for writable too, and comes round when
+    /// the socket takes more.
+    fn unsent(&self) -> bool {
+        false
+    }
+    /// The host's screen.
+    fn screen(&self) -> Option<HostScreen>;
+    /// When the loop must come round for the host's own work.
+    fn next_wakeup(&self) -> Option<Instant> {
+        None
+    }
+    /// The window system's keymap, which the server's takes at start, so a
+    /// key means in X what it means in the host's other windows.
+    fn keymap(&self) -> Option<HostKeymap> {
+        None
+    }
+    /// The name of the RandR output the host's screen is.
+    fn output_name(&self) -> &'static str {
+        "HOST-1"
+    }
+}
+
+/// A [`DisplayHost`] shared between the platform, which polls it, and the
+/// presenter, which hands it frames.
+pub(crate) type SharedHost = Rc<RefCell<dyn DisplayHost>>;
+
+/// The presenter's handle on a [`SharedHost`].
+pub(crate) struct PresenterHandle(pub SharedHost);
+
+impl RootlessHost for PresenterHandle {
+    fn handoff(&self, id: ToplevelId, depth: u8) -> HandoffKind {
+        self.0.borrow().handoff(id, depth)
+    }
+
+    fn create_surface(&mut self, id: ToplevelId, vk: &VkContext) -> io::Result<vk::SurfaceKHR> {
+        self.0.borrow_mut().create_surface(id, vk)
+    }
+
+    fn submit_cpu(&mut self, frame: CpuFrame) {
+        self.0.borrow_mut().submit_cpu(frame);
+    }
+
+    fn submit_dmabuf(&mut self, frame: DmabufFrame) {
+        self.0.borrow_mut().submit_dmabuf(frame);
+    }
+
+    fn first_frame(&mut self, id: ToplevelId) {
+        self.0.borrow_mut().first_frame(id);
+    }
+
+    fn on_events(&mut self, events: &[RootlessEvent]) {
+        self.0.borrow_mut().on_events(events);
+    }
+
+    fn frame_wanted(&mut self, id: ToplevelId) {
+        self.0.borrow_mut().frame_wanted(id);
+    }
+
+    fn set_cursor(&mut self, cursor: Option<&ActiveCursorImage>) {
+        self.0.borrow_mut().set_cursor(cursor);
+    }
+
+    fn takes_direct(&self, depth: u8) -> bool {
+        self.0.borrow().takes_direct(depth)
+    }
+
+    fn import_direct(&mut self, buffer: DirectBuffer) {
+        self.0.borrow_mut().import_direct(buffer);
+    }
+
+    fn submit_direct(&mut self, frame: DirectFrame) -> bool {
+        self.0.borrow_mut().submit_direct(frame)
+    }
+
+    fn forget_direct(&mut self, generations: &[u64]) {
+        self.0.borrow_mut().forget_direct(generations);
+    }
+}

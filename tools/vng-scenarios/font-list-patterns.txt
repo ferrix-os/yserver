@@ -1,0 +1,42 @@
+# max<TAB>pattern, for font-list-probe.c on the font-list path.
+# Not here: an XLFD naming a size, or with a size wildcard, that reaches a
+# bitmap XLFD before max-names runs out. Xorg's bitmap scaler adds scaled
+# and -0-0- names for those (and lists an exact one twice); yserver does
+# not scale bitmap fonts.
+# CDE: dtwm, dtterm and dtpad probe their -dt-interface aliases one name at a time.
+# "names": ListFontsWithInfo names only. Xorg serves an alias that leads to a
+# 75dpi font as that font scaled from 100dpi, which comes first on the path;
+# yserver does not scale bitmap fonts.
+1	-dt-interface user-medium-r-normal-m*-*-*-*-*-*-*-ISO8859-1
+1	-dt-interface system-medium-r-normal-m*-*-*-*-*-*-*-ISO8859-1
+1	-dt-interface system-medium-r-normal-s*-*-*-*-*-*-*-KOI8-R
+1	-dt-interface user-medium-r-normal-m*-*-*-*-*-*-*-JISX0201.1976-0
+1	-dt-interface user-medium-r-normal-l*-*-*-*-*-m-*-iso8859-1	names
+1	-dt-interface user-bold-r-normal-m sans-17-120-100-100-m-100-iso8859-1
+100	-dt-interface user-bold-r-normal-m sans-17-120-100-100-m-100-iso8859-1
+1	-dt-interface system-medium-r-normal-m serif-17-120-100-100-p-96-iso8859-1
+100	-dt-interface user-bold-r-normal-m sans-14-130-75-75-m-70-koi8-r
+100	-dt-interface system-*-iso8859-1	names
+1000	-dt-interface user-*	names
+1000	-dt-interface *-100-100-*
+# Exact names and aliases, any case.
+10	fixed
+10	FIXED
+10	variable
+10	5x7
+10	cursor
+10	nosuchfont
+# Xorg's PatternMatch takes the character after a * literally.
+10	5x7**
+10	*?x7
+10	5?7
+10	5X7*
+# Wildcards, with and without a charset; max-names cuts the walk.
+1	-*-*-*-*-*-*-*-*-*-*-*-*-iso8859-1
+5	-misc-fixed-*-*-*-*-*-*-*-*-*-*-iso8859-1
+1000	-*-*-*-*-*-*-1?-*-*-*-*-*-koi8-r
+1000	*x1?
+1000	?x??
+20	*
+0	*
+10	-nosuch-*

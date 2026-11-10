@@ -1,5 +1,7 @@
+#[cfg(test)]
+mod tests;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Write,
     sync::{
         Arc, Mutex,
@@ -51,13 +53,13 @@ pub struct IdAllocator {
     /// `next_base` so XID-heavy workloads (xts5 XIproto opens a fresh
     /// connection per protocol-validation TP and burned through bases
     /// after ~4096 reconnects, hitting the u32 ceiling) keep going.
-    /// `Vec` rather than `VecDeque` because allocate/release strict
-    /// LIFO order is fine — Xorg's `clientPrivates` reuses MRU bases
-    /// similarly. Released bases of *retained* clients (CloseDownMode
+    /// The lowest is reused first, as Xorg's `NextAvailableClient` takes
+    /// the lowest free client index (dix/dispatch.c `nextFreeClientID`).
+    /// Released bases of *retained* clients (CloseDownMode
     /// `RetainPermanent`/`RetainTemporary`) are NOT pushed here — the
     /// resources owned by those bases stay live in the resource table
     /// and a fresh client reusing the base would collide with them.
-    free_bases: Vec<u32>,
+    free_bases: BTreeSet<u32>,
 }
 
 impl IdAllocator {
@@ -65,18 +67,18 @@ impl IdAllocator {
     pub fn new() -> Self {
         Self {
             next_base: FIRST_CLIENT_BASE,
-            free_bases: Vec::new(),
+            free_bases: BTreeSet::new(),
         }
     }
 
     /// Returns `(resource_id_base, resource_id_mask)` for a new client.
-    /// Reuses a previously-released base if one is available; otherwise
+    /// Reuses the lowest previously-released base if one is available; otherwise
     /// bumps the monotonic counter. Returns `None` only when the free
     /// list is empty AND the next monotonic base would overflow `u32`
     /// — in practice unreachable for any realistic workload now that
     /// disconnect recycles bases.
     pub fn allocate(&mut self) -> Option<(u32, u32)> {
-        if let Some(base) = self.free_bases.pop() {
+        if let Some(base) = self.free_bases.pop_first() {
             return Some((base, PER_CLIENT_MASK));
         }
         let base = self.next_base;
@@ -98,7 +100,7 @@ impl IdAllocator {
             log::warn!("IdAllocator::release: ignoring invalid base 0x{base:x}");
             return;
         }
-        self.free_bases.push(base);
+        self.free_bases.insert(base);
     }
 
     /// `id` is owned by the holder of `(base, mask)` iff `(id & !mask) == base`.
@@ -114,9 +116,9 @@ impl Default for IdAllocator {
     }
 }
 
-/// Xorg's per-client XKB state (`ClientRec`, xkb/xkb.c): whether the
-/// client called XkbUseExtension, and the two XkbSelectEvents detail masks
-/// Xorg keeps per client rather than per device.
+/// Xorg's per-client XKB state (`ClientRec`, xkb/xkb.c): XKB initialization,
+/// `PerClientFlags`, and the event detail masks Xorg keeps per client rather
+/// than per device.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct XkbClientState {
     /// `_XkbClientInitialized`: a successful XkbUseExtension. Every other
@@ -128,6 +130,22 @@ pub struct XkbClientState {
     pub map_notify_mask: u16,
     /// `newKeyboardNotifyMask`: the XkbNewKeyboardNotify details selected.
     pub new_keyboard_notify_mask: u16,
+    /// XKB `PerClientFlags` value (`XkbPCF_AllFlagsMask` subset).
+    /// Kept with the existing client-owned XKB state so it is removed with
+    /// the client and cannot leak between connections.
+    pub per_client_flags: u32,
+    /// `PerClientFlags` AutoResetControls state, reported in its reply.
+    pub auto_reset_ctrls: u32,
+    pub auto_reset_ctrl_values: u32,
+}
+
+impl XkbClientState {
+    /// Whether this client requested XKB DetectableAutoRepeat.
+    #[must_use]
+    pub(crate) fn wants_detectable_auto_repeat(self) -> bool {
+        // XkbPCF_DetectableAutoRepeatMask.
+        self.per_client_flags & 1 != 0
+    }
 }
 
 /// One client's interest in one XKB device (`XkbInterestRec`): the
@@ -238,6 +256,9 @@ impl AtomTable {
 #[derive(Debug, Clone)]
 pub struct PassiveButtonGrab {
     pub owner: ClientId,
+    /// 0 for a core GrabButton (master semantics), otherwise the exact XI2
+    /// device requested by XIPassiveGrabDevice.
+    pub device_id: u16,
     pub grab_window: ResourceId,
     /// 0 = AnyButton
     pub button: u8,
@@ -270,6 +291,9 @@ pub struct PassiveButtonGrab {
 #[derive(Debug, Clone)]
 pub struct KeyGrab {
     pub owner: ClientId,
+    /// 0 for a core GrabKey (master semantics), otherwise the exact XI2
+    /// device requested by XIPassiveGrabDevice.
+    pub device_id: u16,
     pub grab_window: ResourceId,
     /// 0 == AnyKey
     pub keycode: u8,
@@ -353,6 +377,26 @@ pub struct Xi1ActiveGrab {
     pub passive_detail: Option<u8>,
 }
 
+/// An owned selection, Xorg's `Selection` (`include/selection.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionOwner {
+    /// The owner window; `ResourceId(0)` (None) once released. Xorg keeps
+    /// the record with its `lastTimeChanged` after SetSelectionOwner(None),
+    /// the setter's disconnect and the window's destruction
+    /// (`dix/selection.c:113-139`, `:204-207`).
+    pub window: ResourceId,
+    /// `lastTimeChanged` in ms, the resolved time of the `SetSelectionOwner`
+    /// that set it; `selection_timestamp` in `XFixesSelectionNotify`
+    /// (`xfixes/select.c:89`).
+    pub last_time_changed: u32,
+    /// The client whose `SetSelectionOwner` set it, which need not own
+    /// `window` (`dix/selection.c:220`); `None` (`NullClient`) once released.
+    /// SelectionClear and SelectionRequest go to it, and its disconnect
+    /// clears the selection with ClientClose
+    /// (`DeleteClientFromAnySelections`, `dix/selection.c:128-139`).
+    pub client: Option<ClientId>,
+}
+
 /// Core keyboard focus state — Xorg `FocusClassRec` (win/revert/time)
 /// for the virtual core keyboard.
 #[derive(Debug, Clone, Copy)]
@@ -407,6 +451,10 @@ pub struct Xi1Freeze {
 pub enum QueuedInputEvent {
     HostPointer(crate::host_x11::HostPointerEvent),
     HostKey(crate::host_x11::HostKeyEvent),
+    /// A key already processed through the per-device/master guards. Keep the
+    /// accepted master edge with frozen delivery so thaw cannot infer a new
+    /// transition from later held state, and retain the synthetic-repeat marker.
+    HostKeyTransition(crate::host_x11::HostKeyEvent, bool, bool),
     Xi1Routed(Xi1QueuedEvent),
     /// The master-keyboard form of an XI2 raw key event, queued behind a
     /// frozen keyboard in input order (Xorg enqueues the master's
@@ -554,11 +602,12 @@ pub struct Xi1QueuedEvent {
     /// Absolute XI1 wire event code (XI_FIRST_EVENT + offset).
     pub evcode: u8,
     pub detail: u8,
+    /// This key event belongs to the synthetic software auto-repeat pair.
+    /// Pointer events and ordinary device keys keep false.
+    pub synthetic_repeat: bool,
     pub time: u32,
     pub root_x: i16,
     pub root_y: i16,
-    pub event_x: i16,
-    pub event_y: i16,
     pub state_mask: u16,
     /// Natural (hit/focus) target the selection walk starts from.
     pub natural_target: ResourceId,
@@ -628,17 +677,13 @@ pub struct ActivePointerGrab {
     /// this is the event window's MERGED xi2 selection captured at
     /// activation (Xorg ActivateImplicitGrab: xi2mask_merge(tempGrab->
     /// xi2mask, inputMasks->xi2mask), events.c:2183-2189). XIGrabDevice
-    /// sets `u64::MAX` — its wire mask is not parsed (pre-existing
-    /// permissive delivery); core GrabPointer sets 0 (never consulted:
-    /// the XI2 redirect delivers nothing for via_xi2=false grabs).
+    /// snapshots the request's XI2 event-type mask; core GrabPointer sets 0
+    /// (never consulted: the XI2 redirect delivers nothing for via_xi2=false
+    /// grabs).
     pub xi2_mask: u64,
 }
 
-/// XComposite redirect mode. Both wire constants are accepted —
-/// `Automatic` (update=0) and `Manual` (update=1) — but the
-/// redirected-backing pixmap path is unimplemented, so no code
-/// currently branches on the variant. The record's presence is what
-/// `NameWindowPixmap` and the disconnect-cleanup paths consult.
+/// XComposite redirect mode: `Automatic` (update=0) or `Manual` (update=1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeRedirectMode {
     Manual,
@@ -767,6 +812,29 @@ pub struct ScreenSaverState {
     /// cleared when `active` returns to `Off`. Mirrors Xorg
     /// `WaitFor.c:473-476`.
     pub next_cycle: Option<Instant>,
+
+    /// `SetAttributes`: the window one client wants shown while the saver
+    /// is on (Xorg `ScreenSaverAttrRec`, `Xext/saver.c:734-1073`).
+    pub attributes: Option<SaverAttributes>,
+    /// That window ([`crate::resources::SCREEN_SAVER_WINDOW`]) exists.
+    pub window_shown: bool,
+}
+
+/// What `ScreenSaverSetAttributes` stores: a `CreateWindow` for the saver
+/// window, child of the root, owned by the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaverAttributes {
+    pub client: ClientId,
+    pub x: i16,
+    pub y: i16,
+    pub width: u16,
+    pub height: u16,
+    pub border_width: u16,
+    pub class: u8,
+    pub depth: u8,
+    pub visual: u32,
+    pub value_mask: u32,
+    pub values: Vec<u32>,
 }
 
 impl ScreenSaverState {
@@ -786,6 +854,8 @@ impl ScreenSaverState {
             selected_by: HashMap::new(),
             suspend_counts: HashMap::new(),
             next_cycle: None,
+            attributes: None,
+            window_shown: false,
         }
     }
 }
@@ -821,7 +891,19 @@ pub struct KeyboardControlState {
     pub auto_repeats_explicit: [u8; 32],
     /// LED bitmask (led N → bit N-1). `DEFAULT_LEDS` = all off.
     pub led_mask: u32,
+    /// XKB RepeatKeys delay before the first repeat, ms (`repeat_delay`,
+    /// set by XKB SetControls). [`XKB_DEFAULT_REPEAT_DELAY`] at startup.
+    pub repeat_delay: u16,
+    /// XKB RepeatKeys interval between repeats, ms (`repeat_interval`).
+    /// [`XKB_DEFAULT_REPEAT_INTERVAL`] at startup.
+    pub repeat_interval: u16,
 }
+
+/// Xorg `XkbDfltRepeatDelay` (`xkb/xkbAccessX.c:46`); Xvfb's GetControls
+/// reports it (`kms/testdata/xorg-repeat-controls.txt`).
+pub const XKB_DEFAULT_REPEAT_DELAY: u16 = 660;
+/// Xorg `XkbDfltRepeatInterval` (`xkb/xkbAccessX.c:47`).
+pub const XKB_DEFAULT_REPEAT_INTERVAL: u16 = 40;
 
 /// Xorg `include/input.h` `DEFAULT_AUTOREPEATS`: keycodes 8..=135
 /// repeat, the rest don't.
@@ -842,6 +924,8 @@ impl KeyboardControlState {
             auto_repeats: DEFAULT_AUTO_REPEATS,
             auto_repeats_explicit: [0; 32],
             led_mask: 0,
+            repeat_delay: XKB_DEFAULT_REPEAT_DELAY,
+            repeat_interval: XKB_DEFAULT_REPEAT_INTERVAL,
         }
     }
 
@@ -889,13 +973,11 @@ impl Default for PointerControlState {
     }
 }
 
-/// Per-window XComposite redirect record stored in
-/// [`ServerState::composite_redirects`]. The `owner` is the client
-/// that issued the `RedirectWindow` / `RedirectSubwindows` — used
-/// by the dispatch layer for `BadAccess` conflict detection and by
-/// `process_disconnect` to tear down redirects belonging to a
-/// departing client (L2 task B.1b).
-#[derive(Debug, Clone, Copy)]
+/// One client's XComposite redirect (Xorg `CompClientWindowRec`), kept in
+/// [`ServerState::composite_redirects`]. The `owner` is the client that
+/// issued the `RedirectWindow` / `RedirectSubwindows`; its records go with
+/// it at disconnect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RedirectRecord {
     pub mode: CompositeRedirectMode,
     pub owner: ClientId,
@@ -1013,6 +1095,9 @@ pub struct ServerState {
     pub server_grab_owner: Option<ClientId>,
     pub id_allocator: IdAllocator,
     pub start_instant: Instant,
+    /// The core's way to the host access list (`xhost`). Survives a reset
+    /// with the new generation, like `start_instant`.
+    pub host_access: crate::core_loop::auth::HostAccessHandle,
     pub randr: RandrState,
     /// RANDR event masks selected via RRSelectInput: (client, window) -> mask.
     pub randr_select_masks: HashMap<(u32, ResourceId), u16>,
@@ -1026,6 +1111,9 @@ pub struct ServerState {
     /// See [`RandrOutputProperty`] for why this lives beside `randr` rather
     /// than inside `RandrState`.
     pub randr_output_properties: HashMap<u32, Vec<(AtomId, RandrOutputProperty)>>,
+    /// RANDR 1.5 client-defined monitors in `SetMonitor` order. See
+    /// [`crate::randr::ClientMonitor`] for why this lives beside `randr`.
+    pub randr_client_monitors: Vec<crate::randr::ClientMonitor>,
     /// One bit per RANDR minor opcode whose unsupported behavior has already
     /// produced a warning. Repeated requests remain visible at debug level
     /// without flooding ordinary desktop layout reapplication logs.
@@ -1036,13 +1124,8 @@ pub struct ServerState {
     /// Xorg's per-device XKB interest (`XkbInterestRec`, the other
     /// XkbSelectEvents detail masks): (client, device spec) -> masks.
     pub xkb_interests: HashMap<(u32, u16), XkbInterest>,
-    /// Selection ownership: maps selection atom → (owning window,
-    /// `lastTimeChanged` in ms). `lastTimeChanged` is the timestamp
-    /// from the `SetSelectionOwner` request that produced this entry;
-    /// it surfaces on the wire as `selection_timestamp` in
-    /// `XFixesSelectionNotify` events (Xorg `xfixes/select.c:89` reads
-    /// `selection->lastTimeChanged`).
-    pub selections: HashMap<AtomId, (ResourceId, u32)>,
+    /// Selection ownership by selection atom.
+    pub selections: HashMap<AtomId, SelectionOwner>,
     /// Last known pointer position in root coordinates, cached from the
     /// pointer fanout. XI2 focus events (FocusIn/FocusOut share the
     /// `xXIEnterEvent` layout and carry the pointer position) are emitted
@@ -1051,6 +1134,17 @@ pub struct ServerState {
     pub pointer_root: (i16, i16),
     /// Active pointer grab record (full state including event_mask/cursor/time).
     pub active_pointer_grab: Option<ActivePointerGrab>,
+    /// XI2 pointer grabs on exact slave devices. Master and core pointer
+    /// grabs continue to use `active_pointer_grab`.
+    pub xi2_pointer_grabs: HashMap<u16, ActivePointerGrab>,
+    /// XI2 keyboard grabs on exact slave devices. Master and core keyboard
+    /// grabs continue to use `active_keyboard_grab`.
+    pub xi2_keyboard_grabs: HashMap<u16, ActiveKeyboardGrab>,
+    /// Original master for a slave temporarily detached by an explicit
+    /// XI2 grab (`dix/events.c::DetachFromMaster`).
+    pub xi2_detached_masters: HashMap<u16, u16>,
+    /// Per-slave sprite position retained during a floating pointer grab.
+    pub floating_pointer_positions: HashMap<u16, (f32, f32)>,
     /// Registered passive button grabs.
     pub button_grabs: Vec<PassiveButtonGrab>,
     /// Global withheld-event queue, in arrival order across devices.
@@ -1093,19 +1187,13 @@ pub struct ServerState {
     /// Currently-pressed keycodes, one bit per keycode (byte k/8, bit
     /// k%8) — the QueryKeymap bitmap, maintained by the key fanout.
     pub keys_down: [u8; 32],
-    /// Last keyboard group yserver broadcast an `XkbStateNotify` for —
-    /// the dedup anchor shared by the two group-switch drivers
-    /// (XkbLatchLockState in `process_request`, and compiled `grp:` key
-    /// actions detected in `cook_host_key` / fanned out in
-    /// `key_event_fanout_to_state`). Each driver sets this after it
-    /// emits its StateNotify so the other doesn't re-emit a redundant
-    /// one on the next key.
-    pub last_xkb_group: u8,
-    /// Last effective real-modifier mask announced via `XkbStateNotify`
-    /// (companion to [`Self::last_xkb_group`]). The key fanout emits a
-    /// fresh `XkbStateNotify` whenever the effective mods change between
-    /// key events so libxkbcommon clients track modifier state (GH #59).
-    pub last_xkb_mods: u8,
+    /// The keyboard state `XkbStateNotify` last announced, `(group,
+    /// (effective, base, latched, locked))`: Xorg's `prev_state`, what the
+    /// next StateNotify's `changed` is computed against
+    /// (`core_loop::xkb_layout::announce_xkb_state`).
+    pub xkb_announced: (u8, (u8, u8, u8, u8)),
+    /// The lit indicators `XkbIndicatorStateNotify` last announced.
+    pub xkb_announced_indicators: u32,
     /// Window the pointer is currently confined to (0 = none) — set
     /// while an active pointer grab with `confine_to` is in effect
     /// (Xorg `ConfineCursorToWindow`). The pointer fanout clamps
@@ -1188,6 +1276,8 @@ pub struct ServerState {
     pub xfixes_cursor_hide_counts: HashMap<u32, u32>,
     /// SHAPE state per window. Missing entries mean the default window rectangle.
     pub shape_windows: HashMap<ResourceId, ShapeWindowState>,
+    /// Rootless mode; `None` unless an embedder called `rootless::enable`.
+    pub rootless: Option<crate::rootless::Rootless>,
     /// SHAPE select-input state: (client, window) -> enabled.
     pub shape_select_masks: HashMap<(u32, ResourceId), bool>,
     /// Unified pending-present store (spec "Unified pending-present
@@ -1221,11 +1311,16 @@ pub struct ServerState {
     /// (Task 19) lives on the KMS backend's `dri3_sync_resources` map.
     pub sync_fences: HashMap<u32, SyncFence>,
     pub damage_objects: HashMap<u32, DamageObject>,
+    /// Clock for [`DamageObject::list_pos`] and [`DamageObject::created`].
+    pub damage_list_clock: u64,
+    /// Windows realized unpainted whose background goes into the redirect
+    /// backing they are about to get.
+    pub background_paint_after_backing: HashSet<ResourceId>,
     /// A real DamageNotify was queued after backend drawing. Before client
     /// output is allowed to drain, the core asks the backend to submit that
     /// drawing so an external compositor cannot sample ahead of it.
     pub damage_notify_flush_pending: bool,
-    pub composite_redirects: HashMap<(ResourceId, bool), RedirectRecord>,
+    pub composite_redirects: crate::composite_redirects::CompositeRedirects,
     pub present_event_selections: HashMap<u32, PresentEventSelection>,
     /// `PresentNotifyMSC` requests parked for a future MSC, fired when a
     /// pageflip advances past their target (`drain_present_completions`).
@@ -1277,6 +1372,14 @@ pub struct ServerState {
     /// `SetClientVersion`. Missing means the legacy v0 reply layout, matching
     /// Xorg's `ClientMajorVersion`.
     pub vidmode_client_versions: HashMap<ClientId, (u16, u16)>,
+    /// The screen's VidMode gamma (red, green, blue) as the last `SetGamma`
+    /// stored it, which `GetGamma` reports: Xorg's `pScrn->gamma`, a float
+    /// each, 1.0 until set.
+    pub vidmode_gamma: [f32; 3],
+    /// The screen's VidMode gamma table under every CRTC's RANDR ramp, as
+    /// the last `SetGamma` or `SetGammaRamp` left it. `None` until the
+    /// first: the identity, and the CRTCs load their RANDR ramps alone.
+    pub vidmode_gamma_table: Option<crate::backend::gamma::VidModeGammaTable>,
     /// XI version each client announced with XIQueryVersion (Xorg
     /// `XIClientRec.major_version/minor_version`), kept by Xorg's rules:
     /// the first query sets it; a later one raises it only when both are
@@ -1284,6 +1387,11 @@ pub struct ServerState {
     /// to filter XI2 raw events under a grab (`FilterRawEvents`: an XI 2.0
     /// client gets no raw event from a grabbed device).
     pub xi2_client_versions: HashMap<ClientId, (u16, u16)>,
+    /// RANDR version each client last sent in QueryVersion (Xorg
+    /// `pRRClient->major_version/minor_version`, the client's own numbers).
+    /// Absent = never queried (0.0). `RRClientKnowsRates` (≥ 1.1) picks the
+    /// SetScreenConfig request size.
+    pub randr_client_versions: HashMap<ClientId, (u32, u32)>,
     /// `GLX_EXT_texture_from_pixmap` is advertised only when the backend
     /// confirmed at init that it can allocate and export a BGRA8 dma-buf.
     /// Set once from `backend.supports_dmabuf_export()` during startup;
@@ -1293,13 +1401,11 @@ pub struct ServerState {
     /// from the backend at startup. Space-separated, libglvnd priority
     /// order.
     pub glx_vendor_names: String,
-    /// Server-side key auto-repeat state. Set to `Some` while a key
-    /// is held; cleared on the matching release or replaced when a
-    /// different key is pressed (X11 spec: only the most recently
-    /// pressed key repeats). The core loop's poll uses
-    /// `repeat_state.next_fire` to compute its wake-up timeout so an
-    /// idle server still costs zero CPU.
-    pub repeat_state: Option<KeyRepeatState>,
+    /// Server-side key auto-repeat state, keyed by the originating XI
+    /// keyboard view. A key press on another keyboard cannot replace this
+    /// device's repeat. The core loop's poll uses the earliest `next_fire`
+    /// to compute its wake-up timeout so an idle server still costs zero CPU.
+    pub key_repeats: HashMap<crate::core_loop::InputOrigin, KeyRepeatState>,
     /// Global DPMS extension state (power management).
     pub dpms: DpmsState,
     /// MIT-SCREEN-SAVER extension state.
@@ -1327,8 +1433,9 @@ pub struct ServerState {
     /// This is the **single** authority on how many holds the overlay
     /// has; the backend deliberately counts nothing. Two counters that
     /// can disagree is what leaked the overlay across a compositor
-    /// crash. The backend sees exactly two edges: `get_overlay_window`
-    /// on 0 → 1 and `release_overlay_window` on 1 → 0.
+    /// crash. Claims do not decide existence: GetOverlayWindow
+    /// materializes whenever the COW record is absent, and
+    /// `DestroyWindow(COW)` leaves the claims (Xorg `compwindow.c:624-626`).
     ///
     /// Repeated Gets from one client push repeated entries, matching
     /// Xorg's N-`CompOverlayClientRec` model
@@ -1362,11 +1469,19 @@ pub struct ServerState {
     /// `ServerState` gives it the right lifetime under `-noreset` — as
     /// long as the server, which is as long as the orphaned overlay.
     pub cow_teardown_failed: bool,
+    /// Terminal: a client's windows could not be destroyed (a plan holding
+    /// the COW failed to prepare), so its teardown stopped with the client
+    /// record, its resources and its resource-ID range still in place. The
+    /// core loop shuts the server down at the end of the iteration. Holds
+    /// the cause for the shutdown log.
+    pub fatal_teardown: Option<String>,
     /// SYNC `Await` / `AwaitFence` in progress, keyed by client id. A client
     /// with an entry is suspended (Xorg `IgnoreClient`): the core loop's
     /// fair request queue keeps its later requests queued until the entry
     /// is removed — the await fired, or the client left.
     pub sync_awaits: HashMap<u32, SyncAwait>,
+    /// RECORD contexts (`core_loop::record`).
+    pub record: crate::core_loop::record::RecordState,
     /// SERVERTIME value last evaluated against alarms and awaits; the
     /// post-poll pass feeds `(last, now)` through the trigger tests the way
     /// Xorg's `ServertimeWakeupHandler` calls `SyncChangeCounter`.
@@ -1378,7 +1493,21 @@ pub struct ServerState {
     /// on the XIScrollClass entries in the XIQueryDevice reply. GDK
     /// reads the cumulative value off each XI_Motion-with-scroll-
     /// axis event and computes deltas from the previous sample.
+    /// Current XI master-pointer valuator state. Attached-source events
+    /// copy their cumulative scroll values here, matching Xorg's UpdateFromMaster.
     pub scroll_axis_value: [i32; 2],
+    /// Buttons held by physical pointer sources whose facets could not be
+    /// published because XI device IDs were exhausted. These sources still
+    /// participate in the attached master pointer's button aggregation.
+    pub unpublished_pointer_buttons_down: HashMap<crate::xinput::InputSourceId, u16>,
+    /// Key holds owned by each published XI keyboard, including virtual
+    /// XTEST and explicit XTEST targets. The saved origin lets source cleanup
+    /// submit the matching release through the normal guarded key path.
+    pub key_down_by_device: HashMap<u16, HashMap<u8, crate::core_loop::InputOrigin>>,
+    /// Key holds for enabled physical keyboard sources whose facet could not
+    /// be published because XI IDs were exhausted.
+    pub unpublished_keyboard_keys_down:
+        HashMap<crate::xinput::InputSourceId, HashMap<u8, crate::core_loop::InputOrigin>>,
     /// Installed colormaps in install order (oldest first). Capacity
     /// is the server's max installed minimum; we only have a single
     /// hardware colormap (TrueColor) so the list mostly mirrors the
@@ -1387,12 +1516,23 @@ pub struct ServerState {
     /// `ROOT_COLORMAP` at startup per X11 spec ("the default colormap
     /// for the screen is installed when the server first starts up").
     pub installed_colormaps: Vec<ResourceId>,
-    /// XI2 device and property registry.  One entry per static XI2
-    /// device (ids 2–5, mirroring the XIQueryDevice reply).  The slave-
-    /// pointer entry (id 4) is updated by `xi_seed_touchpad` /
-    /// `xi_clear_touchpad` when libinput reports a touchpad device.
-    /// Read by the XIListProperties / XIGetProperty handlers.
-    pub xi_devices: Vec<crate::xinput::XiDevice>,
+    /// Central XI registry. It owns the static masters/XTEST devices, live
+    /// physical facets, and source metadata. Existing property/query helpers
+    /// temporarily use its slice compatibility while consumers migrate.
+    pub xi_devices: crate::xinput::XiRegistry,
+    /// Xorg `last.slave` for the paired master pointer and keyboard.
+    /// Floating, disabled, and removed slaves are cleared before they can be
+    /// advertised as the current source again.
+    xi_last_pointer_slave: Option<u16>,
+    xi_last_keyboard_slave: Option<u16>,
+    /// Removed XI facet snapshots waiting for the lifecycle notification
+    /// stage. KMS fills this before unregistering the source so the later
+    /// notification path retains the exact descriptors that disappeared.
+    pub pending_xi_device_removals: Vec<crate::xinput::XiDevice>,
+    /// Atom identity for the read-only XTEST marker on virtual devices 4/5.
+    pub xtest_device_atom: AtomId,
+    /// Atom identity for each device's `Device Enabled` property.
+    pub xi_device_enabled_atom: AtomId,
     /// Pre-interned atom for the property-type literal `"FLOAT"`.
     ///
     /// `FLOAT` is **not** a predefined X atom, so the libinput
@@ -1402,12 +1542,11 @@ pub struct ServerState {
     pub float_atom: AtomId,
 }
 
-/// Server-side key auto-repeat. Carries the original `HostKeyEvent`
-/// so synthetic repeat events can re-use its time/state/coord
-/// fields when fan-out runs, plus the `Instant` at which the next
-/// repeat should fire. Per-key delay/rate overrides aren't tracked
-/// today — `core_loop::run` uses the X11 defaults (660 ms initial,
-/// 40 ms period ≈ 25 Hz).
+/// Server-side key auto-repeat for one input origin. Carries the original
+/// `HostKeyEvent` so synthetic repeat events retain source, state, and
+/// coordinates, plus the `Instant` at which the next repeat should fire.
+/// The delay and interval are the XKB RepeatKeys controls in
+/// [`KeyboardControlState`].
 #[derive(Clone, Copy, Debug)]
 pub struct KeyRepeatState {
     pub event: crate::host_x11::HostKeyEvent,
@@ -1523,6 +1662,203 @@ pub struct GlxDrawable {
 }
 
 impl ServerState {
+    /// Append an access policy. Policies run in installation order.
+    pub fn install_access_policy(&mut self, policy: Arc<dyn crate::access::AccessPolicy>) {
+        self.host_access.policies.push(policy);
+    }
+
+    /// Whether at least one access policy is installed.
+    pub(crate) fn policies_installed(&self) -> bool {
+        !self.host_access.policies.is_empty()
+    }
+
+    fn first_denial(
+        &self,
+        request: Option<crate::access::RequestOpcodes>,
+        ask: impl Fn(
+            &dyn crate::access::AccessPolicy,
+            &crate::access::AccessContext<'_>,
+        ) -> crate::access::Decision,
+    ) -> crate::access::Decision {
+        let policies = &self.host_access.policies;
+        if policies.is_empty() {
+            return crate::access::Decision::Allow;
+        }
+
+        let context = crate::access::AccessContext::new(self, request);
+        for policy in policies {
+            match ask(policy.as_ref(), &context) {
+                crate::access::Decision::Allow => {}
+                denial @ crate::access::Decision::Deny(_) => return denial,
+            }
+        }
+        crate::access::Decision::Allow
+    }
+
+    /// Resolve a resource's owner from the store for its exact resource kind.
+    /// This remains separate from `ResourceTable::resource_owner`, whose
+    /// narrower lookup is part of KillClient's existing BadValue behavior.
+    #[must_use]
+    pub(crate) fn access_resource_owner(
+        &self,
+        id: ResourceId,
+        kind: crate::access::ResourceKind,
+    ) -> Option<ClientId> {
+        use crate::access::ResourceKind;
+
+        let server_owner = crate::resources::SERVER_OWNER;
+        match kind {
+            ResourceKind::Window
+            | ResourceKind::Pixmap
+            | ResourceKind::Gc
+            | ResourceKind::Font
+            | ResourceKind::Cursor
+            | ResourceKind::Colormap
+            | ResourceKind::Picture
+            | ResourceKind::GlyphSet
+            | ResourceKind::Dri3Syncobj => self.resources.access_owner(id, kind),
+            ResourceKind::Region => self.xfixes_regions.get(&id.0).map(|region| region.owner),
+            ResourceKind::PointerBarrier => self
+                .pointer_barriers
+                .get(&id.0)
+                .map(|barrier| barrier.owner),
+            ResourceKind::SyncCounter => {
+                if crate::core_loop::sync_await::is_system_counter(id.0) {
+                    Some(server_owner)
+                } else {
+                    self.sync_counters.get(&id.0).map(|counter| counter.owner)
+                }
+            }
+            ResourceKind::SyncAlarm => self.sync_alarms.get(&id.0).map(|alarm| alarm.owner),
+            ResourceKind::SyncFence => self.sync_fences.get(&id.0).map(|fence| fence.owner),
+            ResourceKind::Damage => self.damage_objects.get(&id.0).map(|damage| damage.owner),
+            ResourceKind::PresentEventSelection => self
+                .present_event_selections
+                .get(&id.0)
+                .map(|selection| selection.owner),
+            ResourceKind::ShmSegment => self
+                .mit_shm_segments
+                .get(&id.0)
+                .map(|segment| segment.owner),
+            ResourceKind::GlxContext => self.glx_contexts.get(&id.0).map(|context| context.owner),
+            ResourceKind::GlxDrawable => {
+                self.glx_drawables.get(&id.0).map(|drawable| drawable.owner)
+            }
+            ResourceKind::RecordContext => self.record.owner(id.0),
+            ResourceKind::RandrOutput => self
+                .randr
+                .outputs
+                .iter()
+                .any(|output| output.output_id == id.0)
+                .then_some(server_owner),
+            ResourceKind::RandrCrtc => self
+                .randr
+                .outputs
+                .iter()
+                .any(|output| output.crtc_id == id.0)
+                .then_some(server_owner),
+            ResourceKind::RandrMode => self
+                .randr
+                .mode_table
+                .iter()
+                .chain(self.randr.modes.iter())
+                .any(|mode| mode.mode_id == id.0)
+                .then_some(server_owner),
+            ResourceKind::RandrProvider => self.randr.provider(id.0).map(|_| server_owner),
+        }
+    }
+
+    /// Ask installed policies whether a client may perform `mode` on a typed resource.
+    pub(crate) fn check_resource(
+        &self,
+        client: ClientId,
+        target: &crate::access::ResourceTarget,
+        mode: crate::access::AccessMode,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        if !self.policies_installed() {
+            return crate::access::Decision::Allow;
+        }
+        if client == crate::resources::SERVER_OWNER {
+            return crate::access::Decision::Allow;
+        }
+        self.first_denial(request, |policy, context| {
+            policy.resource(context, client, target, mode)
+        })
+    }
+
+    /// Ask installed policies whether a client may perform `mode` on a property.
+    pub(crate) fn check_property(
+        &self,
+        client: ClientId,
+        window: ResourceId,
+        property: AtomId,
+        mode: crate::access::AccessMode,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        if !self.policies_installed() {
+            return crate::access::Decision::Allow;
+        }
+        if client == crate::resources::SERVER_OWNER {
+            return crate::access::Decision::Allow;
+        }
+        self.first_denial(request, |policy, context| {
+            policy.property(context, client, window, property, mode)
+        })
+    }
+
+    /// Ask installed policies about a server operation, stopping at the first denial.
+    pub(crate) fn check_server(
+        &self,
+        client: ClientId,
+        mode: crate::access::AccessMode,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        self.first_denial(request, |policy, context| {
+            policy.server(context, client, mode)
+        })
+    }
+
+    /// Ask installed policies whether an extension is visible in discovery.
+    pub(crate) fn check_extension_access(
+        &self,
+        client: ClientId,
+        extension: &str,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        self.first_denial(request, |policy, context| {
+            policy.extension_access(context, client, extension)
+        })
+    }
+
+    /// Ask installed policies whether a request may be dispatched to an extension.
+    pub(crate) fn check_extension_dispatch(
+        &self,
+        client: ClientId,
+        extension: &str,
+        request: Option<crate::access::RequestOpcodes>,
+    ) -> crate::access::Decision {
+        self.first_denial(request, |policy, context| {
+            policy.extension_dispatch(context, client, extension)
+        })
+    }
+
+    /// Notify every installed policy in installation order.
+    pub(crate) fn notify_policies(
+        &self,
+        f: impl Fn(&dyn crate::access::AccessPolicy, &crate::access::AccessContext<'_>),
+    ) {
+        let policies = &self.host_access.policies;
+        if policies.is_empty() {
+            return;
+        }
+
+        let context = crate::access::AccessContext::new(self, None);
+        for policy in policies {
+            f(policy.as_ref(), &context);
+        }
+    }
+
     /// Install the complete active pointer-grab snapshot.
     pub fn set_pointer_grab(&mut self, grab: ActivePointerGrab) {
         self.active_pointer_grab = Some(grab);
@@ -1531,6 +1867,66 @@ impl ServerState {
     /// Tear down the active pointer grab.
     pub fn clear_pointer_grab(&mut self) {
         self.active_pointer_grab = None;
+    }
+
+    /// Temporarily float a slave for an explicit XI2 grab, saving its
+    /// attachment so deactivation and disconnect can restore it. XTEST 4/5
+    /// have no physical facet, but are slaves like the dynamic facets. Xorg
+    /// detaches every slave for explicit pointer/keyboard XI2 grabs
+    /// (`dix/events.c:1621-1624,1743-1746`); `DetachFromMaster` returns early
+    /// only when it is already floating (`dix/events.c:1461-1468`).
+    pub fn detach_xi2_slave(&mut self, device_id: u16) -> bool {
+        let Some(device) = self.xi_devices.device(device_id) else {
+            return false;
+        };
+        let Some(role) = self.xi_devices.role(device_id) else {
+            return false;
+        };
+        if !device.enabled
+            || !matches!(
+                role,
+                crate::xinput::XiDeviceRole::SlavePointer
+                    | crate::xinput::XiDeviceRole::SlaveKeyboard
+            )
+        {
+            return false;
+        }
+        let Some(master) = device.attached_master else {
+            return false;
+        };
+        self.xi_clear_last_slave(device_id);
+        self.xi2_detached_masters.insert(device_id, master);
+        if role == crate::xinput::XiDeviceRole::SlavePointer {
+            self.floating_pointer_positions.insert(
+                device_id,
+                (
+                    f32::from(self.pointer_root.0),
+                    f32::from(self.pointer_root.1),
+                ),
+            );
+        }
+        if let Some(device) = self.xi_devices.device_mut(device_id) {
+            device.attached_master = None;
+        }
+        true
+    }
+
+    /// Restore the attachment saved by [`Self::detach_xi2_slave`].
+    pub fn reattach_xi2_slave(&mut self, device_id: u16) -> bool {
+        let Some(detached_master) = self.xi2_detached_masters.remove(&device_id) else {
+            return false;
+        };
+        let Some(device) = self.xi_devices.device_mut(device_id) else {
+            self.floating_pointer_positions.remove(&device_id);
+            return false;
+        };
+        if device.enabled {
+            device.attached_master = Some(detached_master);
+        } else {
+            device.attached_master = None;
+        }
+        self.floating_pointer_positions.remove(&device_id);
+        true
     }
 
     #[must_use]
@@ -1557,11 +1953,54 @@ impl ServerState {
         atoms.intern(crate::xinput::XI_ATOM_MOUSE, false);
         atoms.intern(crate::xinput::XI_ATOM_KEYBOARD, false);
         atoms.intern(crate::xinput::XI_ATOM_TOUCHPAD, false);
+        let xtest_device_atom = atoms.intern(crate::xinput::PROP_XTEST_DEVICE, false);
+        let xi_device_enabled_atom = atoms.intern(crate::xinput::PROP_DEVICE_ENABLED, false);
         // FLOAT is not a predefined X atom; intern it now so the
         // libinput accel-speed property family can stamp
         // type=float_atom on its wire replies without a per-request
         // intern dance.
         let float_atom = atoms.intern("FLOAT", false);
+        let mut xi_devices = crate::xinput::XiRegistry::new();
+        for device_id in [
+            crate::xinput::DEVICEID_MASTER_POINTER,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD,
+            crate::xinput::DEVICEID_XTEST_POINTER,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
+        ] {
+            xi_devices
+                .device_mut(device_id)
+                .expect("XiRegistry creates all four base devices")
+                .properties
+                .insert(
+                    xi_device_enabled_atom,
+                    crate::xinput::XiProperty {
+                        type_atom: crate::xinput::XA_INTEGER,
+                        format: 8,
+                        data: vec![1],
+                        read_only: false,
+                        deletable: false,
+                    },
+                );
+        }
+        for device_id in [
+            crate::xinput::DEVICEID_XTEST_POINTER,
+            crate::xinput::DEVICEID_XTEST_KEYBOARD,
+        ] {
+            xi_devices
+                .device_mut(device_id)
+                .expect("XiRegistry creates both XTEST devices")
+                .properties
+                .insert(
+                    xtest_device_atom,
+                    crate::xinput::XiProperty {
+                        type_atom: crate::xinput::XA_INTEGER,
+                        format: 8,
+                        data: vec![1],
+                        read_only: true,
+                        deletable: false,
+                    },
+                );
+        }
         Self {
             atoms,
             resources,
@@ -1569,16 +2008,22 @@ impl ServerState {
             server_grab_owner: None,
             id_allocator: IdAllocator::new(),
             start_instant: Instant::now(),
+            host_access: crate::core_loop::auth::HostAccessHandle::default(),
             randr: RandrState::nested(0, width, height),
             randr_select_masks: HashMap::new(),
             randr_primary_output_explicit: false,
             randr_output_properties: HashMap::new(),
+            randr_client_monitors: Vec::new(),
             randr_unsupported_warned_mask: 0,
             xkb_clients: HashMap::new(),
             xkb_interests: HashMap::new(),
             selections: HashMap::new(),
             pointer_root: (0, 0),
             active_pointer_grab: None,
+            xi2_pointer_grabs: HashMap::new(),
+            xi2_keyboard_grabs: HashMap::new(),
+            xi2_detached_masters: HashMap::new(),
+            floating_pointer_positions: HashMap::new(),
             button_grabs: Vec::new(),
             sync_pending: std::collections::VecDeque::new(),
             playing_sync_events: false,
@@ -1593,8 +2038,8 @@ impl ServerState {
             pointer_mapping_override: None,
             modifier_mapping_override: None,
             keys_down: [0u8; 32],
-            last_xkb_group: 0,
-            last_xkb_mods: 0,
+            xkb_announced: (0, (0, 0, 0, 0)),
+            xkb_announced_indicators: 0,
             pointer_confine_to: ResourceId(0),
             buttons_down: 0,
             confine_warp_active: false,
@@ -1616,6 +2061,7 @@ impl ServerState {
             xfixes_client_major: HashMap::new(),
             xfixes_cursor_hide_counts: HashMap::new(),
             shape_windows: HashMap::new(),
+            rootless: None,
             shape_select_masks: HashMap::new(),
             present_pending_exec: BTreeMap::new(),
             present_wait_to_id: HashMap::new(),
@@ -1625,8 +2071,10 @@ impl ServerState {
             idletime_last_evaluated: HashMap::new(),
             sync_fences: HashMap::new(),
             damage_objects: HashMap::new(),
+            damage_list_clock: 0,
+            background_paint_after_backing: HashSet::new(),
             damage_notify_flush_pending: false,
-            composite_redirects: HashMap::new(),
+            composite_redirects: crate::composite_redirects::CompositeRedirects::default(),
             present_event_selections: HashMap::new(),
             present_pending_msc: Vec::new(),
             present_next_id: 1,
@@ -1642,12 +2090,16 @@ impl ServerState {
             glx_next_context_tag: 1,
             glx_drawables: HashMap::new(),
             vidmode_client_versions: HashMap::new(),
+            vidmode_gamma: [1.0; 3],
+            vidmode_gamma_table: None,
             xi2_client_versions: HashMap::new(),
+            randr_client_versions: HashMap::new(),
             glx_tfp_supported: false,
             glx_vendor_names: glx::VENDOR_NAMES.to_string(),
             sync_awaits: HashMap::new(),
+            record: crate::core_loop::record::RecordState::default(),
             sync_servertime_last: None,
-            repeat_state: None,
+            key_repeats: HashMap::new(),
             dpms: DpmsState::new(false),
             screensaver: ScreenSaverState::new(),
             keyboard_control: KeyboardControlState::new(),
@@ -1656,9 +2108,18 @@ impl ServerState {
             zombie_clients: HashMap::new(),
             cow_claims: Vec::new(),
             cow_teardown_failed: false,
+            fatal_teardown: None,
             scroll_axis_value: [0; 2],
+            unpublished_pointer_buttons_down: HashMap::new(),
+            key_down_by_device: HashMap::new(),
+            unpublished_keyboard_keys_down: HashMap::new(),
             installed_colormaps: vec![crate::resources::ROOT_COLORMAP],
-            xi_devices: crate::xinput::initial_xi_devices(),
+            xi_devices,
+            xi_last_pointer_slave: None,
+            xi_last_keyboard_slave: None,
+            pending_xi_device_removals: Vec::new(),
+            xtest_device_atom,
+            xi_device_enabled_atom,
             float_atom,
         }
     }
@@ -1729,42 +2190,410 @@ impl ServerState {
         generation
     }
 
-    /// Seed the XI2 device-property registry from a libinput pointer
-    /// device-add event.
-    ///
-    /// The single slave-pointer entry (id 4) receives the real device name
-    /// and the libinput-style properties for whichever knobs libinput
-    /// reports available. Admitted for a touchpad OR a **real relative
-    /// pointer** — one that reports pointer acceleration (`accel.available`,
-    /// the hallmark of a mouse/trackpoint). This deliberately EXCLUDES the
-    /// phantom HID "Consumer Control" / "System Control" collections that a
-    /// keyboard or wireless receiver exposes: libinput tags them
-    /// pointer-capable but they carry almost no config, and — because id 4
-    /// is a single latest-wins slot — one of them would otherwise clobber
-    /// the real mouse's rich config (left-handed, middle-emulation, …),
-    /// leaving the KDE Mouse KCM unable to configure the mouse.
-    ///
-    /// Seeding a real mouse is required because the KDE Mouse KCM reads
-    /// `libinput Accel Speed` on the pointer; a missing atom made it
-    /// SIGSEGV (see `project_kcm_mouse_crash_libinput_accel`).
-    ///
-    /// Property-name atoms are interned via `self.atoms` so they share
-    /// the same atom namespace as all other server atoms.
-    pub fn xi_seed_touchpad(&mut self, info: &crate::core_loop::DeviceInfo) {
-        if !info.is_touchpad && !info.config.accel.available {
-            return;
+    /// Register one physical input source and seed properties on each of its
+    /// independent XI facets. Existing sources retain their facet IDs and
+    /// property maps; continuation refreshes only values whose entries remain.
+    pub fn xi_register_source(&mut self, info: &crate::core_loop::DeviceInfo) -> Vec<u16> {
+        let continuation = self.xi_devices.source(info.source_id).is_some();
+        let previous_enabled: HashMap<u16, bool> = if continuation {
+            [
+                self.xi_devices
+                    .facet(info.source_id, crate::xinput::XiFacetKind::Keyboard),
+                self.xi_devices
+                    .facet(info.source_id, crate::xinput::XiFacetKind::PointerTouch),
+            ]
+            .into_iter()
+            .flatten()
+            .filter_map(|id| {
+                self.xi_devices
+                    .device(id)
+                    .map(|device| (id, device.enabled))
+            })
+            .collect()
+        } else {
+            HashMap::new()
+        };
+        let ids = self.xi_devices.register(info);
+        if !continuation {
+            for &id in &ids {
+                if let Some(device) = self.xi_devices.device_mut(id) {
+                    device.properties.insert(
+                        self.xi_device_enabled_atom,
+                        crate::xinput::XiProperty {
+                            type_atom: crate::xinput::XA_INTEGER,
+                            format: 8,
+                            data: vec![0],
+                            read_only: false,
+                            deletable: false,
+                        },
+                    );
+                }
+            }
         }
-        crate::xinput::seed_touchpad(&mut self.xi_devices, &mut self.atoms, self.float_atom, info);
+        for id in &ids {
+            if !self
+                .xi_devices
+                .device(*id)
+                .is_some_and(|device| device.enabled)
+            {
+                // DisableDevice clears the master's lastSlave reference
+                // (devices.c:488-492). A grab's saved attachment is a
+                // separate temporary state; it must not survive disable.
+                self.xi_clear_last_slave(*id);
+                self.xi2_detached_masters.remove(id);
+                self.floating_pointer_positions.remove(id);
+            } else if previous_enabled.get(id) == Some(&false) {
+                // Re-enable from the facet's role-derived home master,
+                // discarding any stale grab-position state.
+                self.xi2_detached_masters.remove(id);
+                self.floating_pointer_positions.remove(id);
+            }
+        }
+        for &id in &ids {
+            if continuation {
+                let Some(mut seeded) = self.xi_devices.device(id).cloned() else {
+                    continue;
+                };
+                seeded.properties.clear();
+                crate::xinput::seed_pointer_properties(
+                    &mut seeded,
+                    &mut self.atoms,
+                    self.float_atom,
+                    info,
+                );
+                if let Some(device) = self.xi_devices.device_mut(id) {
+                    for (atom, fresh) in seeded.properties {
+                        if let Some(existing) = device.properties.get_mut(&atom) {
+                            existing.type_atom = fresh.type_atom;
+                            existing.format = fresh.format;
+                            existing.data = fresh.data;
+                        }
+                    }
+                }
+            } else if let Some(device) = self.xi_devices.device_mut(id) {
+                crate::xinput::seed_pointer_properties(
+                    device,
+                    &mut self.atoms,
+                    self.float_atom,
+                    info,
+                );
+            }
+        }
+        ids
     }
 
-    /// Revert the slave-pointer XI2 device entry to its generic defaults
-    /// and clear all touchpad properties.
-    ///
-    /// Called from `on_host_input(DeviceRemoved)`.  `device_node` is
-    /// used for logging; no node→device mapping is maintained today
-    /// (one touchpad assumed).
-    pub fn xi_clear_touchpad(&mut self, device_node: &str) {
-        crate::xinput::clear_touchpad(&mut self.xi_devices, device_node);
+    /// Replace a device's `Device Enabled` byte after an actual enabled-state
+    /// transition. Returns the property notification kind expected by the
+    /// shared XI1/XI2 property-event emitter.
+    pub(crate) fn xi_update_device_enabled_property(
+        &mut self,
+        device_id: u16,
+        enabled: bool,
+    ) -> Option<crate::xinput::PropWhat> {
+        let atom = self.xi_device_enabled_atom;
+        let device = self.xi_devices.device_mut(device_id)?;
+        let (what, deletable) = match device.properties.get(&atom) {
+            Some(existing) => (crate::xinput::PropWhat::Modified, existing.deletable),
+            // XI/xiproperty.c::XICreateDeviceProperty initializes a property
+            // recreated after GetProperty(delete) as deletable (lines 575-592).
+            None => (crate::xinput::PropWhat::Created, true),
+        };
+        device.properties.insert(
+            atom,
+            crate::xinput::XiProperty {
+                type_atom: crate::xinput::XA_INTEGER,
+                format: 8,
+                data: vec![u8::from(enabled)],
+                read_only: false,
+                deletable,
+            },
+        );
+        Some(what)
+    }
+
+    /// Refresh metadata for a retained source while preserving the enabled
+    /// facts on its individual facets.
+    pub fn xi_refresh_source(&mut self, info: &crate::core_loop::DeviceInfo) -> Vec<u16> {
+        let ids = self.xi_devices.refresh_source(info);
+        for &id in &ids {
+            let Some(mut seeded) = self.xi_devices.device(id).cloned() else {
+                continue;
+            };
+            seeded.properties.clear();
+            crate::xinput::seed_pointer_properties(
+                &mut seeded,
+                &mut self.atoms,
+                self.float_atom,
+                info,
+            );
+            if let Some(device) = self.xi_devices.device_mut(id) {
+                for (atom, fresh) in seeded.properties {
+                    if let Some(existing) = device.properties.get_mut(&atom) {
+                        existing.type_atom = fresh.type_atom;
+                        existing.format = fresh.format;
+                        existing.data = fresh.data;
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// Change one facet's VT/session enabled state. A disable clears the
+    /// master last-slave reference but deliberately retains the attachment
+    /// until its Disabled hierarchy snapshot has been emitted.
+    pub fn xi_set_facet_session_enabled(&mut self, device_id: u16, enabled: bool) -> bool {
+        if !enabled {
+            self.xi_clear_last_slave(device_id);
+        }
+        let changed = self
+            .xi_devices
+            .set_facet_session_enabled(device_id, enabled);
+        if enabled && changed {
+            self.xi2_detached_masters.remove(&device_id);
+            self.floating_pointer_positions.remove(&device_id);
+        }
+        changed
+    }
+
+    /// Change one physical facet's client Device Enabled preference. A
+    /// disable clears the master's last-slave reference but retains the
+    /// attachment for its Disabled hierarchy snapshot. A re-enable removes
+    /// any grab-floating bookkeeping only when session state also makes the
+    /// facet enabled.
+    pub fn xi_set_facet_client_disabled(&mut self, device_id: u16, disabled: bool) -> bool {
+        if disabled {
+            self.xi_clear_last_slave(device_id);
+        }
+        let changed = self
+            .xi_devices
+            .set_facet_client_disabled(device_id, disabled);
+        if !disabled
+            && changed
+            && self
+                .xi_devices
+                .device(device_id)
+                .is_some_and(|device| device.enabled)
+        {
+            self.xi2_detached_masters.remove(&device_id);
+            self.floating_pointer_positions.remove(&device_id);
+        }
+        changed
+    }
+
+    /// Remove one facet after its Disabled/Removed notifications have been
+    /// sent. This keeps a mixed source's other facet live until its own turn.
+    pub fn xi_unregister_facet(&mut self, device_id: u16) -> Option<crate::xinput::XiDevice> {
+        let device = self.xi_devices.device(device_id)?.clone();
+        let source_id = device.source_id?;
+        self.xi_clear_last_slave(device_id);
+
+        if let Some(grab) = self.xi2_pointer_grabs.remove(&device_id)
+            && let Some(freeze) = self.xi1_frozen.get_mut(&device_id)
+            && freeze.other == Some(grab.owner)
+        {
+            freeze.other = None;
+        }
+        if let Some(grab) = self.xi2_keyboard_grabs.remove(&device_id)
+            && let Some(freeze) = self.xi1_frozen.get_mut(&device_id)
+            && freeze.other == Some(grab.owner)
+        {
+            freeze.other = None;
+        }
+        self.xi2_detached_masters.remove(&device_id);
+        self.floating_pointer_positions.remove(&device_id);
+        self.xi1_frozen.remove(&device_id);
+        self.xi1_device_focus.remove(&device_id);
+        self.xi1_device_input_state.remove(&device_id);
+        self.xi1_button_map.remove(&device_id);
+        self.xi1_modifier_map.remove(&device_id);
+        self.xi1_resolution.remove(&device_id);
+        self.xi1_active_grabs.remove(&device_id);
+        self.button_grabs.retain(|grab| grab.device_id != device_id);
+        self.key_grabs.retain(|grab| grab.device_id != device_id);
+        self.xi1_passive_grabs
+            .retain(|grab| grab.deviceid != device_id);
+        self.sync_pending
+            .retain(|pending| pending.device != device_id);
+        self.key_down_by_device.remove(&device_id);
+
+        let removed = self.xi_devices.remove_facet(device_id)?;
+        if self.xi_devices.source(source_id).is_none() {
+            self.unpublished_keyboard_keys_down.remove(&source_id);
+            self.unpublished_pointer_buttons_down.remove(&source_id);
+        }
+        Some(removed)
+    }
+
+    /// Finish a physical facet disable after its disabled notification has
+    /// been built from the still-attached snapshot (devices.c:532-539).
+    pub fn xi_float_disabled_device(&mut self, device_id: u16) {
+        let Some(device) = self.xi_devices.device(device_id) else {
+            return;
+        };
+        if device.enabled || device.facet.is_none() {
+            return;
+        }
+        self.xi_clear_last_slave(device_id);
+        self.xi2_detached_masters.remove(&device_id);
+        self.floating_pointer_positions.remove(&device_id);
+        if let Some(device) = self.xi_devices.device_mut(device_id) {
+            device.attached_master = None;
+        }
+    }
+
+    /// Remove one physical source and every facet it currently owns.
+    pub fn xi_unregister_source(&mut self, source: crate::xinput::InputSourceId) -> Vec<u16> {
+        let ids: Vec<u16> = [
+            self.xi_devices
+                .facet(source, crate::xinput::XiFacetKind::Keyboard),
+            self.xi_devices
+                .facet(source, crate::xinput::XiFacetKind::PointerTouch),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for id in &ids {
+            self.xi_clear_last_slave(*id);
+        }
+        let removed_descriptors: Vec<crate::xinput::XiDevice> = ids
+            .iter()
+            .filter_map(|id| self.xi_devices.device(*id).cloned())
+            .collect();
+        let removed_grabs: Vec<(u16, ClientId)> = ids
+            .iter()
+            .filter_map(|id| {
+                self.xi2_pointer_grabs
+                    .get(id)
+                    .map(|grab| (*id, grab.owner))
+                    .or_else(|| {
+                        self.xi2_keyboard_grabs
+                            .get(id)
+                            .map(|grab| (*id, grab.owner))
+                    })
+            })
+            .collect();
+        for (id, owner) in removed_grabs {
+            let paired = self.xi_devices.paired_master(id).or_else(|| {
+                self.xi2_detached_masters
+                    .get(&id)
+                    .and_then(|master| self.xi_devices.paired_master(*master))
+            });
+            if let Some(freeze) = paired.and_then(|paired| self.xi1_frozen.get_mut(&paired))
+                && freeze.other == Some(owner)
+            {
+                freeze.other = None;
+            }
+        }
+        for id in &ids {
+            self.xi2_pointer_grabs.remove(id);
+            self.xi2_keyboard_grabs.remove(id);
+            self.xi2_detached_masters.remove(id);
+            self.floating_pointer_positions.remove(id);
+            self.xi1_frozen.remove(id);
+            self.xi1_device_focus.remove(id);
+            self.xi1_device_input_state.remove(id);
+            self.xi1_button_map.remove(id);
+            self.xi1_modifier_map.remove(id);
+            self.xi1_resolution.remove(id);
+            self.xi1_active_grabs.remove(id);
+        }
+        self.button_grabs
+            .retain(|grab| !ids.contains(&grab.device_id));
+        self.key_grabs.retain(|grab| !ids.contains(&grab.device_id));
+        self.xi1_passive_grabs
+            .retain(|grab| !ids.contains(&grab.deviceid));
+        self.sync_pending
+            .retain(|pending| !ids.contains(&pending.device));
+        // These bitmaps are keyed outside the device table. Drop them at the
+        // unregister boundary so a reused XI id cannot inherit an old
+        // keyboard hold. The normal backend path has already sent guarded
+        // releases first (Xorg dix/devices.c:2626-2653); this also makes
+        // registry teardown remove the per-device held state itself.
+        for id in &ids {
+            self.key_down_by_device.remove(id);
+        }
+        self.unpublished_keyboard_keys_down.remove(&source);
+        self.unpublished_pointer_buttons_down.remove(&source);
+        self.pending_xi_device_removals.extend(removed_descriptors);
+        self.xi_devices.remove(source)
+    }
+
+    /// Return facet snapshots queued by [`Self::xi_unregister_source`] for
+    /// the physical-device notification publisher.
+    pub fn take_xi_removed_device_descriptors(&mut self) -> Vec<crate::xinput::XiDevice> {
+        std::mem::take(&mut self.pending_xi_device_removals)
+    }
+
+    /// Current last attached slave for master pointer 2 or keyboard 3.
+    #[must_use]
+    pub fn xi_last_slave(&self, master_id: u16) -> Option<u16> {
+        match master_id {
+            crate::xinput::DEVICEID_MASTER_POINTER => self.xi_last_pointer_slave,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD => self.xi_last_keyboard_slave,
+            _ => None,
+        }
+    }
+
+    /// Update Xorg-style `lastSlave` after an input edge. Returns true only
+    /// when the attached source actually changed; disabled and floating
+    /// devices cannot become a master's current source.
+    pub fn xi_record_last_slave(&mut self, master_id: u16, slave_id: u16) -> bool {
+        let Some(device) = self.xi_devices.device(slave_id) else {
+            return false;
+        };
+        if !device.enabled || device.attached_master != Some(master_id) {
+            return false;
+        }
+        let expected_role = match master_id {
+            crate::xinput::DEVICEID_MASTER_POINTER => crate::xinput::XiDeviceRole::SlavePointer,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD => crate::xinput::XiDeviceRole::SlaveKeyboard,
+            _ => return false,
+        };
+        if self.xi_devices.role(slave_id) != Some(expected_role) {
+            return false;
+        }
+        let last_slave = match master_id {
+            crate::xinput::DEVICEID_MASTER_POINTER => &mut self.xi_last_pointer_slave,
+            crate::xinput::DEVICEID_MASTER_KEYBOARD => &mut self.xi_last_keyboard_slave,
+            _ => return false,
+        };
+        if *last_slave == Some(slave_id) {
+            return false;
+        }
+        *last_slave = Some(slave_id);
+        // Xorg UpdateFromMaster copies each present class from the new slave
+        // and records that slave ID in the copied class (`Xi/exevents.c:592,
+        // 630`). Store the class metadata separately from lastSlave so
+        // disable/removal can clear the latter without resetting XIQueryDevice
+        // or DeviceChanged's retained class source.
+        let class_shape = device.class_shape;
+        if let Some(master) = self.xi_devices.device_mut(master_id) {
+            master.class_shape = class_shape;
+            master.class_sourceid = slave_id;
+        }
+        true
+    }
+
+    /// Clear only the `lastSlave` reference before its slave is disabled,
+    /// detached, or removed. Xorg's `DisableDevice` does the same at
+    /// `dix/devices.c:488-492`; copied classes and their source IDs remain
+    /// stored until a later `DeepCopyDeviceClasses` switch replaces them.
+    /// It is harmless when the device was not current.
+    pub fn xi_clear_last_slave(&mut self, slave_id: u16) {
+        if self.xi_last_pointer_slave == Some(slave_id) {
+            self.xi_last_pointer_slave = None;
+        }
+        if self.xi_last_keyboard_slave == Some(slave_id) {
+            self.xi_last_keyboard_slave = None;
+        }
+    }
+
+    /// The connected clients that count as users of the server: all but
+    /// the internal ones.
+    #[must_use]
+    pub fn counted_clients(&self) -> usize {
+        self.clients.values().filter(|c| !c.internal).count()
     }
 
     #[must_use]
@@ -1948,7 +2777,7 @@ impl ServerState {
 
     /// True iff `id` designates ANY live resource in ANY client-XID
     /// namespace: the 9 ResourceTable maps (via
-    /// `resources.xid_in_use`) plus the 10 extension maps that
+    /// `resources.xid_in_use`) plus the 11 extension maps that
     /// `xid_in_use` does NOT cover. XC-MISC must never report an
     /// occupied id as free — extend this (and the
     /// `xid_occupied_covers_every_namespace` test) when adding an
@@ -1967,10 +2796,11 @@ impl ServerState {
             || self.glx_contexts.contains_key(&id)
             || self.glx_drawables.contains_key(&id)
             || self.present_event_selections.contains_key(&id)
+            || self.record.contains(id)
     }
 
     /// Sorted, deduped list of occupied XIDs in `base..=base|mask`
-    /// across all 19 namespaces. O(total live resources) — called
+    /// across all 20 namespaces. O(total live resources) — called
     /// only on the rare XC-MISC GetXIDRange path.
     #[must_use]
     pub fn used_xids_in(&self, base: u32, mask: u32) -> Vec<u32> {
@@ -1987,6 +2817,7 @@ impl ServerState {
         out.extend(self.glx_contexts.keys().filter(in_range));
         out.extend(self.glx_drawables.keys().filter(in_range));
         out.extend(self.present_event_selections.keys().filter(in_range));
+        out.extend(self.record.ids().filter(|id| (*id & !mask) == base));
         out.sort_unstable();
         out.dedup();
         out
@@ -2063,6 +2894,11 @@ pub struct PendingPresentEntry {
     /// The producer-side wait (dma-buf READ sync-file / acquire timeline
     /// point) has signalled. Distinct from msc-due (Task 7).
     pub source_ready: bool,
+    /// Newer covered same-target Present that executed while this entry's
+    /// source/acquire wait was still pending. Keep waiting for the producer;
+    /// once it signals, complete this entry as Skip instead of showing an
+    /// older frame after the newer one.
+    pub superseded_by_executed_present_id: Option<u64>,
     /// Backend-owned source-wait id, `Some` only while the entry is
     /// parked on `arm_present_source_wait` / `arm_present_syncobj_wait`
     /// returning `Deferred`. Mirrored in `ServerState::present_wait_to_id`.
@@ -2110,7 +2946,15 @@ pub struct PendingPresentPixmap {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XFixesRegion {
     pub owner: ClientId,
-    pub rects: Vec<xfixes::RegionRect>,
+    pub(crate) region: crate::region::Region,
+}
+
+impl XFixesRegion {
+    /// The region's rects, as FetchRegion returns them.
+    #[must_use]
+    pub fn rects(&self) -> Vec<xfixes::RegionRect> {
+        self.region.to_rects()
+    }
 }
 
 /// XFIXES/XInput pointer barrier (XID resource, client-owned).
@@ -2139,11 +2983,14 @@ pub struct PointerBarrier {
     pub last_timestamp: u32,
 }
 
+/// A window's SHAPE regions, `None` while a kind is unset. Each is kept
+/// as a [`Region`](crate::region::Region) between requests, so the SHAPE
+/// operations and the clip lists use it as it is.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ShapeWindowState {
-    pub bounding: Option<Vec<xfixes::RegionRect>>,
-    pub clip: Option<Vec<xfixes::RegionRect>>,
-    pub input: Option<Vec<xfixes::RegionRect>>,
+    bounding: Option<crate::region::Region>,
+    clip: Option<crate::region::Region>,
+    input: Option<crate::region::Region>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2215,6 +3062,13 @@ pub struct DamageObject {
     /// the area is still coalesced. Tracking the last report lets us
     /// emit a follow-up notify when geometry changes mid-cycle.
     pub last_reported_geometry: Option<x11::damage::Rectangle>,
+    /// Position in Xorg's per-pixmap damage list: higher is nearer the
+    /// head, which reports first (`damageRegionProcessPending`,
+    /// `miext/damage/damage.c:285-300`).
+    pub list_pos: u64,
+    /// Creation order: a window's damage list is newest first
+    /// (`DamageRegister`, `miext/damage/damage.c:1765-1773`).
+    pub created: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2223,6 +3077,12 @@ pub struct PresentEventSelection {
     pub window: ResourceId,
     pub event_mask: u32,
 }
+
+/// `<sys/shm.h>`'s `SHM_RDONLY`, which the libc crate omits for OpenBSD.
+#[cfg(target_os = "openbsd")]
+const SHM_RDONLY: libc::c_int = 0o10000;
+#[cfg(all(unix, not(target_os = "openbsd")))]
+const SHM_RDONLY: libc::c_int = libc::SHM_RDONLY;
 
 /// A shared memory segment attached via MIT-SHM. Owns the lifetime of both
 /// the file descriptor and the kernel mapping; the `Drop` impl `munmap`s
@@ -2241,9 +3101,11 @@ pub struct MitShmSegment {
     addr: *mut libc::c_void,
     /// Backing source — either an FD we close on Drop, or a SysV shmat
     /// mapping we shmdt on Drop.
+    #[cfg(unix)]
     backing: MitShmBacking,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 enum MitShmBacking {
     /// `AttachFd`: file descriptor that backs `addr` via `mmap`.
@@ -2257,6 +3119,8 @@ enum MitShmBacking {
 unsafe impl Send for MitShmSegment {}
 unsafe impl Sync for MitShmSegment {}
 
+/// Windows has no MIT-SHM, so no segment is ever made there.
+#[cfg(unix)]
 impl MitShmSegment {
     /// Map an attached file descriptor. Caller must have verified the FD
     /// references a regular file or memfd; we `fstat` to learn the size.
@@ -2304,7 +3168,7 @@ impl MitShmSegment {
     /// commonly because the client and server live in different IPC
     /// namespaces).
     pub fn from_shmid(owner: ClientId, shmid: u32, read_only: bool) -> std::io::Result<Self> {
-        let flags = if read_only { libc::SHM_RDONLY } else { 0 };
+        let flags = if read_only { SHM_RDONLY } else { 0 };
         // SAFETY: shmat is fine to call with arbitrary user-provided shmid;
         // it returns (void*)-1 on failure.
         let addr = unsafe { libc::shmat(shmid as libc::c_int, std::ptr::null(), flags) };
@@ -2319,7 +3183,9 @@ impl MitShmSegment {
             unsafe { libc::shmdt(addr) };
             return Err(err);
         }
-        let size = info.shm_segsz;
+        // `size_t`, except `int` on OpenBSD.
+        #[allow(clippy::useless_conversion)]
+        let size = usize::try_from(info.shm_segsz).unwrap_or(0);
         if size == 0 {
             unsafe { libc::shmdt(addr) };
             return Err(std::io::Error::new(
@@ -2335,7 +3201,9 @@ impl MitShmSegment {
             backing: MitShmBacking::Sysv,
         })
     }
+}
 
+impl MitShmSegment {
     /// View into the mapped memory. Lifetime is tied to `&self`, so callers
     /// may only borrow within their own request handler.
     #[must_use]
@@ -2359,6 +3227,7 @@ impl MitShmSegment {
     }
 }
 
+#[cfg(unix)]
 impl Drop for MitShmSegment {
     fn drop(&mut self) {
         unsafe {
@@ -2394,23 +3263,67 @@ impl Default for SyncAlarm {
 }
 
 impl ShapeWindowState {
-    pub fn rects_mut(&mut self, kind: u8) -> Option<&mut Option<Vec<xfixes::RegionRect>>> {
+    /// Set (or, with `None`, unset) the shape of `kind`; an unknown kind
+    /// is ignored.
+    pub(crate) fn set_region(&mut self, kind: u8, region: Option<crate::region::Region>) {
         match kind {
-            shape::KIND_BOUNDING => Some(&mut self.bounding),
-            shape::KIND_CLIP => Some(&mut self.clip),
-            shape::KIND_INPUT => Some(&mut self.input),
-            _ => None,
+            shape::KIND_BOUNDING => self.bounding = region,
+            shape::KIND_CLIP => self.clip = region,
+            shape::KIND_INPUT => self.input = region,
+            _ => {}
         }
     }
 
-    #[must_use]
-    pub fn rects(&self, kind: u8) -> Option<&Vec<xfixes::RegionRect>> {
+    /// [`ShapeWindowState::set_region`] from arbitrary rects.
+    pub fn set_rects(&mut self, kind: u8, rects: Option<Vec<xfixes::RegionRect>>) {
+        self.set_region(kind, rects.map(|r| crate::region::Region::from_rects(&r)));
+    }
+
+    /// The shape of `kind`, `None` while unset.
+    pub(crate) fn region(&self, kind: u8) -> Option<&crate::region::Region> {
         match kind {
             shape::KIND_BOUNDING => self.bounding.as_ref(),
             shape::KIND_CLIP => self.clip.as_ref(),
             shape::KIND_INPUT => self.input.as_ref(),
             _ => None,
         }
+    }
+
+    /// The bounding shape.
+    pub(crate) fn bounding_region(&self) -> Option<&crate::region::Region> {
+        self.bounding.as_ref()
+    }
+
+    /// The clip shape.
+    pub(crate) fn clip_region(&self) -> Option<&crate::region::Region> {
+        self.clip.as_ref()
+    }
+
+    #[must_use]
+    pub fn bounding(&self) -> Option<Vec<xfixes::RegionRect>> {
+        self.rects(shape::KIND_BOUNDING)
+    }
+
+    #[must_use]
+    pub fn clip(&self) -> Option<Vec<xfixes::RegionRect>> {
+        self.rects(shape::KIND_CLIP)
+    }
+
+    #[must_use]
+    pub fn input(&self) -> Option<Vec<xfixes::RegionRect>> {
+        self.rects(shape::KIND_INPUT)
+    }
+
+    /// No shape of any kind is set.
+    #[must_use]
+    pub fn is_unshaped(&self) -> bool {
+        self.bounding.is_none() && self.clip.is_none() && self.input.is_none()
+    }
+
+    /// The rects of the shape of `kind`, `None` while unset.
+    #[must_use]
+    pub fn rects(&self, kind: u8) -> Option<Vec<xfixes::RegionRect>> {
+        self.region(kind).map(crate::region::Region::to_rects)
     }
 }
 
@@ -2421,6 +3334,14 @@ pub struct ClientState {
     pub is_local: bool,
     /// Whether this connection can carry SCM_RIGHTS descriptors.
     pub fd_passing: bool,
+    /// The server's own client (a window shell's clipboard bridge): not
+    /// counted as connected for the shell or the last-client reset.
+    pub internal: bool,
+    /// Who connected, read from the socket at setup. Immutable for the
+    /// connection's life.
+    pub peer: crate::peer::PeerIdentity,
+    /// The authorization path that admitted this client. Immutable after setup.
+    pub admission: crate::access::Admission,
     pub byte_order: ClientByteOrder,
     pub last_sequence: Arc<AtomicU16>,
     pub resource_id_base: u32,
@@ -2451,9 +3372,25 @@ pub struct ClientState {
     /// Outbound bytes buffered when the client write fd would block.
     /// Populated in D2.
     pub outbound: std::collections::VecDeque<u8>,
+    /// Descriptors that go with bytes in `outbound`.
+    pub outbound_fds: crate::core_loop::client_io::OutboundFds,
     /// Whether the core's mio poller currently watches this client's
     /// writer fd for WRITABLE.  Used in I2.
     pub watching_writable: bool,
+    /// The duplicate of the writer socket the poller watches: mio cannot
+    /// watch a borrowed socket on Windows.
+    #[cfg(windows)]
+    pub writable_source: Option<mio::net::TcpStream>,
+    /// A write to this client failed (peer gone, or `OUTBOUND_CAP`
+    /// reached), so its stream can no longer be whole. Set by
+    /// `client_io`, never cleared; the core loop disconnects every
+    /// flagged client (`client_io::failed_writers`) and nothing more is
+    /// written to it meanwhile.
+    pub write_failed: bool,
+    /// The client is being closed down: nothing more is written to it (Xorg
+    /// `clientGone`, `dix/dispatch.c:3518`). The entry stays until the
+    /// disconnect removes it.
+    pub gone: bool,
     /// Window the client's pointer/key events route through; demoted off
     /// `Arc<Mutex<ResourceId>>` in D3.
     pub focused_window: ResourceId,
@@ -2467,7 +3404,8 @@ pub struct ClientState {
 pub(crate) fn xi1_class_is_global_notification(class: u32) -> bool {
     #[allow(clippy::cast_possible_truncation)]
     let event_code = class as u8;
-    event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET
+    class == crate::xinput::XI1_DEVICE_PRESENCE_CLASS
+        || event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET
         || event_code == XI_FIRST_EVENT + crate::xinput::XI_DEVICE_MAPPING_NOTIFY_OFFSET
         || event_code == XI_FIRST_EVENT + crate::xinput::XI_CHANGE_DEVICE_NOTIFY_OFFSET
 }
@@ -2511,23 +3449,9 @@ pub struct EventTarget {
 }
 
 impl ServerState {
-    /// Stage 4e — set the COW's input shape to empty (click-through) at
-    /// materialization. Mirrors Xorg's compositor convention where the
-    /// COW's default input region passes pointer events through to
-    /// underlying root children, with descendants like the compositor's
-    /// stage receiving input directly.
-    ///
-    /// Pairs with `ResourceTable::materialize_cow_resource` — both run
-    /// from the `GetOverlayWindow` handler on the 0→1 transition.
-    pub fn materialize_cow_input_shape(&mut self) {
-        self.shape_windows
-            .entry(COMPOSITE_OVERLAY_WINDOW)
-            .or_default()
-            .input = Some(Vec::<xfixes::RegionRect>::new());
-    }
-
-    /// Symmetric teardown for [`Self::materialize_cow_input_shape`]. Called
-    /// from the `ReleaseOverlayWindow` handler on the 1→0 transition.
+    /// Drop the COW's shapes with the overlay: Xorg frees them in
+    /// DeleteWindow, so the next overlay starts unshaped. Called by the
+    /// destroy executor for a plan holding the COW.
     pub fn destroy_cow_input_shape(&mut self) {
         self.shape_windows.remove(&COMPOSITE_OVERLAY_WINDOW);
     }
@@ -2556,15 +3480,137 @@ impl ServerState {
         Some(best)
     }
 
+    /// The window under root `(x, y)`. In rootless mode only the scoped
+    /// top-level's subtree is hit (spec §4.4).
     #[must_use]
     pub fn root_pointer_target_at(&self, x: i16, y: i16) -> Option<(ResourceId, i16, i16)> {
-        self.pointer_target_at(ROOT_WINDOW, x, y)
+        use crate::rootless::PointerScope;
+        match self
+            .rootless
+            .as_ref()
+            .map(crate::rootless::Rootless::pointer_scope)
+        {
+            Some(PointerScope::Nowhere) => Some((ROOT_WINDOW, x, y)),
+            Some(PointerScope::Within(top)) => {
+                let Some(mut best) = self.hit_test_child(top, x, y) else {
+                    return Some((ROOT_WINDOW, x, y));
+                };
+                self.pointer_target_at_inner(best.0, best.1, best.2, &mut best);
+                Some(best)
+            }
+            Some(PointerScope::Anywhere) | None => self.pointer_target_at(ROOT_WINDOW, x, y),
+        }
     }
 
     #[must_use]
     pub fn direct_child_at(&self, parent: ResourceId, x: i16, y: i16) -> Option<ResourceId> {
         self.hit_test_children(parent, x, y)
             .map(|(child, _, _)| child)
+    }
+
+    /// The child CirculateWindow restacks — Xorg `CirculateWindow`
+    /// (`dix/window.c:2443`): RaiseLowest (0) takes the lowest mapped child a
+    /// mapped sibling above overlaps, LowerHighest (1) the highest mapped
+    /// child that overlaps a mapped sibling below. The overlay window stays
+    /// out of it, capped on top.
+    #[must_use]
+    pub fn circulate_candidate(&self, parent: ResourceId, direction: u8) -> Option<ResourceId> {
+        let kids: Vec<ResourceId> = self
+            .resources
+            .children(parent)
+            .iter()
+            .copied()
+            .filter(|w| *w != crate::resources::COMPOSITE_OVERLAY_WINDOW)
+            .collect();
+        let mapped = |w: ResourceId| {
+            self.resources
+                .window(w)
+                .is_some_and(|w| w.map_state != crate::resources::MapState::Unmapped)
+        };
+        let overlaps_any = |w: ResourceId, others: &[ResourceId]| {
+            others
+                .iter()
+                .any(|s| mapped(*s) && self.siblings_overlap(w, *s))
+        };
+        if direction == 0 {
+            (0..kids.len())
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[i + 1..]))
+                .map(|i| kids[i])
+        } else {
+            (0..kids.len())
+                .rev()
+                .find(|&i| mapped(kids[i]) && overlaps_any(kids[i], &kids[..i]))
+                .map(|i| kids[i])
+        }
+    }
+
+    /// Xorg `BOXES_OVERLAP` of two siblings' border-inclusive extents, cut by
+    /// their bounding shapes (`ShapeOverlap`, `dix/window.c:1975`).
+    fn siblings_overlap(&self, a: ResourceId, b: ResourceId) -> bool {
+        let (ra, rb) = (self.sibling_region(a), self.sibling_region(b));
+        ra.iter().any(|p| {
+            rb.iter()
+                .any(|q| p.0 < q.2 && q.0 < p.2 && p.1 < q.3 && q.1 < p.3)
+        })
+    }
+
+    /// A window's bounding region in its parent's coordinates, as
+    /// `(x1, y1, x2, y2)` boxes.
+    fn sibling_region(&self, window: ResourceId) -> Vec<(i32, i32, i32, i32)> {
+        let Some(w) = self.resources.window(window) else {
+            return Vec::new();
+        };
+        let bw = i32::from(w.border_width);
+        let (x1, y1) = (i32::from(w.x), i32::from(w.y));
+        let (x2, y2) = (
+            x1 + i32::from(w.width) + 2 * bw,
+            y1 + i32::from(w.height) + 2 * bw,
+        );
+        let Some(shape) = self
+            .shape_windows
+            .get(&window)
+            .and_then(|s| s.bounding.as_ref())
+        else {
+            return vec![(x1, y1, x2, y2)];
+        };
+        let (ox, oy) = (x1 + bw, y1 + bw);
+        shape
+            .boxes()
+            .iter()
+            .map(|r| {
+                (
+                    (ox + r.x1).max(x1),
+                    (oy + r.y1).max(y1),
+                    (ox + r.x2).min(x2),
+                    (oy + r.y2).min(y2),
+                )
+            })
+            .filter(|b| b.0 < b.2 && b.1 < b.3)
+            .collect()
+    }
+
+    /// The `focus` flag of a crossing on `window` (core and XI2): the core
+    /// focus is PointerRoot, or `window` or one of its ancestors (Xorg
+    /// `CoreEnterLeaveEvent` / `DeviceEnterLeaveEvent`, `dix/events.c:4772`).
+    #[must_use]
+    pub fn crossing_has_focus(&self, window: ResourceId) -> bool {
+        match self.core_focus.raw {
+            0 => false,
+            1 => true,
+            focus => {
+                let mut current = window;
+                for _ in 0..256 {
+                    if current.0 == focus {
+                        return true;
+                    }
+                    match self.resources.window(current) {
+                        Some(w) if w.parent != current => current = w.parent,
+                        _ => return false,
+                    }
+                }
+                false
+            }
+        }
     }
 
     #[must_use]
@@ -2607,13 +3653,9 @@ impl ServerState {
     ) -> Option<(ResourceId, i16, i16)> {
         // Strict-Xorg miSpriteTrace: iterate children top-to-bottom and
         // let hit_test_child's window_input_contains gate decide each one.
-        // The COW is no longer special once it's a real root child
-        // (Phase 2 materialization). With its default empty input shape,
-        // hit_test_child(COW) returns None and the trace continues to
-        // the next sibling — exactly matching Xorg's mi/misprite.c.
-        // When a compositor populates the COW input region via XFIXES,
-        // the gate descends naturally via pointer_target_at_inner's
-        // recursive walk.
+        // The COW is no special case: like Xorg's it is created unshaped,
+        // so it takes the pointer until the compositor empties its input
+        // region, and the trace then continues to the next sibling.
         let parent_window = self.resources.window(parent)?;
         for child_id in parent_window.children.iter().rev() {
             if let Some(hit) = self.hit_test_child(*child_id, x, y) {
@@ -2666,23 +3708,18 @@ impl ServerState {
         Some((child_id, child_x, child_y))
     }
 
+    /// Xorg `miSpriteTrace` (`mi/miwindow.c:767`): a set bounding shape
+    /// (`PointInBorderSize`) and a set input shape must both hold the point.
     fn window_input_contains(&self, window: ResourceId, x: i16, y: i16) -> bool {
-        let Some(rects) = self
-            .shape_windows
-            .get(&window)
-            .and_then(|state| state.input.as_ref())
-        else {
+        let Some(shape) = self.shape_windows.get(&window) else {
             return true;
         };
-        rects.iter().any(|rect| {
-            let rx = i32::from(rect.x);
-            let ry = i32::from(rect.y);
-            let rr = rx + i32::from(rect.width);
-            let rb = ry + i32::from(rect.height);
-            let px = i32::from(x);
-            let py = i32::from(y);
-            px >= rx && py >= ry && px < rr && py < rb
-        })
+        let holds = |region: &Option<crate::region::Region>| {
+            region
+                .as_ref()
+                .is_none_or(|r| r.contains_point(i32::from(x), i32::from(y)))
+        };
+        holds(&shape.bounding) && holds(&shape.input)
     }
 
     /// Diagnostic label for a window: `0x<id>[<WM_CLASS>]`. WM_CLASS is
@@ -2823,6 +3860,7 @@ impl ServerState {
     pub fn subscribers(&self, window: ResourceId, mask_bit: u32) -> Vec<EventTarget> {
         self.clients
             .values()
+            .filter(|c| !c.gone)
             .filter_map(|c| {
                 let mask = c.event_masks.get(&window).copied().unwrap_or(0);
                 if mask & mask_bit != 0 {
@@ -2884,6 +3922,7 @@ impl ServerState {
     ) -> Vec<EventTarget> {
         self.clients
             .values()
+            .filter(|c| !c.gone)
             .filter_map(|c| {
                 let mask = c.event_masks.get(&window).copied().unwrap_or(0);
                 if mask & event_mask != 0 {
@@ -2899,15 +3938,16 @@ impl ServerState {
     pub fn client_target(&self, client_id: ClientId) -> Option<EventTarget> {
         self.clients
             .get(&client_id.0)
+            .filter(|c| !c.gone)
             .map(Self::event_target_for_client)
     }
 
+    /// The owner window and the client that set it (Xorg `pSel->client`).
     #[must_use]
     pub fn selection_owner_target(&self, selection: AtomId) -> Option<(ResourceId, EventTarget)> {
-        let owner_window = self.selections.get(&selection)?.0;
-        let owner_client = self.resources.window_owner(owner_window)?;
-        let target = self.client_target(owner_client)?;
-        Some((owner_window, target))
+        let owner = self.selections.get(&selection)?;
+        let target = self.client_target(owner.client?)?;
+        Some((owner.window, target))
     }
 
     pub fn drop_window_subscriptions(&mut self, windows: &[ResourceId]) {
@@ -2932,6 +3972,8 @@ impl ServerState {
         window: ResourceId,
         button: u8,
         state_mask: u16,
+        device_id: u16,
+        master_device_id: Option<u16>,
     ) -> Option<PassiveButtonGrab> {
         // X11 GrabButton: the grab activates only when "no other
         // buttons ... are logically down" (XGrabButton-1).
@@ -2955,12 +3997,17 @@ impl ServerState {
             current = w.parent;
         }
         for current in chain.into_iter().rev() {
-            for grab in &self.button_grabs {
+            let attached_master =
+                master_device_id.or_else(|| self.xi_devices.attachment(device_id));
+            let matching = self.button_grabs.iter().filter_map(|grab| {
                 if grab.grab_window != current {
-                    continue;
+                    return None;
                 }
                 let button_match = grab.button == 0 || grab.button == button;
                 let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
+                let device_match = (grab.device_id == 0 && attached_master.is_some())
+                    || grab.device_id == device_id
+                    || Some(grab.device_id) == attached_master;
                 // Xorg ActivatePointerGrab fails when confine_to is
                 // not viewable — the grab does not activate
                 // (XGrabButton-3).
@@ -2969,9 +4016,19 @@ impl ServerState {
                         .resources
                         .window(grab.confine_to)
                         .is_some_and(|w| w.map_state == crate::resources::MapState::Viewable);
-                if button_match && mod_match && confine_ok {
-                    return Some(grab.clone());
-                }
+                (button_match && mod_match && device_match && confine_ok).then(|| {
+                    let specificity = if grab.device_id == device_id && grab.device_id != 0 {
+                        3
+                    } else if grab.device_id != 0 {
+                        2
+                    } else {
+                        1
+                    };
+                    (specificity, grab)
+                })
+            });
+            if let Some((_, grab)) = matching.max_by_key(|(specificity, _)| *specificity) {
+                return Some(grab.clone());
             }
         }
         None
@@ -2988,6 +4045,8 @@ impl ServerState {
         window: ResourceId,
         keycode: u8,
         state_mask: u16,
+        device_id: u16,
+        master_device_id: Option<u16>,
     ) -> Option<&KeyGrab> {
         // Top-down walk (root first) — Xorg CheckDeviceGrabs checks
         // the focus trace from the root down, so an ancestor's grab
@@ -3008,15 +4067,30 @@ impl ServerState {
             chain.push(crate::resources::ROOT_WINDOW);
         }
         for current in chain.into_iter().rev() {
-            for grab in &self.key_grabs {
+            let attached_master =
+                master_device_id.or_else(|| self.xi_devices.attachment(device_id));
+            let matching = self.key_grabs.iter().filter_map(|grab| {
                 if grab.grab_window != current {
-                    continue;
+                    return None;
                 }
                 let key_match = grab.keycode == 0 || grab.keycode == keycode;
                 let mod_match = grab.modifiers == 0x8000 || grab.modifiers == (state_mask & 0x00ff);
-                if key_match && mod_match {
-                    return Some(grab);
-                }
+                let device_match = (grab.device_id == 0 && attached_master.is_some())
+                    || grab.device_id == device_id
+                    || Some(grab.device_id) == attached_master;
+                (key_match && mod_match && device_match).then(|| {
+                    let specificity = if grab.device_id == device_id && grab.device_id != 0 {
+                        3
+                    } else if grab.device_id != 0 {
+                        2
+                    } else {
+                        1
+                    };
+                    (specificity, grab)
+                })
+            });
+            if let Some((_, grab)) = matching.max_by_key(|(specificity, _)| *specificity) {
+                return Some(grab);
             }
         }
         None
@@ -3024,7 +4098,7 @@ impl ServerState {
 }
 
 /// Like `emit_window_event` but operates on a pre-snapshotted target list (use when the lock has
-/// already been dropped — e.g. after `destroy_window`).
+/// already been dropped).
 pub fn fanout_event(
     targets: &[EventTarget],
     encode: impl Fn(&mut Vec<u8>, SequenceNumber, ClientByteOrder),
@@ -3127,6 +4201,32 @@ fn pointer_event_fanout_inner(
     handle_grabs: bool,
 ) {
     use crate::host_x11::PointerEventKind;
+    let xi_pointer_device_id = match state.lock() {
+        Ok(state) => match event.origin {
+            crate::core_loop::InputOrigin::Physical(source_id) => {
+                state.xi_devices.source(source_id).and_then(|info| {
+                    info.enabled.then(|| {
+                        state
+                            .xi_devices
+                            .facet(source_id, crate::xinput::XiFacetKind::PointerTouch)
+                            .unwrap_or(crate::xinput::DEVICEID_MASTER_POINTER)
+                    })
+                })
+            }
+            crate::core_loop::InputOrigin::XTest(device_id) => state
+                .xi_devices
+                .device(device_id)
+                .filter(|device| device.enabled)
+                .map(|_| device_id),
+            crate::core_loop::InputOrigin::NestedHost => {
+                Some(crate::xinput::DEVICEID_MASTER_POINTER)
+            }
+        },
+        Err(_) => return,
+    };
+    let Some(xi_pointer_device_id) = xi_pointer_device_id else {
+        return;
+    };
     trace!(
         "pointer_event_fanout: kind={:?} detail={} host_xid=0x{:x} root=({},{}) event=({},{}) state=0x{:x}",
         event.kind,
@@ -3156,6 +4256,7 @@ fn pointer_event_fanout_inner(
         });
         if let Some((rx, ry)) = translated {
             crate::host_x11::HostPointerEvent {
+                origin: event.origin,
                 root_x: rx,
                 root_y: ry,
                 ..event
@@ -3281,7 +4382,7 @@ fn pointer_event_fanout_inner(
         && s.active_pointer_grab.is_some_and(|grab| grab.passive)
     {
         s.clear_pointer_grab();
-        if let Some(freeze) = s.xi1_frozen.get_mut(&crate::xinput::DEVICEID_SLAVE_POINTER) {
+        if let Some(freeze) = s.xi1_frozen.get_mut(&xi_pointer_device_id) {
             freeze.stored = None;
             freeze.state = Xi1SyncState::Thawed;
             freeze.other = None;
@@ -3297,8 +4398,14 @@ fn pointer_event_fanout_inner(
                 .root_pointer_target_at(event.root_x, event.root_y)
                 .or_else(|| s.pointer_target_at(top, event.event_x, event.event_y))
                 .unwrap_or((top, event.event_x, event.event_y));
-            s.find_passive_grab(hit_window, event.detail, event.state)
-                .map(|grab| (grab, hit_window))
+            s.find_passive_grab(
+                hit_window,
+                event.detail,
+                event.state,
+                xi_pointer_device_id,
+                None,
+            )
+            .map(|grab| (grab, hit_window))
         });
         if let Some(grab) = matched {
             let (grab, hit_window) = grab;
@@ -3314,10 +4421,8 @@ fn pointer_event_fanout_inner(
                 Ok(mut s) => {
                     let target = s.client_target(grab.owner);
                     if grab.pointer_mode == 0 {
-                        s.xi1_frozen
-                            .entry(crate::xinput::DEVICEID_SLAVE_POINTER)
-                            .or_default()
-                            .stored = Some(QueuedInputEvent::HostPointer(event));
+                        s.xi1_frozen.entry(xi_pointer_device_id).or_default().stored =
+                            Some(QueuedInputEvent::HostPointer(event));
                     }
                     s.set_pointer_grab(ActivePointerGrab {
                         owner: grab.owner,
@@ -3432,8 +4537,18 @@ fn pointer_event_fanout_inner(
             let mut xi2_targets = Vec::new();
             let mut xi2_raw_targets = Vec::new();
             if xi2_evtype != 0 {
-                for (cid, c) in g.clients.iter() {
-                    let mask = xi2_mask_for_client(c, target, top_level_id, &[4, 2, 1, 0]);
+                for (cid, c) in g.clients.iter().filter(|(_, c)| !c.gone) {
+                    let mask = xi2_mask_for_client(
+                        c,
+                        target,
+                        top_level_id,
+                        &[
+                            xi_pointer_device_id,
+                            crate::xinput::DEVICEID_MASTER_POINTER,
+                            1,
+                            0,
+                        ],
+                    );
                     trace!(
                         "  xi2 lookup: client={} target=0x{:x} top_level=0x{:x} mask=0x{:x} want_bit={}",
                         cid,
@@ -3465,7 +4580,12 @@ fn pointer_event_fanout_inner(
                             c,
                             crate::resources::ROOT_WINDOW,
                             crate::resources::ROOT_WINDOW,
-                            &[1, 0, 4, 2],
+                            &[
+                                xi_pointer_device_id,
+                                crate::xinput::DEVICEID_MASTER_POINTER,
+                                1,
+                                0,
+                            ],
                         );
                         if root_mask & (1 << raw_evtype) != 0
                             // Avoid double-add if the per-target lookup
@@ -3492,6 +4612,7 @@ fn pointer_event_fanout_inner(
         }
         Err(_) => return,
     };
+    let focus = state.lock().is_ok_and(|g| g.crossing_has_focus(nested_id));
 
     for target in core_targets {
         let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
@@ -3564,6 +4685,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
             PointerEventKind::LeaveNotify => x11::encode_leave_notify_event(
@@ -3582,6 +4704,7 @@ fn pointer_event_fanout_inner(
                     state: event.state,
                     detail: event.detail,
                     mode: event.crossing_mode,
+                    focus,
                 },
             ),
         }
@@ -3602,10 +4725,10 @@ fn pointer_event_fanout_inner(
             seq,
             137, // XI2 major opcode
             raw_evtype,
-            4, // deviceid: source Slave Pointer
+            xi_pointer_device_id,
             event.time,
             u32::from(event.detail),
-            4, // sourceid: source Slave Pointer
+            xi_pointer_device_id, // sourceid follows the input origin
             // Relative device delta, not absolute position (see pointer_fanout).
             event.raw_dx,
             event.raw_dy,
@@ -3640,6 +4763,7 @@ fn pointer_event_fanout_inner(
                 0,
                 0,
                 2,
+                focus,
             );
         } else {
             // Pre-D3 legacy emitter (state.fanout_pointer). Mirror the
@@ -3662,7 +4786,7 @@ fn pointer_event_fanout_inner(
                 seq,
                 137, // XI2 major opcode
                 xi2_evtype,
-                2, // deviceid: Master Pointer
+                xi_pointer_device_id,
                 event.time,
                 crate::resources::ROOT_WINDOW,
                 nested_id,
@@ -3673,7 +4797,7 @@ fn pointer_event_fanout_inner(
                 event_y,
                 event.state,
                 u32::from(event.detail),
-                2,
+                xi_pointer_device_id,
                 xi2_flags,
             );
         }
@@ -3698,2853 +4822,4 @@ pub fn next_dpms_level(current: u8, idle_ms: u32, dpms: &DpmsState) -> u8 {
         return 1;
     }
     current
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use proptest::prelude::*;
-    use std::os::unix::net::UnixStream;
-
-    #[test]
-    fn float_atom_is_pre_interned_at_server_init() {
-        let state = ServerState::new();
-        assert_ne!(state.float_atom.0, 0, "FLOAT must be interned at startup");
-        // Re-interning must hit the cache and return the same id.
-        let mut state = state;
-        let again = state.atoms.intern("FLOAT", true);
-        assert_eq!(again, state.float_atom);
-    }
-
-    #[test]
-    fn first_client_base_is_above_root_resources() {
-        let mut a = IdAllocator::new();
-        let (base, mask) = a.allocate().expect("first allocate");
-        assert_eq!(base, 0x0010_0000);
-        assert_eq!(mask, 0x000F_FFFF);
-    }
-
-    #[test]
-    fn allocate_increments_by_first_client_base() {
-        let mut a = IdAllocator::new();
-        let (b1, _) = a.allocate().unwrap();
-        let (b2, _) = a.allocate().unwrap();
-        assert_eq!(b2 - b1, FIRST_CLIENT_BASE);
-    }
-
-    #[test]
-    fn release_recycles_base_for_next_allocate() {
-        let mut a = IdAllocator::new();
-        let (b1, _) = a.allocate().unwrap();
-        let (b2, _) = a.allocate().unwrap();
-        a.release(b1);
-        let (b3, _) = a.allocate().unwrap();
-        assert_eq!(
-            b3, b1,
-            "released base must be reused before bumping next_base"
-        );
-        let (b4, _) = a.allocate().unwrap();
-        assert_eq!(
-            b4,
-            b2 + FIRST_CLIENT_BASE,
-            "fresh base resumes from next_base"
-        );
-    }
-
-    #[test]
-    fn release_ignores_unaligned_or_below_first_base() {
-        let mut a = IdAllocator::new();
-        let (b1, _) = a.allocate().unwrap();
-        a.release(b1 | 0x42); // unaligned (low bits set)
-        a.release(0); // below FIRST_CLIENT_BASE
-        a.release(0x1234); // below FIRST_CLIENT_BASE
-        // Free list rejected all three; next allocate falls through to monotonic.
-        let (b2, _) = a.allocate().unwrap();
-        assert_eq!(b2, b1 + FIRST_CLIENT_BASE);
-    }
-
-    #[test]
-    fn release_survives_u32_overflow_threshold() {
-        // Drain the monotonic counter to the verge of overflow, then
-        // confirm a release-and-reallocate keeps working past the
-        // point where a non-recycling allocator would return None.
-        let mut a = IdAllocator::new();
-        let mut bases = Vec::new();
-        while let Some((b, _)) = a.allocate() {
-            bases.push(b);
-        }
-        // u32::MAX / FIRST_CLIENT_BASE = 4095, but `checked_add` rejects the
-        // step that *would* land on 4095 * FCB because the *next* base would
-        // overflow. Net successful allocates = 4094 (bases 1*FCB through
-        // 4094*FCB).
-        assert_eq!(
-            bases.len(),
-            4094,
-            "successful monotonic allocates before overflow"
-        );
-        assert!(
-            a.allocate().is_none(),
-            "next monotonic allocate must overflow"
-        );
-        let recycled = bases.pop().unwrap();
-        a.release(recycled);
-        let (reused, _) = a
-            .allocate()
-            .expect("recycled base allocates after overflow");
-        assert_eq!(reused, recycled);
-        assert!(
-            a.allocate().is_none(),
-            "no more free + monotonic overflowed"
-        );
-    }
-
-    #[test]
-    fn validate_owned_accepts_ids_in_range() {
-        let (base, mask) = (0x0020_0000, 0x000F_FFFF);
-        assert!(IdAllocator::validate_owned(base, base, mask));
-        assert!(IdAllocator::validate_owned(base | mask, base, mask));
-        assert!(IdAllocator::validate_owned(base + 0x42, base, mask));
-    }
-
-    #[test]
-    fn validate_owned_rejects_ids_outside_range() {
-        let (base, mask) = (0x0020_0000, 0x000F_FFFF);
-        assert!(!IdAllocator::validate_owned(0x0010_0000, base, mask));
-        assert!(!IdAllocator::validate_owned(0x0030_0000, base, mask));
-        assert!(!IdAllocator::validate_owned(0x0000_0100, base, mask));
-    }
-
-    proptest! {
-        #[test]
-        fn pairwise_non_overlap(n in 1usize..256) {
-            let mut a = IdAllocator::new();
-            let mut ranges = Vec::with_capacity(n);
-            for _ in 0..n {
-                ranges.push(a.allocate().expect("range"));
-            }
-            for (i, (b1, m1)) in ranges.iter().enumerate() {
-                for (b2, m2) in ranges.iter().skip(i + 1) {
-                    let lo1 = *b1;
-                    let hi1 = b1 | m1;
-                    let lo2 = *b2;
-                    let hi2 = b2 | m2;
-                    prop_assert!(hi1 < lo2 || hi2 < lo1, "overlap {:x}..={:x} vs {:x}..={:x}", lo1, hi1, lo2, hi2);
-                }
-            }
-        }
-
-        #[test]
-        fn mask_covers_assigned_bits(n in 1usize..64) {
-            let mut a = IdAllocator::new();
-            for _ in 0..n {
-                let (base, mask) = a.allocate().unwrap();
-                prop_assert_eq!(base & mask, 0);
-            }
-        }
-
-        #[test]
-        fn allocated_bases_above_root_range(n in 1usize..64) {
-            let mut a = IdAllocator::new();
-            for _ in 0..n {
-                let (base, _) = a.allocate().unwrap();
-                prop_assert!(base >= 0x0010_0000);
-            }
-        }
-
-        #[test]
-        fn validate_round_trip(seed in 0u32..256, offset in 0u32..=PER_CLIENT_MASK) {
-            let mut a = IdAllocator::new();
-            for _ in 0..seed { a.allocate().unwrap(); }
-            let (base, mask) = a.allocate().unwrap();
-            let id = base + offset;
-            prop_assert!(IdAllocator::validate_owned(id, base, mask));
-            let other = base.wrapping_add(0x0010_0000).wrapping_add(offset);
-            prop_assert!(!IdAllocator::validate_owned(other, base, mask));
-        }
-    }
-
-    #[test]
-    fn subscribers_returns_clients_with_bit_set() {
-        let mut state = ServerState::new();
-        state.clients.insert(
-            1,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([(ResourceId(0x100), 0x0040_0000)]),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-        state.clients.insert(
-            2,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0020_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([(ResourceId(0x100), 0x0000_0001)]),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-        // PropertyChange = 0x0040_0000
-        let subs = state.subscribers(ResourceId(0x100), 0x0040_0000);
-        assert_eq!(subs.len(), 1);
-    }
-
-    #[test]
-    fn subscribers_omits_other_windows() {
-        let mut state = ServerState::new();
-        state.clients.insert(
-            1,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([(ResourceId(0x200), 0xFFFF_FFFF)]),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-        let subs = state.subscribers(ResourceId(0x100), 0x0040_0000);
-        assert!(subs.is_empty());
-    }
-
-    #[test]
-    fn xi2_pointer_mask_matches_exact_and_wildcard_devices() {
-        for deviceid in [2u16, 1, 0] {
-            let client = ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::new(),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 4)]),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            };
-
-            assert_eq!(
-                xi2_mask_for_client(&client, ResourceId(0x100), ResourceId(0x100), &[2, 1, 0]),
-                1 << 4
-            );
-        }
-    }
-
-    /// Issue #72 at the mask layer: a client that splits its XI2
-    /// selection across device wildcards on one window (SDL2/lite-xl:
-    /// Motion under `XIAllMasterDevices(1)`, buttons under
-    /// `XIAllDevices(0)`) must get the OR of BOTH masks, not just the
-    /// first-matching device's. First-match returned only the device-1
-    /// mask (no button bit) and starved lite-xl of every button event.
-    #[test]
-    fn xi2_mask_ors_masks_split_across_device_wildcards() {
-        let win = ResourceId(0x0080_0037);
-        let client = ClientState {
-            writer: make_test_writer(),
-            byte_order: ClientByteOrder::LittleEndian,
-            last_sequence: Arc::new(AtomicU16::new(0)),
-            resource_id_base: 0x0010_0000,
-            resource_id_mask: 0x000F_FFFF,
-            event_masks: HashMap::new(),
-            save_set: HashSet::new(),
-            big_requests_enabled: false,
-            xi2_masks: HashMap::from([
-                // XIAllMasterDevices(1): motion/enter/touch/gesture, NO buttons.
-                ((win, 1u16), 0x381c_00c0u64),
-                // XIAllDevices(0): includes ButtonPress(4)/ButtonRelease(5).
-                ((win, 0u16), 0x19f2u64),
-            ]),
-            xi1_event_classes: HashSet::new(),
-            xi1_window_event_classes: HashMap::new(),
-            outbound: std::collections::VecDeque::new(),
-            watching_writable: false,
-            focused_window: crate::resources::ROOT_WINDOW,
-            reader_control: None,
-            is_local: true,
-            fd_passing: true,
-        };
-
-        // Button bits come from device 0; motion bit from either. First-match
-        // would have returned only device 1's mask (no button bits at all).
-        let mask = xi2_mask_for_client(&client, win, win, &[4, 2, 1, 0]);
-        assert!(
-            mask & (1 << 4) != 0,
-            "issue #72: ButtonPress bit under XIAllDevices(0) must survive the OR"
-        );
-        assert!(
-            mask & (1 << 5) != 0,
-            "issue #72: ButtonRelease bit under XIAllDevices(0) must survive the OR"
-        );
-        assert!(mask & (1 << 6) != 0, "Motion bit must survive the OR");
-    }
-
-    #[test]
-    fn xi2_keyboard_mask_matches_exact_and_wildcard_devices() {
-        for deviceid in [3u16, 1, 0] {
-            let client = ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::new(),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::from([((ResourceId(0x100), deviceid), 1 << 2)]),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            };
-
-            assert_eq!(
-                xi2_mask_for_client(&client, ResourceId(0x100), ResourceId(0x100), &[3, 1, 0]),
-                1 << 2
-            );
-        }
-    }
-
-    #[test]
-    fn subscribers_omits_disconnected_client() {
-        let mut state = ServerState::new();
-        state.clients.insert(
-            1,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([(ResourceId(0x100), 0x0040_0000)]),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-        assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
-        state.clients.remove(&1);
-        assert!(state.subscribers(ResourceId(0x100), 0x0040_0000).is_empty());
-    }
-
-    #[test]
-    fn subscribers_intersecting_matches_any_selected_bit() {
-        let mut state = ServerState::new();
-        state.clients.insert(
-            1,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([(ResourceId(0x100), 0b1010)]),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-        state.clients.insert(
-            2,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0020_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([(ResourceId(0x100), 0b0100)]),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-
-        assert_eq!(
-            state
-                .subscribers_intersecting(ResourceId(0x100), 0b0010)
-                .len(),
-            1
-        );
-        assert_eq!(
-            state
-                .subscribers_intersecting(ResourceId(0x100), 0b1100)
-                .len(),
-            2
-        );
-        assert!(
-            state
-                .subscribers_intersecting(ResourceId(0x100), 0b0001)
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn client_target_returns_connected_client() {
-        let mut state = ServerState::new();
-        state.clients.insert(
-            7,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0x1234)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::new(),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-
-        assert!(state.client_target(ClientId(7)).is_some());
-        assert!(state.client_target(ClientId(8)).is_none());
-    }
-
-    fn make_test_writer() -> Arc<Mutex<Transport>> {
-        let (a, _b) = UnixStream::pair().expect("socketpair");
-        Arc::new(Mutex::new(Transport::Unix(a)))
-    }
-
-    #[test]
-    fn unmap_notify_fanout_reaches_only_subscribed_clients() {
-        use yserver_protocol::x11::{SequenceNumber, encode_unmap_notify_event};
-
-        // Client A: StructureNotify on window 0x100.
-        let (a_writer_local, _a_reader_remote) = UnixStream::pair().expect("socketpair");
-        // Client B: KeyPress only on window 0x100 (NOT StructureNotify).
-        let (b_writer_local, _b_reader_remote) = UnixStream::pair().expect("socketpair");
-
-        let mut state = ServerState::new();
-        state.clients.insert(
-            1,
-            ClientState {
-                writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([(ResourceId(0x100), 0x0002_0000)]), // StructureNotify
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-        state.clients.insert(
-            2,
-            ClientState {
-                writer: Arc::new(Mutex::new(Transport::Unix(b_writer_local))),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0020_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([(ResourceId(0x100), 0x0000_0001)]), // KeyPress
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-
-        let subs = state.subscribers(ResourceId(0x100), 0x0002_0000);
-        assert_eq!(subs.len(), 1, "only client A should be subscribed");
-
-        let target = &subs[0];
-        let seq = SequenceNumber(target.last_sequence.load(Ordering::Relaxed));
-        let mut buf = Vec::with_capacity(32);
-        encode_unmap_notify_event(
-            &mut buf,
-            seq,
-            target.byte_order,
-            ResourceId(0x100),
-            ResourceId(0x100),
-            false,
-        );
-        assert_eq!(buf[0], 18, "wire byte 0 is UnmapNotify");
-        assert_eq!(&buf[4..8], &0x100u32.to_le_bytes());
-        assert_eq!(&buf[8..12], &0x100u32.to_le_bytes());
-        assert_eq!(buf[12], 0, "from_configure = false");
-    }
-
-    #[test]
-    fn drop_window_subscriptions_removes_entries_for_destroyed_windows() {
-        let mut state = ServerState::new();
-        let xi1_class_dev4 =
-            (4 << 8) | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
-        let xi1_class_dev5 =
-            (5 << 8) | u32::from(XI_FIRST_EVENT + crate::xinput::XI_DEVICE_PROPERTY_NOTIFY_OFFSET);
-        state.clients.insert(
-            1,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([
-                    (ResourceId(0x100), 0x0040_0000),
-                    (ResourceId(0x200), 0x0040_0000),
-                ]),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::from([
-                    ((ResourceId(0x100), 4), 1),
-                    ((ResourceId(0x200), 5), 1),
-                ]),
-                xi1_event_classes: HashSet::from([xi1_class_dev4, xi1_class_dev5]),
-                xi1_window_event_classes: HashMap::from([
-                    (ResourceId(0x100), HashSet::from([xi1_class_dev4])),
-                    (ResourceId(0x200), HashSet::from([xi1_class_dev5])),
-                ]),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-        assert_eq!(state.subscribers(ResourceId(0x100), 0x0040_0000).len(), 1);
-        state.drop_window_subscriptions(&[ResourceId(0x100)]);
-        assert!(state.subscribers(ResourceId(0x100), 0x0040_0000).is_empty());
-        // Surviving window's subscription stays.
-        assert_eq!(state.subscribers(ResourceId(0x200), 0x0040_0000).len(), 1);
-        let client = state.clients.get(&1).unwrap();
-        assert!(!client.xi2_masks.contains_key(&(ResourceId(0x100), 4)));
-        assert!(client.xi2_masks.contains_key(&(ResourceId(0x200), 5)));
-        assert!(
-            !client
-                .xi1_window_event_classes
-                .contains_key(&ResourceId(0x100))
-        );
-        assert!(
-            client
-                .xi1_window_event_classes
-                .contains_key(&ResourceId(0x200))
-        );
-        assert_eq!(client.xi1_event_classes, HashSet::from([xi1_class_dev5]));
-    }
-
-    #[test]
-    fn replay_pointer_delivers_to_button_press_window_not_grab_owner() {
-        use std::{
-            collections::HashMap as StdHashMap,
-            io::{ErrorKind, Read},
-            sync::Mutex as StdMutex,
-        };
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        let (grab_writer_local, mut grab_reader_remote) = UnixStream::pair().expect("socketpair");
-        let (target_writer_local, mut target_reader_remote) =
-            UnixStream::pair().expect("socketpair");
-        grab_reader_remote.set_nonblocking(true).unwrap();
-        target_reader_remote.set_nonblocking(true).unwrap();
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            let grab_window = ResourceId(0x0010_0002);
-            let target_window = ResourceId(0x0020_0002);
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: grab_window,
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            s.resources.create_window(
-                ClientId(2),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: target_window,
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            let _ = s.resources.map_window(grab_window);
-            let _ = s.resources.map_window(target_window);
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(grab_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(grab_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(target_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(target_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-            s.set_pointer_grab(ActivePointerGrab {
-                owner: ClientId(1),
-                grab_window,
-                event_mask: u16::MAX,
-                cursor: ResourceId(0),
-                time: 0,
-                owner_events: false,
-                via_xi2: false,
-                implicit: false,
-                passive: true,
-                xi2_mask: 0,
-            });
-            assert_eq!(s.subscribers(grab_window, 0x0000_0004).len(), 1);
-            assert_eq!(s.subscribers(target_window, 0x0000_0004).len(), 1);
-            assert!(s.resources.window(target_window).is_some());
-            assert!(
-                s.resources
-                    .pointer_target_at(target_window, 10, 10)
-                    .is_some()
-            );
-            assert!(
-                s.pointer_propagation_target(target_window, 10, 10, 0x0000_0004)
-                    .is_some()
-            );
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0020_0002));
-        let xid_map = map;
-
-        route_button_press_no_grab(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE,
-                detail: 1,
-                time: 0,
-                root_x: 10,
-                root_y: 10,
-                event_x: 10,
-                event_y: 10,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-                raw_dx: 0,
-                raw_dy: 0,
-            },
-        );
-
-        let mut buf = [0u8; 32];
-        let grab_read = grab_reader_remote.read(&mut buf);
-        assert!(
-            matches!(grab_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "grab owner must not receive replayed ButtonPress; got {grab_read:?}",
-        );
-        let target_read = target_reader_remote.read(&mut buf);
-        assert!(
-            matches!(target_read, Ok(32)),
-            "target window subscriber should receive replayed ButtonPress; got {target_read:?}",
-        );
-        assert_eq!(buf[0], 4, "event type should be ButtonPress");
-        assert_eq!(&buf[12..16], &0x0020_0002u32.to_le_bytes());
-    }
-
-    #[test]
-    fn passive_grab_owner_events_keeps_child_delivery_on_owned_windows() {
-        use std::{
-            collections::HashMap as StdHashMap,
-            io::{ErrorKind, Read},
-            sync::Mutex as StdMutex,
-        };
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        let (grab_writer_local, mut grab_reader_remote) = UnixStream::pair().expect("socketpair");
-        let (child_writer_local, mut child_reader_remote) = UnixStream::pair().expect("socketpair");
-        grab_reader_remote.set_nonblocking(true).unwrap();
-        child_reader_remote.set_nonblocking(true).unwrap();
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            let grab_window = ResourceId(0x0010_0002);
-            let child_window = ResourceId(0x0010_0003);
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: grab_window,
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: child_window,
-                    parent: grab_window,
-                    x: 10,
-                    y: 10,
-                    width: 40,
-                    height: 40,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            let _ = s.resources.map_window(grab_window);
-            let _ = s.resources.map_window(child_window);
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(grab_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(grab_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(child_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(child_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-            s.set_pointer_grab(ActivePointerGrab {
-                owner: ClientId(1),
-                grab_window,
-                event_mask: u16::MAX,
-                cursor: ResourceId(0),
-                time: 0,
-                owner_events: true,
-                via_xi2: true,
-                implicit: false,
-                passive: true,
-                xi2_mask: u64::MAX,
-            });
-            s.button_grabs.push(PassiveButtonGrab {
-                owner: ClientId(1),
-                grab_window,
-                button: 1,
-                modifiers: 0,
-                owner_events: true,
-                event_mask: 0xFFFF_FFFF,
-                pointer_mode: 0,
-                keyboard_mode: 1,
-                confine_to: ResourceId(0),
-                via_xi2: true,
-            });
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
-        let xid_map = map;
-
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE,
-                detail: 1,
-                time: 0,
-                root_x: 20,
-                root_y: 20,
-                event_x: 20,
-                event_y: 20,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-                raw_dx: 0,
-                raw_dy: 0,
-            },
-        );
-
-        let mut buf = [0u8; 32];
-        let child_read = child_reader_remote.read(&mut buf);
-        assert!(
-            matches!(child_read, Ok(32)),
-            "owner_events=true passive grab must still deliver to the owned child; got {child_read:?}",
-        );
-        assert_eq!(buf[0], 4, "event type should be ButtonPress");
-        assert_eq!(&buf[12..16], &0x0010_0003u32.to_le_bytes());
-
-        let grab_read = grab_reader_remote.read(&mut buf);
-        assert!(
-            matches!(grab_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "owner_events=true passive grab must not redirect owned-child clicks to the grab owner; got {grab_read:?}",
-        );
-    }
-
-    #[test]
-    fn passive_grab_owner_events_keeps_descendant_delivery_even_when_child_owned_elsewhere() {
-        use std::{
-            collections::HashMap as StdHashMap,
-            io::{ErrorKind, Read},
-            sync::Mutex as StdMutex,
-        };
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        let (grab_writer_local, mut grab_reader_remote) = UnixStream::pair().expect("socketpair");
-        let (child_writer_local, mut child_reader_remote) = UnixStream::pair().expect("socketpair");
-        grab_reader_remote.set_nonblocking(true).unwrap();
-        child_reader_remote.set_nonblocking(true).unwrap();
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            let grab_window = ResourceId(0x0010_0010);
-            let child_window = ResourceId(0x0010_0011);
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: grab_window,
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            s.resources.create_window(
-                ClientId(2),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: child_window,
-                    parent: grab_window,
-                    x: 10,
-                    y: 10,
-                    width: 40,
-                    height: 40,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            let _ = s.resources.map_window(grab_window);
-            let _ = s.resources.map_window(child_window);
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(grab_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(grab_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(child_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(child_window, 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-            s.set_pointer_grab(ActivePointerGrab {
-                owner: ClientId(1),
-                grab_window,
-                event_mask: u16::MAX,
-                cursor: ResourceId(0),
-                time: 0,
-                owner_events: true,
-                via_xi2: true,
-                implicit: false,
-                passive: true,
-                xi2_mask: u64::MAX,
-            });
-            s.button_grabs.push(PassiveButtonGrab {
-                owner: ClientId(1),
-                grab_window,
-                button: 1,
-                modifiers: 0,
-                owner_events: true,
-                event_mask: 0xFFFF_FFFF,
-                pointer_mode: 0,
-                keyboard_mode: 1,
-                confine_to: ResourceId(0),
-                via_xi2: true,
-            });
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0010_0010));
-        let xid_map = map;
-
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE,
-                detail: 1,
-                time: 0,
-                root_x: 20,
-                root_y: 20,
-                event_x: 20,
-                event_y: 20,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-                raw_dx: 0,
-                raw_dy: 0,
-            },
-        );
-
-        let mut buf = [0u8; 32];
-        let child_read = child_reader_remote.read(&mut buf);
-        assert!(
-            matches!(child_read, Ok(32)),
-            "owner_events=true passive grab must still deliver to the descendant child even when another client owns it; got {child_read:?}",
-        );
-        let grab_read = grab_reader_remote.read(&mut buf);
-        assert!(
-            matches!(grab_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "owner_events=true passive grab must not redirect descendant clicks to the grab owner; got {grab_read:?}",
-        );
-    }
-
-    #[test]
-    fn pointer_event_fanout_filters_by_mask() {
-        use std::{collections::HashMap as StdHashMap, sync::Mutex as StdMutex};
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        // Client A: ButtonPress on window 0x0010_0002.
-        let (a_writer_local, _a_reader_remote) = UnixStream::pair().expect("socketpair");
-        // Client B: MotionNotify on window 0x0010_0002.
-        let (b_writer_local, _b_reader_remote) = UnixStream::pair().expect("socketpair");
-        // Client C: no pointer events at all.
-        let (c_writer_local, _c_reader_remote) = UnixStream::pair().expect("socketpair");
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]), // ButtonPress
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(b_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0040)]), // PointerMotion
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-            s.clients.insert(
-                3,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(c_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0030_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::new(),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
-        let xid_map = map;
-
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE,
-                detail: 1,
-                time: 0,
-                root_x: 1,
-                root_y: 2,
-                event_x: 3,
-                event_y: 4,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-                raw_dx: 0,
-                raw_dy: 0,
-            },
-        );
-
-        let s = state.lock().unwrap();
-        assert_eq!(
-            s.subscribers(ResourceId(0x0010_0002), 0x0000_0004).len(),
-            1,
-            "only client A selected ButtonPress"
-        );
-        assert_eq!(
-            s.subscribers(ResourceId(0x0010_0002), 0x0000_0040).len(),
-            1,
-            "only client B selected MotionNotify"
-        );
-    }
-
-    #[test]
-    fn pointer_event_fanout_delivers_motion_under_button_motion_mask() {
-        use std::{
-            collections::HashMap as StdHashMap,
-            io::{ErrorKind, Read},
-            sync::Mutex as StdMutex,
-        };
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        // Client A: subscribes to ButtonMotion (0x2000) only. Mirrors
-        // wmaker's frame mask: it expects motion while a button is held.
-        let (a_writer_local, mut a_reader_remote) = UnixStream::pair().expect("socketpair");
-        // Client B: no motion mask at all — must not receive anything.
-        let (b_writer_local, mut b_reader_remote) = UnixStream::pair().expect("socketpair");
-
-        a_reader_remote.set_nonblocking(true).unwrap();
-        b_reader_remote.set_nonblocking(true).unwrap();
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            // Top-level window so pointer_target_at returns the same id.
-            s.resources.create_window(
-                ClientId(1),
-                yserver_protocol::x11::CreateWindowRequest {
-                    depth: 24,
-                    window: ResourceId(0x0010_0002),
-                    parent: crate::resources::ROOT_WINDOW,
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 100,
-                    border_width: 0,
-                    class: 1,
-                    visual: crate::resources::ROOT_VISUAL,
-                    ..Default::default()
-                },
-            );
-            let _ = s.resources.map_window(ResourceId(0x0010_0002));
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_2000)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-            s.clients.insert(
-                2,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(b_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0020_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::new(),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-        }
-
-        let mut map = StdHashMap::new();
-        map.insert(0xCAFE_u32, ResourceId(0x0010_0002));
-        let xid_map = map;
-
-        // Motion with button 1 held (state bit 8 == 0x100).
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::MotionNotify,
-                host_xid: 0xCAFE,
-                detail: 0,
-                time: 0,
-                root_x: 5,
-                root_y: 5,
-                event_x: 5,
-                event_y: 5,
-                state: 0x0100,
-                crossing_mode: 0,
-                child: 0,
-                raw_dx: 0,
-                raw_dy: 0,
-            },
-        );
-
-        let mut buf = [0u8; 32];
-        let a_read = a_reader_remote.read(&mut buf);
-        assert!(
-            matches!(a_read, Ok(32)),
-            "client with ButtonMotion mask should receive 32-byte MotionNotify when a button is held; got {a_read:?}",
-        );
-        assert_eq!(buf[0], 6, "event type should be MotionNotify");
-
-        let b_read = b_reader_remote.read(&mut buf);
-        assert!(
-            matches!(b_read, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "client with no motion mask must not receive motion; got {b_read:?}",
-        );
-
-        // Motion without any button held: ButtonMotion subscriber must NOT receive.
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::MotionNotify,
-                host_xid: 0xCAFE,
-                detail: 0,
-                time: 0,
-                root_x: 5,
-                root_y: 5,
-                event_x: 5,
-                event_y: 5,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-                raw_dx: 0,
-                raw_dy: 0,
-            },
-        );
-        let a_read2 = a_reader_remote.read(&mut buf);
-        assert!(
-            matches!(a_read2, Err(ref e) if e.kind() == ErrorKind::WouldBlock),
-            "ButtonMotion-only subscriber must NOT receive motion when no button is held; got {a_read2:?}",
-        );
-    }
-
-    #[test]
-    fn pointer_event_fanout_drops_unknown_host_xid() {
-        use std::{collections::HashMap as StdHashMap, sync::Mutex as StdMutex};
-
-        use crate::host_x11::{HostPointerEvent, PointerEventKind};
-
-        let (a_writer_local, _a_reader_remote) = UnixStream::pair().expect("socketpair");
-
-        let state = StdMutex::new(ServerState::new());
-        {
-            let mut s = state.lock().unwrap();
-            s.clients.insert(
-                1,
-                ClientState {
-                    writer: Arc::new(Mutex::new(Transport::Unix(a_writer_local))),
-                    byte_order: ClientByteOrder::LittleEndian,
-                    last_sequence: Arc::new(AtomicU16::new(0)),
-                    resource_id_base: 0x0010_0000,
-                    resource_id_mask: 0x000F_FFFF,
-                    event_masks: HashMap::from([(ResourceId(0x0010_0002), 0x0000_0004)]),
-                    save_set: HashSet::new(),
-                    big_requests_enabled: false,
-                    xi2_masks: HashMap::new(),
-                    xi1_event_classes: HashSet::new(),
-                    xi1_window_event_classes: HashMap::new(),
-                    outbound: std::collections::VecDeque::new(),
-                    watching_writable: false,
-                    focused_window: crate::resources::ROOT_WINDOW,
-                    reader_control: None,
-                    is_local: true,
-                    fd_passing: true,
-                },
-            );
-        }
-
-        let xid_map: crate::host_x11::HostXidMap = StdHashMap::new(); // empty
-
-        pointer_event_fanout(
-            &state,
-            &xid_map,
-            HostPointerEvent {
-                kind: PointerEventKind::ButtonPress,
-                host_xid: 0xCAFE, // not in map
-                detail: 1,
-                time: 0,
-                root_x: 0,
-                root_y: 0,
-                event_x: 0,
-                event_y: 0,
-                state: 0,
-                crossing_mode: 0,
-                child: 0,
-                raw_dx: 0,
-                raw_dy: 0,
-            },
-        );
-
-        assert!(state.lock().unwrap().clients.contains_key(&1));
-    }
-
-    #[test]
-    fn key_grab_lookup_exact_match() {
-        let mut s = ServerState::new();
-        let win = ResourceId(0x42);
-        let owner = ClientId(1);
-        s.key_grabs.push(KeyGrab {
-            owner,
-            grab_window: win,
-            keycode: 24,
-            modifiers: 0x0040,
-            owner_events: false,
-            pointer_mode: 1,
-            keyboard_mode: 1,
-            via_xi2: false,
-            xi2_mask: 0,
-        });
-        let hit = s.find_key_grab(win, 24, 0x0040);
-        assert!(hit.is_some());
-        assert_eq!(hit.unwrap().owner, owner);
-    }
-
-    #[test]
-    fn key_grab_lookup_any_modifier_wildcard() {
-        let mut s = ServerState::new();
-        let win = ResourceId(0x42);
-        s.key_grabs.push(KeyGrab {
-            owner: ClientId(1),
-            grab_window: win,
-            keycode: 24,
-            modifiers: 0x8000,
-            owner_events: false,
-            pointer_mode: 1,
-            keyboard_mode: 1,
-            via_xi2: false,
-            xi2_mask: 0,
-        });
-        assert!(s.find_key_grab(win, 24, 0x0040).is_some());
-        assert!(s.find_key_grab(win, 24, 0x0000).is_some());
-        assert!(s.find_key_grab(win, 25, 0x0040).is_none());
-    }
-
-    #[test]
-    fn key_grab_lookup_any_keycode_wildcard() {
-        let mut s = ServerState::new();
-        let win = ResourceId(0x42);
-        s.key_grabs.push(KeyGrab {
-            owner: ClientId(1),
-            grab_window: win,
-            keycode: 0,
-            modifiers: 0x0040,
-            owner_events: false,
-            pointer_mode: 1,
-            keyboard_mode: 1,
-            via_xi2: false,
-            xi2_mask: 0,
-        });
-        assert!(s.find_key_grab(win, 24, 0x0040).is_some());
-        assert!(s.find_key_grab(win, 99, 0x0040).is_some());
-        assert!(s.find_key_grab(win, 24, 0x0000).is_none());
-    }
-
-    #[test]
-    fn active_keyboard_grab_set_and_clear() {
-        let mut s = ServerState::new();
-        assert!(s.active_keyboard_grab.is_none());
-        s.active_keyboard_grab = Some(ActiveKeyboardGrab {
-            owner: ClientId(7),
-            grab_window: ResourceId(0xff),
-            source: ActiveKeyboardGrabSource::Explicit,
-            owner_events: false,
-            via_xi2: false,
-            xi2_mask: 0,
-        });
-        assert_eq!(s.active_keyboard_grab.unwrap().owner, ClientId(7));
-        s.active_keyboard_grab = None;
-        assert!(s.active_keyboard_grab.is_none());
-    }
-
-    fn add_test_client(state: &mut ServerState, client_id: u32, base: u32) {
-        state.clients.insert(
-            client_id,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: base,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::new(),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-    }
-
-    #[test]
-    fn pointer_propagation_walks_parent_chain_to_root() {
-        // Reproduces the desk-1 right-click bug: pointer-on-child of root,
-        // child has no ButtonPress mask, root does. The event must propagate
-        // up to root.
-        use crate::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        let mut state = ServerState::new();
-        add_test_client(&mut state, 1, 0x0010_0000);
-
-        // Child of root, full screen, no ButtonPress mask (e16's "Root-bg").
-        let child = ResourceId(0x0010_0004);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: child,
-                parent: ROOT_WINDOW,
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-                border_width: 0,
-                class: 1,
-                visual: crate::resources::ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(child);
-
-        // e16 selects ButtonPress on root.
-        let button_press_mask: u32 = 0x0000_0004;
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .event_masks
-            .insert(ROOT_WINDOW, button_press_mask);
-
-        // Click hits the child at (136, 111) — relative to child since child is
-        // at (0, 0). pointer_propagation_target should walk up to root.
-        let result = state.pointer_propagation_target(child, 136, 111, button_press_mask);
-        assert!(result.is_some(), "expected propagation to root");
-        let (window, x, y, subs) = result.unwrap();
-        assert_eq!(window, ROOT_WINDOW);
-        // Child is at (0, 0) on root, so coords are unchanged.
-        assert_eq!(x, 136);
-        assert_eq!(y, 111);
-        assert_eq!(subs.len(), 1);
-    }
-
-    #[test]
-    fn pointer_propagation_translates_offset_coords() {
-        // Click at (10, 20) inside a child positioned at (50, 60) on root —
-        // should translate to (60, 80) when delivered to root.
-        use crate::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        let mut state = ServerState::new();
-        add_test_client(&mut state, 1, 0x0010_0000);
-
-        let child = ResourceId(0x0010_0010);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: child,
-                parent: ROOT_WINDOW,
-                x: 50,
-                y: 60,
-                width: 100,
-                height: 100,
-                border_width: 0,
-                class: 1,
-                visual: crate::resources::ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(child);
-
-        let button_press_mask: u32 = 0x0000_0004;
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .event_masks
-            .insert(ROOT_WINDOW, button_press_mask);
-
-        let (window, x, y, _) = state
-            .pointer_propagation_target(child, 10, 20, button_press_mask)
-            .expect("propagation should find root");
-        assert_eq!(window, ROOT_WINDOW);
-        assert_eq!(x, 60);
-        assert_eq!(y, 80);
-    }
-
-    #[test]
-    fn pointer_propagation_stops_at_first_subscriber() {
-        // Both child and root subscribe; event delivered to child (first hit).
-        use crate::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        let mut state = ServerState::new();
-        add_test_client(&mut state, 1, 0x0010_0000);
-
-        let child = ResourceId(0x0010_0020);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: child,
-                parent: ROOT_WINDOW,
-                x: 5,
-                y: 5,
-                width: 100,
-                height: 100,
-                border_width: 0,
-                class: 1,
-                visual: crate::resources::ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(child);
-
-        let button_press_mask: u32 = 0x0000_0004;
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .event_masks
-            .insert(child, button_press_mask);
-        state
-            .clients
-            .get_mut(&1)
-            .unwrap()
-            .event_masks
-            .insert(ROOT_WINDOW, button_press_mask);
-
-        let (window, x, y, _) = state
-            .pointer_propagation_target(child, 30, 40, button_press_mask)
-            .expect("propagation should hit child first");
-        assert_eq!(window, child);
-        assert_eq!(x, 30);
-        assert_eq!(y, 40);
-    }
-
-    #[test]
-    fn pointer_propagation_returns_none_when_nothing_subscribes() {
-        use crate::resources::ROOT_WINDOW;
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        let mut state = ServerState::new();
-        add_test_client(&mut state, 1, 0x0010_0000);
-
-        let child = ResourceId(0x0010_0030);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: child,
-                parent: ROOT_WINDOW,
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 100,
-                border_width: 0,
-                class: 1,
-                visual: crate::resources::ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(child);
-
-        let button_press_mask: u32 = 0x0000_0004;
-        let result = state.pointer_propagation_target(child, 10, 10, button_press_mask);
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn cow_with_empty_input_shape_passes_clicks_to_sibling_below() {
-        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        let mut state = ServerState::new();
-
-        // Non-COW sibling at (0,0) 800x600, default (full) input shape.
-        let sib = ResourceId(0x0010_0080);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: sib,
-                parent: ROOT_WINDOW,
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-                border_width: 0,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(sib);
-
-        // Materialize COW (full-screen, empty input shape per Task 2.8).
-        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
-        state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
-
-        // Click at (50, 50): inside both sibling and COW geometry. COW's
-        // empty input shape → hit_test_child(COW) = None → iteration
-        // falls through to `sib`.
-        let (target, _, _) = state
-            .root_pointer_target_at(50, 50)
-            .expect("trace hits sibling below COW");
-        assert_eq!(
-            target, sib,
-            "empty COW input shape must let clicks through to sibling below"
-        );
-    }
-
-    // ---- #133 step 8 (P9): border-inclusive input ----------------
-    //
-    // The `ServerState` half of the hit test. `resources.rs` pins the
-    // `ResourceTable` mirror and `child_containing_point` on the same
-    // fixture; these add the input-shape gate (which lives only here)
-    // and cross-check the two implementations against each other.
-
-    /// Same fixture as `resources::tests::bordered_frame_table`: a root
-    /// child at (100, 200), 300x400, `border_width = 16`. Content origin
-    /// (116, 216); outer box x [100, 432) x y [200, 632).
-    fn bordered_frame_state() -> (ServerState, ResourceId) {
-        use crate::resources::ROOT_VISUAL;
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        let mut state = ServerState::new();
-        let frame = ResourceId(0x0010_0100);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: frame,
-                parent: crate::resources::ROOT_WINDOW,
-                x: 100,
-                y: 200,
-                width: 300,
-                height: 400,
-                border_width: 16,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(frame);
-        (state, frame)
-    }
-
-    /// (name, root_x, root_y, want content x, want content y).
-    const BORDER_PROBES: &[(&str, i16, i16, i16, i16)] = &[
-        ("left edge", 100, 416, -16, 200),
-        ("top edge", 266, 200, 150, -16),
-        ("right edge", 431, 416, 315, 200),
-        ("bottom edge", 266, 631, 150, 415),
-        ("top-left corner", 100, 200, -16, -16),
-        ("top-right corner", 431, 200, 315, -16),
-        ("bottom-left corner", 100, 631, -16, 415),
-        ("bottom-right corner", 431, 631, 315, 415),
-    ];
-
-    #[test]
-    fn server_hit_test_border_sides_and_corners_report_content_coords() {
-        let (state, frame) = bordered_frame_state();
-        for &(name, ax, ay, wx, wy) in BORDER_PROBES {
-            assert_eq!(
-                state.root_pointer_target_at(ax, ay),
-                Some((frame, wx, wy)),
-                "{name}: root ({ax},{ay}) must hit the frame at content ({wx},{wy})"
-            );
-        }
-    }
-
-    #[test]
-    fn server_hit_test_rejects_one_pixel_outside_the_border() {
-        let (state, _frame) = bordered_frame_state();
-        for (ax, ay) in [(99i16, 416i16), (266, 199), (432, 416), (266, 632)] {
-            assert_eq!(
-                state.root_pointer_target_at(ax, ay),
-                Some((crate::resources::ROOT_WINDOW, ax, ay)),
-                "({ax},{ay}) is outside the outer box and must not hit"
-            );
-        }
-    }
-
-    /// The two implementations (8.4). `ServerState::hit_test_child` and
-    /// `ResourceTable::pointer_target_at_inner` are separate copies of
-    /// the same rule, and divergence between an authoritative tree and
-    /// its mirror is a standing bug class here — so drive both for the
-    /// same points and compare, coordinates included. With no input
-    /// shape set the shape gate is a pass-through, which is what makes
-    /// the two comparable at all.
-    #[test]
-    fn hit_test_implementations_agree_on_border_points() {
-        let (state, frame) = bordered_frame_state();
-        for &(name, ax, ay, wx, wy) in BORDER_PROBES {
-            let via_server = state.root_pointer_target_at(ax, ay);
-            let via_table =
-                state
-                    .resources
-                    .pointer_target_at(crate::resources::ROOT_WINDOW, ax, ay);
-            assert_eq!(
-                via_server, via_table,
-                "{name}: ServerState and ResourceTable hit tests diverge"
-            );
-            assert_eq!(via_server, Some((frame, wx, wy)), "{name}");
-            // The third implementation, which returns only the window.
-            assert_eq!(
-                state.resources.child_containing_point(
-                    crate::resources::ROOT_WINDOW,
-                    i32::from(ax),
-                    i32::from(ay)
-                ),
-                Some(frame),
-                "{name}: child_containing_point diverges"
-            );
-        }
-    }
-
-    /// 8.3 — the input shape is applied in CONTENT coordinates
-    /// (`dix/window.c:2995` passes `x - pWin->drawable.x` to
-    /// `RegionContainsPoint(wInputShape(pWin), ...)`), and it is a THIRD
-    /// shape, distinct from bounding and clip.
-    ///
-    /// A shape rect covering only the top-left 10x10 of the CONTENT must
-    /// therefore accept content (0,0) and reject the border ring, whose
-    /// content coordinates are negative — and, crucially, must reject
-    /// content (16,16), which is what the pre-fix arithmetic handed the
-    /// shape test when the pointer was at the content origin.
-    #[test]
-    fn input_shape_is_tested_in_content_coordinates() {
-        use yserver_protocol::x11::xfixes;
-
-        let (mut state, frame) = bordered_frame_state();
-        state.shape_windows.entry(frame).or_default().input = Some(vec![xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: 10,
-            height: 10,
-        }]);
-
-        // Content origin (116, 216) → content (0,0): inside the shape.
-        assert_eq!(
-            state.root_pointer_target_at(116, 216),
-            Some((frame, 0, 0)),
-            "the content origin is inside a shape rooted at content (0,0)"
-        );
-        // Content (9,9): still inside.
-        assert_eq!(state.root_pointer_target_at(125, 225), Some((frame, 9, 9)));
-        // Content (10,10): outside the shape → falls through to root,
-        // even though it is well inside the window's outer box.
-        assert_eq!(
-            state.root_pointer_target_at(126, 226),
-            Some((crate::resources::ROOT_WINDOW, 126, 226))
-        );
-        // The border ring is inside `borderClip` but outside the input
-        // shape (its content coords are negative) → no hit.
-        assert_eq!(
-            state.root_pointer_target_at(100, 200),
-            Some((crate::resources::ROOT_WINDOW, 100, 200)),
-            "the top-left border corner is outside a content-space shape"
-        );
-        // The outer origin (116-16, 216-16) is what the OLD code called
-        // (0,0). Pinning it as a miss is what makes this a regression
-        // test rather than a restatement.
-        assert_eq!(
-            state.root_pointer_target_at(100 + 16 + 10, 200 + 16 + 10),
-            Some((crate::resources::ROOT_WINDOW, 126, 226))
-        );
-    }
-
-    /// The propagation walk climbs the ancestry when the hit window has
-    /// no subscriber, translating the coordinate to whichever window it
-    /// stops at. That walk must be the exact inverse of the hit-test
-    /// descent — border term included — or the coordinate drifts by one
-    /// border width per level crossed.
-    #[test]
-    fn propagation_walk_up_undoes_the_border_term() {
-        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
-        use yserver_protocol::x11::CreateWindowRequest;
-
-        let (mut state, frame) = bordered_frame_state();
-        let child = ResourceId(0x0010_0101);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: child,
-                parent: frame,
-                x: 10,
-                y: 20,
-                width: 100,
-                height: 100,
-                border_width: 4,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(child);
-
-        // Root (130, 240) is the child's own content origin.
-        let (hit, hx, hy) = state.root_pointer_target_at(130, 240).expect("child hit");
-        assert_eq!((hit, hx, hy), (child, 0, 0));
-
-        // Nobody subscribes anywhere, so the walk runs to the root and
-        // returns None — but it must arrive at root coordinates that
-        // still name the same physical pixel. Assert the arithmetic
-        // directly via the inverse helpers, level by level.
-        let cw = state.resources.window(child).expect("child");
-        let fw = state.resources.window(frame).expect("frame");
-        let (fx, fy) = cw.to_parent_coords(hx, hy);
-        assert_eq!((fx, fy), (14, 24), "child content → frame content");
-        assert_eq!(
-            fw.to_parent_coords(fx, fy),
-            (130, 240),
-            "frame content → root content == the original root point"
-        );
-
-        // And end to end through the real walk: subscribe to
-        // ButtonPress on the ROOT window only, so the walk has to climb
-        // both levels, and check the coordinate it reports.
-        const BUTTON_PRESS: u32 = 0x0000_0004;
-        state.clients.insert(
-            7,
-            ClientState {
-                writer: make_test_writer(),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0x0010_0000,
-                resource_id_mask: 0x000F_FFFF,
-                event_masks: HashMap::from([(ROOT_WINDOW, BUTTON_PRESS)]),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: std::collections::VecDeque::new(),
-                watching_writable: false,
-                focused_window: ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-        let (win, px, py, _subs) = state
-            .pointer_propagation_target(hit, hx, hy, BUTTON_PRESS)
-            .expect("propagates to root");
-        assert_eq!(win, ROOT_WINDOW);
-        assert_eq!(
-            (px, py),
-            (130, 240),
-            "the coordinate reported on root must be the original root point"
-        );
-    }
-
-    #[test]
-    fn cow_with_non_empty_input_shape_descends_into_stage() {
-        use crate::resources::{COMPOSITE_OVERLAY_WINDOW, ROOT_VISUAL};
-        use yserver_protocol::x11::{CreateWindowRequest, xfixes};
-
-        let mut state = ServerState::new();
-
-        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
-        state.resources.materialize_cow_resource(host_xid);
-        // Compositor populates COW input shape covering the stage region.
-        state
-            .shape_windows
-            .entry(COMPOSITE_OVERLAY_WINDOW)
-            .or_default()
-            .input = Some(vec![xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-        }]);
-
-        let stage = ResourceId(0x0010_0050);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: stage,
-                parent: COMPOSITE_OVERLAY_WINDOW,
-                x: 10,
-                y: 10,
-                width: 100,
-                height: 100,
-                border_width: 0,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(stage);
-
-        let (target, _, _) = state.root_pointer_target_at(50, 50).expect("hit");
-        assert_eq!(
-            target, stage,
-            "non-empty COW input shape lets the trace descend to stage"
-        );
-    }
-
-    #[test]
-    fn cow_default_input_shape_is_empty() {
-        use crate::resources::COMPOSITE_OVERLAY_WINDOW;
-
-        let mut state = ServerState::new();
-        let host_xid = crate::backend::WindowHandle::from_raw_panicking(0x4000_0103);
-        state.resources.materialize_cow_resource(host_xid);
-        state.materialize_cow_input_shape();
-
-        let shape = state
-            .shape_windows
-            .get(&COMPOSITE_OVERLAY_WINDOW)
-            .expect("COW must have a shape_windows entry after materialization");
-        assert!(
-            shape.input.is_some(),
-            "COW must have a non-default input shape (set, but empty)"
-        );
-        assert_eq!(
-            shape.input.as_ref().unwrap().len(),
-            0,
-            "COW's default input shape rects are empty (click-through)"
-        );
-    }
-
-    // ── DRIFT 1 characterization net: input-shape empty-vs-absent ──
-    //
-    // These pin the CORE resource tree's empty-vs-absent input-shape
-    // semantics, which are the source of truth the KMS v2 backend must
-    // converge onto (see
-    // docs/superpowers/findings/2026-06-18-pointer-stacking-dual-authority-diagnosis.md,
-    // DRIFT 1). They must stay green through the backend-demotion work;
-    // a change here is a real regression of the truth source, not an
-    // intended effect of the refactor.
-
-    /// Helper: a full-screen mapped top-level child of root.
-    #[cfg(test)]
-    fn fullscreen_child(state: &mut ServerState, id: u32) -> ResourceId {
-        use crate::resources::{ROOT_VISUAL, ROOT_WINDOW};
-        use yserver_protocol::x11::CreateWindowRequest;
-        let win = ResourceId(id);
-        state.resources.create_window(
-            ClientId(1),
-            CreateWindowRequest {
-                depth: 24,
-                window: win,
-                parent: ROOT_WINDOW,
-                x: 0,
-                y: 0,
-                width: 800,
-                height: 600,
-                border_width: 0,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        let _ = state.resources.map_window(win);
-        win
-    }
-
-    #[test]
-    fn core_empty_input_shape_makes_window_click_through() {
-        let mut state = ServerState::new();
-        // `below` created first → lower in the stack; `above` created
-        // second → topmost. Both cover (50,50).
-        let below = fullscreen_child(&mut state, 0x0010_0080);
-        let above = fullscreen_child(&mut state, 0x0010_0090);
-
-        // `above` gets an EMPTY (but present) input shape → click-through.
-        state.shape_windows.entry(above).or_default().input = Some(vec![]);
-
-        let (target, _, _) = state
-            .root_pointer_target_at(50, 50)
-            .expect("trace resolves a window");
-        assert_eq!(
-            target, below,
-            "empty (Some([])) input shape must be click-through, so the \
-             topmost window is skipped and the click lands on the window below"
-        );
-    }
-
-    #[test]
-    fn core_full_input_shape_makes_window_opaque() {
-        use yserver_protocol::x11::xfixes;
-
-        let mut state = ServerState::new();
-        let below = fullscreen_child(&mut state, 0x0010_0080);
-        let above = fullscreen_child(&mut state, 0x0010_0090);
-
-        // Contrast with the empty case: a full-coverage input shape is
-        // opaque, so the topmost window swallows the click. This also
-        // proves the empty-case test above is not vacuous.
-        state.shape_windows.entry(above).or_default().input = Some(vec![xfixes::RegionRect {
-            x: 0,
-            y: 0,
-            width: 800,
-            height: 600,
-        }]);
-
-        let (target, _, _) = state
-            .root_pointer_target_at(50, 50)
-            .expect("trace resolves a window");
-        let _ = below;
-        assert_eq!(
-            target, above,
-            "a full input shape is opaque: the topmost window receives the click"
-        );
-    }
-
-    #[test]
-    fn core_absent_input_shape_is_opaque() {
-        let mut state = ServerState::new();
-        let below = fullscreen_child(&mut state, 0x0010_0080);
-        let above = fullscreen_child(&mut state, 0x0010_0090);
-
-        // No shape_windows entry at all (absent / None) → opaque, same
-        // as a full shape. This is the case that DIFFERS from `Some([])`
-        // and that the backend currently cannot distinguish (DRIFT 1).
-        let (target, _, _) = state
-            .root_pointer_target_at(50, 50)
-            .expect("trace resolves a window");
-        let _ = below;
-        assert_eq!(
-            target, above,
-            "absent input shape (None) is opaque, NOT click-through"
-        );
-    }
-
-    #[test]
-    fn dpms_transition_deadline_picks_smallest_non_zero_above_current() {
-        use std::time::{Duration, Instant};
-        let mut state = ServerState::new();
-        state.dpms.kms_capable = true;
-        state.dpms.enabled = true;
-        let baseline = Instant::now();
-        state.dpms.last_activity = baseline;
-        state.dpms.standby_ms = 300_000;
-        state.dpms.suspend_ms = 600_000;
-        state.dpms.off_ms = 900_000;
-
-        state.dpms.power_level = 0; // On
-        assert_eq!(
-            state.dpms_transition_deadline(),
-            Some(baseline + Duration::from_millis(300_000))
-        );
-
-        state.dpms.power_level = 1; // Standby
-        assert_eq!(
-            state.dpms_transition_deadline(),
-            Some(baseline + Duration::from_millis(600_000))
-        );
-
-        state.dpms.power_level = 2; // Suspend
-        assert_eq!(
-            state.dpms_transition_deadline(),
-            Some(baseline + Duration::from_millis(900_000))
-        );
-
-        state.dpms.power_level = 3; // Off — nothing above
-        assert_eq!(state.dpms_transition_deadline(), None);
-    }
-
-    #[test]
-    fn dpms_transition_deadline_returns_none_when_disabled() {
-        let mut state = ServerState::new();
-        state.dpms.kms_capable = true;
-        state.dpms.enabled = false; // disabled
-        state.dpms.standby_ms = 300_000;
-        assert!(state.dpms_transition_deadline().is_none());
-    }
-
-    #[test]
-    fn dpms_transition_deadline_returns_none_when_not_kms_capable() {
-        let mut state = ServerState::new();
-        state.dpms.kms_capable = false;
-        state.dpms.enabled = true; // a ynest client called DPMSEnable
-        state.dpms.standby_ms = 300_000;
-        // No backend to drive — no deadline.
-        assert!(state.dpms_transition_deadline().is_none());
-    }
-
-    #[test]
-    fn dpms_transition_deadline_zero_skips_not_halts() {
-        use std::time::{Duration, Instant};
-        let mut state = ServerState::new();
-        state.dpms.kms_capable = true;
-        state.dpms.enabled = true;
-        let baseline = Instant::now();
-        state.dpms.last_activity = baseline;
-        // Standby + Off disabled, Suspend at 900s.
-        state.dpms.standby_ms = 0;
-        state.dpms.suspend_ms = 900_000;
-        state.dpms.off_ms = 0;
-
-        state.dpms.power_level = 0; // On
-        assert_eq!(
-            state.dpms_transition_deadline(),
-            Some(baseline + Duration::from_millis(900_000))
-        );
-
-        state.dpms.power_level = 2; // Suspend — nothing above non-zero
-        assert!(state.dpms_transition_deadline().is_none());
-    }
-
-    #[test]
-    fn next_dpms_level_leapfrogs_on_equal_timeouts() {
-        let mut state = ServerState::new();
-        state.dpms.standby_ms = 600_000;
-        state.dpms.suspend_ms = 600_000;
-        state.dpms.off_ms = 600_000;
-        // From On, with idle = exactly 600_000ms, highest expired wins → Off.
-        assert_eq!(next_dpms_level(0, 600_000, &state.dpms), 3);
-    }
-
-    #[test]
-    fn next_dpms_level_skips_zero_levels() {
-        let mut state = ServerState::new();
-        state.dpms.standby_ms = 0;
-        state.dpms.suspend_ms = 900_000;
-        state.dpms.off_ms = 0;
-        // From On, idle = 900s → Suspend (Standby and Off skipped).
-        assert_eq!(next_dpms_level(0, 900_000, &state.dpms), 2);
-    }
-
-    #[test]
-    fn next_dpms_level_stable_when_under_threshold() {
-        let mut state = ServerState::new();
-        state.dpms.standby_ms = 300_000;
-        state.dpms.suspend_ms = 600_000;
-        state.dpms.off_ms = 900_000;
-        assert_eq!(next_dpms_level(0, 0, &state.dpms), 0);
-        assert_eq!(next_dpms_level(1, 100_000, &state.dpms), 1);
-        // Already at Off (max level): cascade has nowhere to go.
-        assert_eq!(next_dpms_level(3, 999_999_999, &state.dpms), 3);
-    }
-
-    #[test]
-    fn screensaver_idle_deadline_none_when_timeout_zero() {
-        let mut state = ServerState::new();
-        state.screensaver.timeout_ms = 0;
-        assert!(state.screensaver_idle_deadline().is_none());
-    }
-
-    #[test]
-    fn screensaver_idle_deadline_none_when_suspended() {
-        let mut state = ServerState::new();
-        state.screensaver.timeout_ms = 60_000;
-        state.screensaver.suspend_counts.insert(ClientId(7), 1);
-        assert!(state.screensaver_idle_deadline().is_none());
-    }
-
-    #[test]
-    fn dpms_transition_deadline_none_when_screensaver_suspended() {
-        // Xorg WaitFor.c:519 — one timer drives BOTH SS and DPMS, and
-        // it isn't armed when screenSaverSuspended. XScreenSaverSuspend
-        // therefore inhibits DPMS firing, which mpv/Firefox rely on.
-        let mut state = ServerState::new();
-        state.dpms.kms_capable = true;
-        state.dpms.enabled = true;
-        state.dpms.standby_ms = 300_000;
-        state.screensaver.suspend_counts.insert(ClientId(99), 1);
-        assert!(state.dpms_transition_deadline().is_none());
-    }
-
-    #[test]
-    fn screensaver_idle_deadline_none_when_active() {
-        let mut state = ServerState::new();
-        state.screensaver.timeout_ms = 60_000;
-        state.screensaver.active = ScreenSaverActive::On;
-        assert!(state.screensaver_idle_deadline().is_none());
-    }
-
-    #[test]
-    fn screensaver_idle_deadline_none_when_dpms_blanked() {
-        // Xorg WaitFor.c:457 — when DPMS already blanked the panel
-        // the SS idle timer is suppressed (DPMS→SS coupling will
-        // have already activated SS on the DPMS transition).
-        let mut state = ServerState::new();
-        state.screensaver.timeout_ms = 60_000;
-        state.dpms.power_level = 1;
-        assert!(state.screensaver_idle_deadline().is_none());
-    }
-
-    #[test]
-    fn screensaver_idle_deadline_returns_last_activity_plus_timeout() {
-        use std::time::{Duration, Instant};
-        let mut state = ServerState::new();
-        let baseline = Instant::now();
-        state.dpms.last_activity = baseline;
-        state.screensaver.timeout_ms = 60_000;
-        assert_eq!(
-            state.screensaver_idle_deadline(),
-            Some(baseline + Duration::from_millis(60_000))
-        );
-    }
-
-    #[test]
-    fn screensaver_cycle_deadline_none_when_off() {
-        let state = ServerState::new();
-        assert!(state.screensaver_cycle_deadline().is_none());
-    }
-
-    #[test]
-    fn screensaver_cycle_deadline_some_when_on() {
-        use std::time::{Duration, Instant};
-        let mut state = ServerState::new();
-        state.screensaver.active = ScreenSaverActive::On;
-        state.screensaver.interval_ms = 600_000;
-        let fire_at = Instant::now() + Duration::from_millis(600_000);
-        state.screensaver.next_cycle = Some(fire_at);
-        assert_eq!(state.screensaver_cycle_deadline(), Some(fire_at));
-    }
-
-    #[test]
-    fn screensaver_cycle_deadline_propagates_next_cycle_none() {
-        // The invariant "interval_ms == 0 ⇒ next_cycle is None" lives
-        // in the activation transition (Task 3); here we only verify
-        // the deadline helper propagates a None `next_cycle` through.
-        let mut state = ServerState::new();
-        state.screensaver.active = ScreenSaverActive::On;
-        state.screensaver.interval_ms = 0;
-        state.screensaver.next_cycle = None;
-        assert!(state.screensaver_cycle_deadline().is_none());
-    }
-
-    #[test]
-    fn idletime_baseline_global_returns_dpms_last_activity() {
-        use std::time::Instant;
-        let mut state = ServerState::new();
-        let baseline = Instant::now();
-        state.dpms.last_activity = baseline;
-        assert_eq!(
-            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_COUNTER),
-            baseline
-        );
-    }
-
-    #[test]
-    fn idletime_baseline_per_device_uses_per_device_entry() {
-        use std::time::{Duration, Instant};
-        let mut state = ServerState::new();
-        let global = Instant::now() - Duration::from_secs(60);
-        let pointer = Instant::now() - Duration::from_secs(5);
-        state.dpms.last_activity = global;
-        state.per_device_last_activity.insert(2, pointer);
-        assert_eq!(
-            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_DEVICE_VCP),
-            pointer
-        );
-        // VCK has no per-device entry; falls back to global.
-        assert_eq!(
-            state.idletime_baseline(yserver_protocol::x11::sync::IDLETIME_DEVICE_VCK),
-            global
-        );
-    }
-
-    #[test]
-    fn idletime_baseline_unknown_counter_falls_back_to_global() {
-        let state = ServerState::new();
-        let baseline = state.dpms.last_activity;
-        assert_eq!(state.idletime_baseline(0xdead_beef), baseline);
-    }
-
-    #[test]
-    fn idletime_alarm_deadline_none_when_no_alarms() {
-        let state = ServerState::new();
-        assert!(state.idletime_alarm_deadline().is_none());
-    }
-
-    #[test]
-    fn idletime_alarm_deadline_picks_smallest_active_pos_alarm() {
-        use std::time::Duration;
-        use yserver_protocol::x11::sync as x11sync;
-        let mut state = ServerState::new();
-        let baseline = std::time::Instant::now();
-        state.dpms.last_activity = baseline;
-
-        for (id, wait) in &[(1u32, 60_000i64), (2, 30_000), (3, 90_000)] {
-            state.sync_alarms.insert(
-                *id,
-                crate::server::SyncAlarm {
-                    owner: ClientId(1),
-                    counter: x11sync::IDLETIME_COUNTER,
-                    wait_value: *wait,
-                    delta: 0,
-                    test_type: x11sync::TEST_POSITIVE_TRANSITION,
-                    events: true,
-                    state: x11sync::ALARM_STATE_ACTIVE,
-                    event_clients: Vec::new(),
-                    value_type: 0,
-                    raw_wait: *wait,
-                    check_type: x11sync::TEST_POSITIVE_TRANSITION,
-                },
-            );
-        }
-
-        let deadline = state.idletime_alarm_deadline().expect("Some");
-        let expected = baseline + Duration::from_millis(30_000);
-        // Allow ±1ms for monotonic-clock resolution.
-        let diff = if deadline > expected {
-            deadline - expected
-        } else {
-            expected - deadline
-        };
-        assert!(
-            diff < Duration::from_millis(2),
-            "deadline ~ baseline + 30_000ms; got diff {diff:?}"
-        );
-    }
-
-    #[test]
-    fn idletime_alarm_deadline_ignores_negative_alarms() {
-        // Negative-* alarms only fire on input wake, not on a positive
-        // deadline. They must not be considered when computing the
-        // poll-deadline `.min()`.
-        use yserver_protocol::x11::sync as x11sync;
-        let mut state = ServerState::new();
-        state.sync_alarms.insert(
-            1,
-            crate::server::SyncAlarm {
-                owner: ClientId(1),
-                counter: x11sync::IDLETIME_COUNTER,
-                wait_value: 60_000,
-                delta: 0,
-                test_type: x11sync::TEST_NEGATIVE_TRANSITION,
-                events: true,
-                state: x11sync::ALARM_STATE_ACTIVE,
-                event_clients: Vec::new(),
-                value_type: 0,
-                raw_wait: 60_000,
-                check_type: x11sync::TEST_NEGATIVE_TRANSITION,
-            },
-        );
-        assert!(state.idletime_alarm_deadline().is_none());
-    }
-
-    #[test]
-    fn idletime_alarm_deadline_ignores_inactive_alarms() {
-        use yserver_protocol::x11::sync as x11sync;
-        let mut state = ServerState::new();
-        state.sync_alarms.insert(
-            1,
-            crate::server::SyncAlarm {
-                owner: ClientId(1),
-                counter: x11sync::IDLETIME_COUNTER,
-                wait_value: 60_000,
-                delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION,
-                events: true,
-                state: x11sync::ALARM_STATE_INACTIVE,
-                event_clients: Vec::new(),
-                value_type: 0,
-                raw_wait: 60_000,
-                check_type: x11sync::TEST_POSITIVE_TRANSITION,
-            },
-        );
-        assert!(state.idletime_alarm_deadline().is_none());
-    }
-
-    #[test]
-    fn idletime_alarm_deadline_ignores_quiescent_alarm_whose_threshold_already_passed() {
-        // Regression for the quiescent-state skip: a PositiveTransition +
-        // delta=0 alarm that has already fired stays Active but is
-        // quiescent — it doesn't re-fire until the counter drops below
-        // wait_value and crosses back up (which requires input). Such an
-        // alarm must NOT contribute a past-instant to the poll-deadline
-        // (which would spin the poll loop with Duration::ZERO).
-        use std::time::Duration;
-        use yserver_protocol::x11::sync as x11sync;
-        let mut state = ServerState::new();
-        // Already idle for 90s; alarm threshold is 60s — quiescent.
-        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(90);
-        state.sync_alarms.insert(
-            1,
-            crate::server::SyncAlarm {
-                owner: ClientId(1),
-                counter: x11sync::IDLETIME_COUNTER,
-                wait_value: 60_000,
-                delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION,
-                events: true,
-                state: x11sync::ALARM_STATE_ACTIVE,
-                event_clients: Vec::new(),
-                value_type: 0,
-                raw_wait: 60_000,
-                check_type: x11sync::TEST_POSITIVE_TRANSITION,
-            },
-        );
-        assert!(
-            state.idletime_alarm_deadline().is_none(),
-            "quiescent alarm (current_idle >= wait_value) must not contribute a deadline"
-        );
-    }
-
-    #[test]
-    fn idletime_alarm_deadline_none_when_screensaver_suspended() {
-        // Mirrors the dpms_transition_deadline suspend gate. XScreen-
-        // SaverSuspend inhibits both the DPMS cascade AND IDLETIME
-        // alarms so fullscreen video (Firefox / mpv / vlc) doesn't
-        // blank the screen.
-        use yserver_protocol::x11::sync as x11sync;
-        let mut state = ServerState::new();
-        state.screensaver.suspend_counts.insert(ClientId(99), 1);
-        state.sync_alarms.insert(
-            1,
-            crate::server::SyncAlarm {
-                owner: ClientId(1),
-                counter: x11sync::IDLETIME_COUNTER,
-                wait_value: 60_000,
-                delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION,
-                events: true,
-                state: x11sync::ALARM_STATE_ACTIVE,
-                event_clients: Vec::new(),
-                value_type: 0,
-                raw_wait: 60_000,
-                check_type: x11sync::TEST_POSITIVE_TRANSITION,
-            },
-        );
-        assert!(state.idletime_alarm_deadline().is_none());
-    }
-
-    /// XC-MISC guard test: every client-XID namespace must register in
-    /// xid_occupied. Seeds ONE resource per namespace at a distinct id.
-    /// A future XID-keyed map added without xid_occupied coverage should
-    /// be caught by review against this pattern (spec
-    /// 2026-06-12-xcmisc-design.md "maintenance hazard").
-    #[test]
-    fn xid_occupied_covers_every_namespace() {
-        use crate::{
-            backend::{GlyphSetHandle, PictureHandle},
-            resources::{GlyphSetState, PictureKind, PictureState, ROOT_VISUAL},
-        };
-        use yserver_protocol::x11::{CreatePixmapRequest, CreateWindowRequest};
-
-        let mut state = ServerState::new();
-        let owner = ClientId(1);
-        let base = 0x0010_0000u32;
-        let mut expect = Vec::new();
-
-        // ── 9 ResourceTable namespaces ──
-
-        // 1. window
-        let id_window = base + 1;
-        state.resources.create_window(
-            owner,
-            CreateWindowRequest {
-                depth: 24,
-                window: ResourceId(id_window),
-                parent: ROOT_WINDOW,
-                x: 0,
-                y: 0,
-                width: 10,
-                height: 10,
-                border_width: 0,
-                class: 1,
-                visual: ROOT_VISUAL,
-                ..Default::default()
-            },
-        );
-        expect.push(id_window);
-
-        // 2. pixmap
-        let id_pixmap = base + 2;
-        state.resources.create_pixmap(
-            owner,
-            CreatePixmapRequest {
-                depth: 24,
-                pixmap: ResourceId(id_pixmap),
-                drawable: ROOT_WINDOW,
-                width: 1,
-                height: 1,
-            },
-        );
-        expect.push(id_pixmap);
-
-        // 3. gc
-        let id_gc = base + 3;
-        state.resources.seed_gc_for_test(owner, ResourceId(id_gc));
-        expect.push(id_gc);
-
-        // 4. font
-        let id_font = base + 4;
-        state
-            .resources
-            .seed_font_for_test(owner, ResourceId(id_font));
-        expect.push(id_font);
-
-        // 5. cursor
-        let id_cursor = base + 5;
-        state.resources.create_cursor(owner, ResourceId(id_cursor));
-        expect.push(id_cursor);
-
-        // 6. colormap
-        let id_colormap = base + 6;
-        state
-            .resources
-            .create_colormap(owner, ResourceId(id_colormap), ROOT_VISUAL);
-        expect.push(id_colormap);
-
-        // 7. picture (pub map — insert literal directly)
-        let id_picture = base + 7;
-        state.resources.pictures.insert(
-            id_picture,
-            PictureState {
-                client: owner,
-                host_picture_xid: Some(PictureHandle::from_raw_for_test(1)),
-                host_owned_pixmap: None,
-                kind: PictureKind::Sourceless,
-                drawable: None,
-                window: None,
-            },
-        );
-        expect.push(id_picture);
-
-        // 8. glyphset (pub map — insert literal directly)
-        let id_glyphset = base + 8;
-        state.resources.glyphsets.insert(
-            id_glyphset,
-            GlyphSetState {
-                client: owner,
-                host_glyphset_xid: GlyphSetHandle::from_raw_for_test(1),
-            },
-        );
-        expect.push(id_glyphset);
-
-        // 9. DRI3 syncobj (the kernel object itself is backend-owned; this
-        // is the ordinary X resource record).
-        let id_dri3_syncobj = base + 9;
-        assert!(
-            state
-                .resources
-                .register_dri3_syncobj(ResourceId(id_dri3_syncobj), owner)
-        );
-        expect.push(id_dri3_syncobj);
-
-        // ── 10 ServerState extension namespaces ──
-
-        // 9. xfixes_regions
-        let id_xfixes = base + 10;
-        state.xfixes_regions.insert(
-            id_xfixes,
-            XFixesRegion {
-                owner,
-                rects: vec![],
-            },
-        );
-        expect.push(id_xfixes);
-
-        // 10. pointer_barriers
-        let id_barrier = base + 11;
-        state.pointer_barriers.insert(
-            id_barrier,
-            PointerBarrier {
-                owner,
-                window: ROOT_WINDOW,
-                x1: 0,
-                y1: 0,
-                x2: 0,
-                y2: 10,
-                directions: 0,
-                devices: Vec::new(),
-                hit: false,
-                seen: false,
-                event_id: 1,
-                release_event_id: 0,
-                last_timestamp: 0,
-            },
-        );
-        expect.push(id_barrier);
-
-        // 11. sync_counters
-        let id_sync_counter = base + 12;
-        state
-            .sync_counters
-            .insert(id_sync_counter, SyncCounter { owner, value: 0 });
-        expect.push(id_sync_counter);
-
-        // 12. sync_alarms
-        let id_sync_alarm = base + 13;
-        state.sync_alarms.insert(
-            id_sync_alarm,
-            SyncAlarm {
-                owner,
-                ..SyncAlarm::default()
-            },
-        );
-        expect.push(id_sync_alarm);
-
-        // 13. sync_fences
-        let id_sync_fence = base + 14;
-        state.sync_fences.insert(
-            id_sync_fence,
-            SyncFence {
-                owner,
-                triggered: false,
-            },
-        );
-        expect.push(id_sync_fence);
-
-        // 14. damage_objects
-        let id_damage = base + 15;
-        state.damage_objects.insert(
-            id_damage,
-            DamageObject {
-                owner,
-                drawable: ROOT_WINDOW,
-                level: 0,
-                rects: vec![],
-                pending_notify_fired: false,
-                last_reported_geometry: None,
-            },
-        );
-        expect.push(id_damage);
-
-        // 15. mit_shm_segments — requires a real fd; use memfd_create
-        let id_shm = base + 16;
-        let fd = unsafe { libc::memfd_create(c"xcmisc-test-shm".as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(fd >= 0, "memfd_create failed");
-        let rc = unsafe { libc::ftruncate(fd, 4096) };
-        assert_eq!(rc, 0, "ftruncate failed");
-        let shm_seg = MitShmSegment::from_fd(owner, fd, false).expect("MitShmSegment::from_fd");
-        state.mit_shm_segments.insert(id_shm, shm_seg);
-        expect.push(id_shm);
-
-        // 16. glx_contexts
-        let id_glx_ctx = base + 17;
-        state.glx_contexts.insert(
-            id_glx_ctx,
-            GlxContext {
-                owner,
-                screen: 0,
-                visual_id: 0,
-                fbconfig: 0,
-                render_type: 0,
-                share_list: 0,
-                is_direct: true,
-            },
-        );
-        expect.push(id_glx_ctx);
-
-        // 17. glx_drawables
-        let id_glx_draw = base + 18;
-        state.glx_drawables.insert(
-            id_glx_draw,
-            GlxDrawable {
-                owner,
-                kind: GlxDrawableKind::Window,
-                x_drawable: 0,
-                fbconfig: 0,
-                width: 0,
-                height: 0,
-                event_mask: 0,
-                glx_export_host_xid: None,
-                texture_target: yserver_protocol::x11::glx::GLX_TEXTURE_2D_EXT,
-            },
-        );
-        expect.push(id_glx_draw);
-
-        // 18. present_event_selections
-        let id_present = base + 19;
-        state.present_event_selections.insert(
-            id_present,
-            PresentEventSelection {
-                owner,
-                window: ROOT_WINDOW,
-                event_mask: 0,
-            },
-        );
-        expect.push(id_present);
-
-        // ── assertions ──
-
-        for id in &expect {
-            assert!(state.xid_occupied(*id), "id 0x{id:x} must be occupied");
-        }
-        assert_eq!(
-            expect.len(),
-            19,
-            "one seed per namespace — update when adding namespaces"
-        );
-        assert!(!state.xid_occupied(base + 100), "unseeded id must be free");
-
-        // used_xids_in returns exactly the seeded set, sorted
-        let used = state.used_xids_in(base, 0x000F_FFFF);
-        let mut sorted = expect.clone();
-        sorted.sort_unstable();
-        assert_eq!(used, sorted);
-        // out-of-range base sees none of them
-        assert!(state.used_xids_in(0x0020_0000, 0x000F_FFFF).is_empty());
-    }
 }

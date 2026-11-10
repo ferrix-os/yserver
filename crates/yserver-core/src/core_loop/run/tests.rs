@@ -1,0 +1,5671 @@
+use super::*;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleEvent {
+    Connected(
+        yserver_protocol::x11::ClientId,
+        crate::peer::PeerIdentity,
+        crate::access::Admission,
+    ),
+    ConnectionGone(yserver_protocol::x11::ClientId),
+    OwnerGone(yserver_protocol::x11::ClientId),
+    GenerationEnded,
+}
+
+struct LifecycleRecordingPolicy {
+    events: std::sync::Arc<std::sync::Mutex<Vec<LifecycleEvent>>>,
+    deny_server_checks: bool,
+}
+
+impl crate::access::AccessPolicy for LifecycleRecordingPolicy {
+    fn server(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        _client: yserver_protocol::x11::ClientId,
+        _mode: crate::access::AccessMode,
+    ) -> crate::access::Decision {
+        if self.deny_server_checks {
+            crate::access::Decision::Deny(crate::access::ACCESS)
+        } else {
+            crate::access::Decision::Allow
+        }
+    }
+
+    fn client_connected(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        client: yserver_protocol::x11::ClientId,
+        peer: &crate::peer::PeerIdentity,
+        admission: &crate::access::Admission,
+    ) {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(LifecycleEvent::Connected(client, *peer, *admission));
+    }
+
+    fn connection_gone(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        client: yserver_protocol::x11::ClientId,
+    ) {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(LifecycleEvent::ConnectionGone(client));
+    }
+
+    fn owner_gone(&self, client: yserver_protocol::x11::ClientId) {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(LifecycleEvent::OwnerGone(client));
+    }
+
+    fn generation_ended(&self) {
+        self.events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push(LifecycleEvent::GenerationEnded);
+    }
+}
+
+fn install_lifecycle_recording_policy(
+    state: &mut ServerState,
+    events: std::sync::Arc<std::sync::Mutex<Vec<LifecycleEvent>>>,
+    deny_server_checks: bool,
+) -> std::sync::Arc<LifecycleRecordingPolicy> {
+    let policy = std::sync::Arc::new(LifecycleRecordingPolicy {
+        events,
+        deny_server_checks,
+    });
+    state.install_access_policy(policy.clone());
+    policy
+}
+
+fn lifecycle_setup_client(
+    state: &mut ServerState,
+    sender: &CoreSender,
+    setup_registry: &crate::core_loop::setup_thread::SetupRegistry,
+    id: u32,
+) -> std::os::unix::net::UnixStream {
+    let (server_stream, peer_stream) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    super::handle_client_setup_complete(
+        sender,
+        setup_registry,
+        state,
+        yserver_protocol::x11::ClientId(id),
+        crate::core_loop::generation::Generation::default(),
+        crate::transport::Transport::Unix(server_stream),
+        id << 20,
+        0x000F_FFFF,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        (true, true, false),
+        crate::peer::PeerIdentity::unknown_unix(),
+        crate::access::Admission::Internal,
+        &[],
+    )
+    .expect("client setup completes");
+    peer_stream
+}
+
+fn lifecycle_request(
+    state: &mut ServerState,
+    backend: &mut crate::backend::recording::RecordingBackend,
+    client: u32,
+    opcode: u8,
+    data: u8,
+    length_units: u32,
+    body: &[u8],
+) {
+    let _outcome = crate::core_loop::process_request::process_request(
+        state,
+        backend,
+        yserver_protocol::x11::ClientId(client),
+        yserver_protocol::x11::SequenceNumber(1),
+        yserver_protocol::x11::RequestHeader {
+            opcode,
+            data,
+            length_units,
+        },
+        body,
+        None,
+    )
+    .expect("request processes");
+}
+
+fn create_lifecycle_pixmap(
+    state: &mut ServerState,
+    backend: &mut crate::backend::recording::RecordingBackend,
+    client: u32,
+    pixmap: u32,
+) {
+    let mut body = Vec::with_capacity(12);
+    body.extend_from_slice(&pixmap.to_le_bytes());
+    body.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    body.extend_from_slice(&16_u16.to_le_bytes());
+    body.extend_from_slice(&16_u16.to_le_bytes());
+    lifecycle_request(state, backend, client, 53, 24, 4, &body);
+}
+
+fn lifecycle_events_for(
+    events: &[LifecycleEvent],
+    id: yserver_protocol::x11::ClientId,
+) -> Vec<LifecycleEvent> {
+    events
+        .iter()
+        .copied()
+        .filter(|event| match event {
+            LifecycleEvent::Connected(client, _, _)
+            | LifecycleEvent::ConnectionGone(client)
+            | LifecycleEvent::OwnerGone(client) => *client == id,
+            LifecycleEvent::GenerationEnded => false,
+        })
+        .collect()
+}
+
+// Mutation: drop the client_connected call after ClientState insertion; this sequence assertion fails.
+#[test]
+fn lifecycle_of_a_destroying_client() {
+    use crate::backend::recording::RecordingBackend;
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let id = yserver_protocol::x11::ClientId(7);
+    let peer_identity = crate::peer::PeerIdentity::unknown_unix();
+    let _peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, id.0);
+
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut RecordingBackend::new(),
+        id,
+    );
+
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), id),
+        vec![
+            LifecycleEvent::Connected(id, peer_identity, crate::access::Admission::Internal),
+            LifecycleEvent::ConnectionGone(id),
+            LifecycleEvent::OwnerGone(id),
+        ],
+    );
+    assert!(!state.clients.contains_key(&id.0));
+    assert!(!state.zombie_clients.contains_key(&id.0));
+}
+
+// Mutation: emit owner_gone at disconnect even when the client is retained; the post-disconnect assertion fails.
+#[test]
+fn lifecycle_of_a_retained_owner() {
+    use crate::backend::recording::RecordingBackend;
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let _owner_peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, 7);
+    let _killer_peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, 8);
+    let mut backend = RecordingBackend::new();
+    let owner = yserver_protocol::x11::ClientId(7);
+    let pixmap = 0x0070_0100;
+
+    lifecycle_request(&mut state, &mut backend, owner.0, 112, 1, 1, &[]);
+    create_lifecycle_pixmap(&mut state, &mut backend, owner.0, pixmap);
+    crate::core_loop::process_disconnect::process_disconnect(&mut state, &mut backend, owner);
+
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), owner),
+        vec![
+            LifecycleEvent::Connected(
+                owner,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(owner),
+        ],
+    );
+    assert_eq!(state.zombie_clients.get(&owner.0), Some(&1));
+    assert_eq!(
+        state
+            .resources
+            .resource_owner(yserver_protocol::x11::ResourceId(pixmap)),
+        Some(owner),
+    );
+
+    lifecycle_request(
+        &mut state,
+        &mut backend,
+        8,
+        113,
+        0,
+        2,
+        &pixmap.to_le_bytes(),
+    );
+
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), owner),
+        vec![
+            LifecycleEvent::Connected(
+                owner,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(owner),
+            LifecycleEvent::OwnerGone(owner),
+        ],
+    );
+    assert!(!state.clients.contains_key(&owner.0));
+    assert!(!state.zombie_clients.contains_key(&owner.0));
+    assert!(
+        !state
+            .resources
+            .xid_in_use(yserver_protocol::x11::ResourceId(pixmap))
+    );
+}
+
+// Mutation: omit owner_gone for RetainTemporary zombies; AllTemporary must still notify their teardown.
+#[test]
+fn retain_temporary_owner_gone_through_all_temporary() {
+    use crate::backend::recording::RecordingBackend;
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let _owner_peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, 7);
+    let _killer_peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, 8);
+    let mut backend = RecordingBackend::new();
+    let owner = yserver_protocol::x11::ClientId(7);
+    let pixmap = 0x0070_0101;
+
+    lifecycle_request(&mut state, &mut backend, owner.0, 112, 2, 1, &[]);
+    create_lifecycle_pixmap(&mut state, &mut backend, owner.0, pixmap);
+    crate::core_loop::process_disconnect::process_disconnect(&mut state, &mut backend, owner);
+    assert_eq!(state.zombie_clients.get(&owner.0), Some(&2));
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), owner),
+        vec![
+            LifecycleEvent::Connected(
+                owner,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(owner),
+        ],
+    );
+
+    lifecycle_request(&mut state, &mut backend, 8, 113, 0, 2, &0_u32.to_le_bytes());
+
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), owner),
+        vec![
+            LifecycleEvent::Connected(
+                owner,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(owner),
+            LifecycleEvent::OwnerGone(owner),
+        ],
+    );
+    assert!(!state.clients.contains_key(&owner.0));
+    assert!(!state.zombie_clients.contains_key(&owner.0));
+    assert!(
+        !state
+            .resources
+            .xid_in_use(yserver_protocol::x11::ResourceId(pixmap))
+    );
+}
+
+// Mutation: have notify_policies stop after the first installed policy; the second recorder misses this sequence.
+#[test]
+fn every_policy_hears_lifecycle() {
+    use crate::backend::recording::RecordingBackend;
+
+    let first_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let second_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, first_events.clone(), true);
+    install_lifecycle_recording_policy(&mut state, second_events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let id = yserver_protocol::x11::ClientId(7);
+    let _peer = lifecycle_setup_client(&mut state, &sender, &setup_registry, id.0);
+
+    assert_eq!(
+        state.check_server(id, crate::access::AccessMode::MANAGE, None),
+        crate::access::Decision::Deny(crate::access::ACCESS),
+    );
+    crate::core_loop::process_disconnect::process_disconnect(
+        &mut state,
+        &mut RecordingBackend::new(),
+        id,
+    );
+
+    let expected = vec![
+        LifecycleEvent::Connected(
+            id,
+            crate::peer::PeerIdentity::unknown_unix(),
+            crate::access::Admission::Internal,
+        ),
+        LifecycleEvent::ConnectionGone(id),
+        LifecycleEvent::OwnerGone(id),
+    ];
+    assert_eq!(*first_events.lock().unwrap(), expected);
+    assert_eq!(*second_events.lock().unwrap(), expected);
+    assert!(!state.clients.contains_key(&id.0));
+    assert!(!state.zombie_clients.contains_key(&id.0));
+}
+
+#[cfg(target_os = "linux")]
+fn reader_spawn_skip_reason(
+    euid: libc::uid_t,
+    effective_capabilities: u64,
+) -> Option<&'static str> {
+    const CAP_SYS_ADMIN: u64 = 1 << 21;
+    const CAP_SYS_RESOURCE: u64 = 1 << 24;
+
+    if euid == 0 {
+        Some("euid 0 is exempt from RLIMIT_NPROC")
+    } else if effective_capabilities & CAP_SYS_RESOURCE != 0 {
+        Some("CAP_SYS_RESOURCE is effective")
+    } else if effective_capabilities & CAP_SYS_ADMIN != 0 {
+        Some("CAP_SYS_ADMIN is effective")
+    } else {
+        None
+    }
+}
+
+// Mutation: ignore CAP_SYS_RESOURCE or CAP_SYS_ADMIN in CapEff; its matching row fails.
+#[cfg(target_os = "linux")]
+#[test]
+fn reader_spawn_skip_reason_names_rlimit_nproc_exemptions() {
+    let cases: [(libc::uid_t, u64, Option<&str>); 4] = [
+        (0, 0, Some("euid 0 is exempt from RLIMIT_NPROC")),
+        (1000, 1 << 24, Some("CAP_SYS_RESOURCE is effective")),
+        (1000, 1 << 21, Some("CAP_SYS_ADMIN is effective")),
+        (1000, 0, None),
+    ];
+
+    for (euid, effective_capabilities, expected) in cases {
+        assert_eq!(
+            reader_spawn_skip_reason(euid, effective_capabilities),
+            expected,
+            "euid {euid}, CapEff {effective_capabilities:#x}"
+        );
+    }
+}
+
+// Mutation: move client_connected until after reader spawn; the constrained spawn error must still leave it first.
+#[cfg(target_os = "linux")]
+#[test]
+fn failed_reader_spawn_still_connects_before_departing() {
+    use std::process::Command;
+
+    // SAFETY: `geteuid` has no preconditions or pointer arguments.
+    let euid = unsafe { libc::geteuid() };
+    if let Some(reason) = reader_spawn_skip_reason(euid, 0) {
+        eprintln!("Skipping reader-spawn failure test: {reason}");
+        return;
+    }
+
+    let status = std::fs::read_to_string("/proc/self/status").expect("read process status");
+    let cap_eff = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .expect("CapEff in /proc/self/status");
+    let effective_capabilities = u64::from_str_radix(cap_eff.trim(), 16).expect("hex CapEff");
+    if let Some(reason) = reader_spawn_skip_reason(euid, effective_capabilities) {
+        eprintln!("Skipping reader-spawn failure test: {reason}");
+        return;
+    }
+
+    const CHILD_MARKER: &str = "YTEST_LIFECYCLE_RLIMIT_CHILD";
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "core_loop::run::tests::lifecycle_reader_spawn_failure_child",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_MARKER, "1")
+        .output()
+        .expect("run the constrained child test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "constrained reader-spawn test failed:\n{stdout}\n{stderr}",
+    );
+}
+
+// Mutation: move client_connected after reader spawn; the child test's first event assertion fails.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "invoked in a subprocess with RLIMIT_NPROC lowered to force the real thread spawn to fail"]
+fn lifecycle_reader_spawn_failure_child() {
+    use crate::backend::recording::RecordingBackend;
+
+    const CHILD_MARKER: &str = "YTEST_LIFECYCLE_RLIMIT_CHILD";
+    if std::env::var_os(CHILD_MARKER).as_deref() != Some(std::ffi::OsStr::new("1")) {
+        return;
+    }
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut state = ServerState::new();
+    install_lifecycle_recording_policy(&mut state, events.clone(), false);
+    let (_poll, sender, _receiver) = crate::core_loop::sender::channel().expect("core channel");
+    let setup_registry = crate::core_loop::setup_thread::make_registry();
+    let (server_stream, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let id = yserver_protocol::x11::ClientId(7);
+
+    // The child process has already started its test worker. Limiting its
+    // own per-UID task allowance below the current task count forces the
+    // same OS thread creation failure the production spawn can encounter.
+    // SAFETY: zero is valid for an output `rlimit` before `getrlimit` fills it.
+    let mut original = unsafe { std::mem::zeroed::<libc::rlimit>() };
+    // SAFETY: `original` is a valid writable output pointer.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NPROC, &mut original) },
+        0
+    );
+    let constrained = libc::rlimit {
+        rlim_cur: 1,
+        rlim_max: original.rlim_max,
+    };
+    // SAFETY: `constrained` is valid and only lowers this child process's soft limit.
+    assert_eq!(
+        unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &constrained) },
+        0
+    );
+
+    let setup_result = super::handle_client_setup_complete(
+        &sender,
+        &setup_registry,
+        &mut state,
+        id,
+        crate::core_loop::generation::Generation::default(),
+        crate::transport::Transport::Unix(server_stream),
+        id.0 << 20,
+        0x000F_FFFF,
+        yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        (true, true, false),
+        crate::peer::PeerIdentity::unknown_unix(),
+        crate::access::Admission::Internal,
+        &[],
+    );
+    // SAFETY: restore the exact process limit saved above before assertions or teardown.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &original) }, 0);
+    assert_eq!(
+        setup_result
+            .expect_err("reader thread creation must fail")
+            .kind(),
+        std::io::ErrorKind::WouldBlock,
+    );
+    assert!(state.clients.contains_key(&id.0));
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), id),
+        vec![LifecycleEvent::Connected(
+            id,
+            crate::peer::PeerIdentity::unknown_unix(),
+            crate::access::Admission::Internal,
+        )],
+    );
+
+    super::disconnect_with_pending_cleanup(
+        &mut state,
+        &mut RecordingBackend::new(),
+        &mut PendingBackendRequests::default(),
+        &mut XiConfigLane::default(),
+        &mut ResetTrigger::new(ResetPolicy::NoReset),
+        id,
+    );
+    assert_eq!(
+        lifecycle_events_for(&events.lock().unwrap(), id),
+        vec![
+            LifecycleEvent::Connected(
+                id,
+                crate::peer::PeerIdentity::unknown_unix(),
+                crate::access::Admission::Internal,
+            ),
+            LifecycleEvent::ConnectionGone(id),
+            LifecycleEvent::OwnerGone(id),
+        ],
+    );
+    assert!(!state.clients.contains_key(&id.0));
+    assert!(!state.zombie_clients.contains_key(&id.0));
+}
+
+fn install_xi_config_test_client(
+    state: &mut ServerState,
+    client_id: u32,
+) -> crate::transport::CapturedPeer {
+    use crate::server::ClientState;
+    use std::sync::{Arc, Mutex, atomic::AtomicU16};
+    use yserver_protocol::x11::ClientByteOrder;
+
+    let (transport, peer) = crate::transport::Transport::capture_pair();
+    state.clients.insert(
+        client_id,
+        ClientState {
+            admission: crate::access::Admission::Internal,
+            writer: Arc::new(Mutex::new(transport)),
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: u32::MAX,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
+            watching_writable: false,
+            write_failed: false,
+            gone: false,
+            focused_window: crate::resources::ROOT_WINDOW,
+            reader_control: None,
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+        },
+    );
+    peer
+}
+
+/// A client on `writer` whose root event mask is `root_mask`.
+fn unix_client(
+    writer: std::os::unix::net::UnixStream,
+    id: u32,
+    root_mask: u32,
+) -> crate::server::ClientState {
+    use std::sync::{Arc, Mutex, atomic::AtomicU16};
+    crate::server::ClientState {
+        admission: crate::access::Admission::Internal,
+        writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
+        byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+        last_sequence: Arc::new(AtomicU16::new(0)),
+        resource_id_base: id << 21,
+        resource_id_mask: 0x001f_ffff,
+        event_masks: if root_mask == 0 {
+            HashMap::new()
+        } else {
+            HashMap::from([(crate::resources::ROOT_WINDOW, root_mask)])
+        },
+        save_set: HashSet::new(),
+        big_requests_enabled: false,
+        xi2_masks: HashMap::new(),
+        xi1_event_classes: HashSet::new(),
+        xi1_window_event_classes: HashMap::new(),
+        outbound: VecDeque::new(),
+        outbound_fds: Default::default(),
+        watching_writable: false,
+        write_failed: false,
+        gone: false,
+        focused_window: crate::resources::ROOT_WINDOW,
+        reader_control: None,
+        is_local: true,
+        fd_passing: true,
+        internal: false,
+        peer: crate::peer::PeerIdentity::unknown_unix(),
+    }
+}
+
+// Mutation: returning None from AccessContext::admission makes this assertion fail.
+#[test]
+fn access_context_returns_the_clients_admission() {
+    let (writer, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut state = ServerState::new();
+    let mut client = unix_client(writer, 7, 0);
+    client.admission = crate::access::Admission::HostAccess;
+    state.clients.insert(7, client);
+
+    let context = crate::access::AccessContext::new(&state, None);
+    assert_eq!(
+        context.admission(yserver_protocol::x11::ClientId(7)),
+        Some(&crate::access::Admission::HostAccess),
+    );
+}
+
+/// Client `owner`'s 10x10 child of the root.
+fn create_child_window(state: &mut ServerState, owner: u32) -> yserver_protocol::x11::ResourceId {
+    let window = yserver_protocol::x11::ResourceId(owner << 21 | 1);
+    state.resources.create_window(
+        yserver_protocol::x11::ClientId(owner),
+        yserver_protocol::x11::CreateWindowRequest {
+            depth: 24,
+            window,
+            parent: crate::resources::ROOT_WINDOW,
+            width: 10,
+            height: 10,
+            class: 1,
+            visual: crate::resources::ROOT_VISUAL,
+            ..Default::default()
+        },
+    );
+    window
+}
+
+/// The core loop disconnects every client a write failed on, and
+/// repeats: here the slow client's own teardown (its window's
+/// DestroyNotify) overflows a second slow client, which goes too. The
+/// reading client stays and sees the DestroyNotify.
+#[test]
+fn failed_writers_are_disconnected_including_ones_failed_by_a_disconnect() {
+    use crate::backend::recording::RecordingBackend;
+    use std::{io::Read, os::unix::net::UnixStream};
+    const SUBSTRUCTURE_NOTIFY: u32 = 1 << 19;
+
+    let mut state = ServerState::new();
+    let mut peers = Vec::new();
+    for (id, mask) in [(1, 0), (2, SUBSTRUCTURE_NOTIFY), (3, SUBSTRUCTURE_NOTIFY)] {
+        let (a, b) = UnixStream::pair().unwrap();
+        peers.push(b);
+        state.clients.insert(id, unix_client(a, id, mask));
+    }
+    let window = create_child_window(&mut state, 1);
+    for id in [1, 2] {
+        client_io::saturate_for_test(state.clients.get_mut(&id).unwrap());
+    }
+    state.clients.get_mut(&1).unwrap().write_failed = true;
+
+    disconnect_failed_writers(
+        &mut state,
+        &mut RecordingBackend::new(),
+        &mut PendingBackendRequests::default(),
+        &mut XiConfigLane::default(),
+        &mut ResetTrigger::new(ResetPolicy::NoReset),
+    );
+    assert!(!state.clients.contains_key(&1));
+    assert!(
+        !state.clients.contains_key(&2),
+        "failed by 1's DestroyNotify"
+    );
+    assert!(state.clients.contains_key(&3));
+    assert!(state.resources.window(window).is_none());
+    let reader = &mut peers[2];
+    reader.set_nonblocking(true).unwrap();
+    let mut event = [0u8; 32];
+    reader.read_exact(&mut event).unwrap();
+    assert_eq!(event[0], 17, "DestroyNotify");
+}
+
+/// Output a forced disconnect produces for a healthy client whose
+/// socket is full gets WRITABLE interest before the loop blocks again;
+/// otherwise those bytes would wait for a wakeup that never comes.
+#[test]
+fn output_buffered_by_a_disconnect_gets_writable_interest() {
+    use crate::backend::recording::RecordingBackend;
+    use std::{
+        io::{ErrorKind, Write},
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
+    const SUBSTRUCTURE_NOTIFY: u32 = 1 << 19;
+
+    let poll = Poll::new().unwrap();
+    let mut state = ServerState::new();
+    let mut peers = Vec::new();
+    for (id, mask) in [(1, 0), (2, SUBSTRUCTURE_NOTIFY)] {
+        let (a, b) = UnixStream::pair().unwrap();
+        a.set_nonblocking(true).unwrap();
+        poll.registry()
+            .register(
+                &mut SourceFd(&a.as_raw_fd()),
+                client_token(yserver_protocol::x11::ClientId(id)),
+                Interest::READABLE,
+            )
+            .unwrap();
+        peers.push(b);
+        state.clients.insert(id, unix_client(a, id, mask));
+    }
+    let window = create_child_window(&mut state, 1);
+    // Fill client 2's socket: the DestroyNotify must buffer.
+    {
+        let mut writer = state.clients[&2].writer.lock().unwrap();
+        let chunk = [0u8; 4096];
+        loop {
+            match writer.write(&chunk) {
+                Ok(_) => {}
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) => panic!("filling the socket: {err}"),
+            }
+        }
+    }
+    state.clients.get_mut(&1).unwrap().write_failed = true;
+
+    settle_client_output(
+        poll.registry(),
+        &mut state,
+        &mut RecordingBackend::new(),
+        &mut PendingBackendRequests::default(),
+        &mut XiConfigLane::default(),
+        &mut ResetTrigger::new(ResetPolicy::NoReset),
+    );
+    assert!(!state.clients.contains_key(&1));
+    assert!(state.resources.window(window).is_none());
+    let healthy = &state.clients[&2];
+    assert!(!healthy.write_failed);
+    assert_eq!(healthy.outbound.len(), 32, "the DestroyNotify");
+    assert!(healthy.watching_writable);
+    drop(peers);
+}
+
+fn xi_vt_config_fixture(
+    client: u32,
+    source: crate::xinput::InputSourceId,
+) -> (
+    ServerState,
+    crate::transport::CapturedPeer,
+    InputInventory,
+    crate::core_loop::DeviceInfo,
+    u16,
+) {
+    let mut state = ServerState::new();
+    let peer = install_xi_config_test_client(&mut state, client);
+    let info = crate::core_loop::DeviceInfo {
+        source_id: source,
+        enabled: true,
+        resume_key: None,
+        capabilities: crate::xinput::InputCapabilities {
+            pointer: true,
+            ..Default::default()
+        },
+        name: "VT config pointer".into(),
+        device_node: format!("/dev/input/event{}", source.0),
+        sysname: format!("event{}", source.0),
+        vendor_id: 1,
+        product_id: 2,
+        is_touchpad: false,
+        config: crate::core_loop::message::LibinputConfigSnapshot {
+            accel: crate::core_loop::message::FloatSetting {
+                available: true,
+                current: 0.0,
+                default: 0.0,
+            },
+            ..Default::default()
+        },
+    };
+    let device_id = state.xi_register_source(&info)[0];
+    let mut inventory = InputInventory::new();
+    inventory.add(info.clone());
+    (state, peer, inventory, info, device_id)
+}
+
+fn xi_vt_accel_request(
+    client: yserver_protocol::x11::ClientId,
+    sequence: u16,
+    device_id: u16,
+    state: &ServerState,
+    speed: f32,
+) -> DeferredRequest {
+    let mut body = Vec::new();
+    body.extend_from_slice(&device_id.to_le_bytes());
+    body.push(crate::xinput::XI_PROP_MODE_REPLACE);
+    body.push(32);
+    body.extend_from_slice(
+        &state
+            .atoms
+            .id_for("libinput Accel Speed")
+            .expect("acceleration property atom")
+            .0
+            .to_le_bytes(),
+    );
+    body.extend_from_slice(&state.float_atom.0.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&speed.to_le_bytes());
+    DeferredRequest {
+        id: client,
+        sequence: yserver_protocol::x11::SequenceNumber(sequence),
+        accepted_at: None,
+        header: yserver_protocol::x11::RequestHeader {
+            opcode: 137,
+            data: 57,
+            length_units: 6,
+        },
+        body,
+        attached_fd: None,
+    }
+}
+
+fn xi_vt_following_focus_request(client: yserver_protocol::x11::ClientId) -> DeferredRequest {
+    DeferredRequest {
+        id: client,
+        sequence: yserver_protocol::x11::SequenceNumber(2),
+        accepted_at: None,
+        header: yserver_protocol::x11::RequestHeader {
+            opcode: 43,
+            data: 0,
+            length_units: 1,
+        },
+        body: Vec::new(),
+        attached_fd: None,
+    }
+}
+
+fn send_vt_test_request(sender: &crate::core_loop::sender::BoundSender, request: DeferredRequest) {
+    sender
+        .send(Message::Request {
+            id: request.id,
+            sequence: request.sequence,
+            accepted_at: request.accepted_at,
+            header: request.header,
+            body: request.body,
+            attached_fd: request.attached_fd,
+        })
+        .expect("queue runner request");
+}
+
+fn run_core_for_vt_test(
+    state: &mut ServerState,
+    backend: &mut crate::backend::recording::RecordingBackend,
+    enqueue: impl FnOnce(&CoreSender, &crate::core_loop::sender::BoundSender),
+) -> InputInventory {
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let request_sender = sender.bind();
+    enqueue(&sender, &request_sender);
+    let mut input_inventory = InputInventory::new();
+    run_core_with_inventory(
+        poll,
+        receiver,
+        sender.clone_handle(),
+        state,
+        backend,
+        [],
+        &ClientIdAllocator::new(),
+        AuthState::new(None),
+        ResetPolicy::NoReset,
+        None,
+        &mut input_inventory,
+    )
+    .expect("run core through VT release and shutdown messages");
+    input_inventory
+}
+
+fn run_core_for_vt_test_with_timeout(
+    mut state: ServerState,
+    mut backend: crate::backend::recording::RecordingBackend,
+    peer: crate::transport::CapturedPeer,
+    timeout: std::time::Duration,
+    enqueue: impl FnOnce(&CoreSender, &crate::core_loop::sender::BoundSender) + Send + 'static,
+) -> Result<
+    (
+        ServerState,
+        crate::backend::recording::RecordingBackend,
+        crate::transport::CapturedPeer,
+        InputInventory,
+    ),
+    std::sync::mpsc::RecvTimeoutError,
+> {
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let runner = std::thread::spawn(move || {
+        let input_inventory = run_core_for_vt_test(&mut state, &mut backend, enqueue);
+        let _ = finished_tx.send((state, backend, peer, input_inventory));
+    });
+    drop(runner);
+    finished_rx.recv_timeout(timeout)
+}
+
+#[test]
+fn xi_vt_timeout_cancelled_command_keeps_bad_match_and_state() {
+    // Mutation killed: omit the core's cancellation before it fails the
+    // still-pending request at the VT barrier timeout.
+    use crate::xinput::libinput_props::{DeviceConfigError, DeviceConfigStart, DeviceConfigToken};
+    use std::io::Read;
+
+    let client = yserver_protocol::x11::ClientId(62);
+    let source = crate::xinput::InputSourceId(620);
+    let (mut state, peer, _fixture_inventory, info, device) =
+        xi_vt_config_fixture(client.0, source);
+    state.clients.get_mut(&client.0).unwrap().xi2_masks.insert(
+        (crate::resources::ROOT_WINDOW, 0),
+        u64::from(crate::xinput::XI2_PROPERTY_EVENT_MASK),
+    );
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    backend.vt_switching_armed = true;
+    backend.vt_release_pause_queued = true;
+    backend.vt_release_probe_client = Some(client.0);
+    backend.vt_release_probe_source = Some(source);
+    let release_finished = backend.vt_release_finished.clone();
+    backend
+        .device_config_start_results
+        .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(620))));
+    let request = xi_vt_accel_request(client, 1, device, &state, 0.75);
+    let registry_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| {
+            (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.attached_master,
+            )
+        })
+        .collect();
+    let properties_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| (entry.id, entry.properties.clone()))
+        .collect();
+    let held_before = (
+        state.keys_down,
+        state.buttons_down,
+        state.key_down_by_device.clone(),
+    );
+    let detached_before = state.xi2_detached_masters.clone();
+    let floating_before = state.floating_pointer_positions.clone();
+    let selections_before = (
+        state.clients[&client.0].xi2_masks.clone(),
+        state.clients[&client.0].xi1_event_classes.clone(),
+        state.clients[&client.0].xi1_window_event_classes.clone(),
+        state.clients[&client.0].event_masks.clone(),
+    );
+
+    let (state, backend, mut peer, inventory) = run_core_for_vt_test_with_timeout(
+        state,
+        backend,
+        peer,
+        std::time::Duration::from_secs(2),
+        move |sender, requests| {
+            sender
+                .send(Message::HostInput(HostInputEvent::DeviceAdded(
+                    info.clone(),
+                )))
+                .unwrap();
+            send_vt_test_request(requests, request);
+            sender.send(Message::VtRelease).unwrap();
+            sender.send(Message::VtAcquire).unwrap();
+            sender
+                .send(Message::HostInput(HostInputEvent::DeviceResumed(info)))
+                .unwrap();
+            let late_result_sender = sender.clone_handle();
+            drop(std::thread::spawn(move || {
+                std::thread::sleep(VT_INPUT_PAUSE_TIMEOUT + std::time::Duration::from_millis(100));
+                while !release_finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                late_result_sender
+                    .send(Message::DeviceConfigResult {
+                        token: DeviceConfigToken(620),
+                        source,
+                        result: Err(DeviceConfigError::Cancelled),
+                    })
+                    .unwrap();
+                late_result_sender.send(Message::Shutdown).unwrap();
+            }));
+        },
+    )
+    .unwrap_or_else(|error| panic!("cancelled VT config timed out: {error:?}"));
+
+    assert!(backend.device_config_cancel_tokens[0].is_cancelled());
+    assert_eq!(backend.started_device_configs.len(), 1);
+    assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.0);
+    assert_eq!(backend.vt_release_inventory_accel_before_finish, Some(0.0));
+    assert_eq!(
+        state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.attached_master
+            ))
+            .collect::<Vec<_>>(),
+        registry_before,
+    );
+    for (id, properties) in properties_before {
+        assert_eq!(state.xi_devices.device(id).unwrap().properties, properties);
+    }
+    let mut error = [0; 32];
+    peer.read_exact(&mut error).unwrap();
+    assert_eq!(error[0], 0);
+    assert_eq!(error[1], yserver_protocol::x11::error::BAD_MATCH);
+    peer.set_nonblocking(true).unwrap();
+    let mut extra = [0; 1];
+    assert!(
+        matches!(peer.read(&mut extra), Err(ref err) if err.kind() == io::ErrorKind::WouldBlock),
+        "cancelled result emits no property event or second reply",
+    );
+    assert_eq!(
+        (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+        ),
+        held_before,
+    );
+    assert_eq!(state.xi2_detached_masters, detached_before);
+    assert_eq!(state.floating_pointer_positions, floating_before);
+    assert_eq!(
+        (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        ),
+        selections_before,
+    );
+}
+
+#[test]
+fn xi_vt_release_config_write_without_input_thread_does_not_hang() {
+    // Mutation killed: wait for InputPaused even though begin_vt_release
+    // did not queue an input-thread pause barrier.
+    let client = yserver_protocol::x11::ClientId(60);
+    let mut state = ServerState::new();
+    let peer = install_xi_config_test_client(&mut state, client.0);
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    backend.vt_switching_armed = true;
+    let registry_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| {
+            (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.attached_master,
+            )
+        })
+        .collect();
+    let properties_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| (entry.id, entry.properties.clone()))
+        .collect();
+    let held_before = (
+        state.keys_down,
+        state.buttons_down,
+        state.key_down_by_device.clone(),
+    );
+    let detached_before = state.xi2_detached_masters.clone();
+    let floating_before = state.floating_pointer_positions.clone();
+    let selections_before = (
+        state.clients[&client.0].xi2_masks.clone(),
+        state.clients[&client.0].xi1_event_classes.clone(),
+        state.clients[&client.0].xi1_window_event_classes.clone(),
+        state.clients[&client.0].event_masks.clone(),
+    );
+
+    let (state, backend, _peer, _inventory) = run_core_for_vt_test_with_timeout(
+        state,
+        backend,
+        peer,
+        std::time::Duration::from_millis(250),
+        |sender, _requests| {
+            sender.send(Message::VtRelease).unwrap();
+            sender.send(Message::Shutdown).unwrap();
+        },
+    )
+    .unwrap_or_else(|error| panic!("VT release without input thread timed out: {error:?}"));
+
+    assert!(
+        backend
+            .vt_release_finished
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "VT release must finish without an input-thread barrier",
+    );
+    assert_eq!(
+        state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.attached_master
+            ))
+            .collect::<Vec<_>>(),
+        registry_before,
+    );
+    assert_eq!(
+        state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (entry.id, entry.properties.clone()))
+            .collect::<Vec<_>>(),
+        properties_before,
+    );
+    assert_eq!(
+        (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+        ),
+        held_before,
+    );
+    assert_eq!(state.xi2_detached_masters, detached_before);
+    assert_eq!(state.floating_pointer_positions, floating_before);
+    assert_eq!(
+        (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        ),
+        selections_before,
+    );
+}
+
+#[test]
+fn xi_vt_timeout_late_applied_reconciles_inventory_property_and_event() {
+    // Mutation killed: discard a timed-out operation's late Applied
+    // result instead of reconciling its confirmed state without a reply.
+    use crate::xinput::libinput_props::{DeviceConfigStart, DeviceConfigToken};
+    use std::io::Read;
+
+    let client = yserver_protocol::x11::ClientId(61);
+    let source = crate::xinput::InputSourceId(610);
+    let (mut state, peer, _fixture_inventory, info, device) =
+        xi_vt_config_fixture(client.0, source);
+    let accel_atom = state.atoms.id_for("libinput Accel Speed").unwrap();
+    state.clients.get_mut(&client.0).unwrap().xi2_masks.insert(
+        (crate::resources::ROOT_WINDOW, 0),
+        u64::from(crate::xinput::XI2_PROPERTY_EVENT_MASK),
+    );
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    backend.vt_switching_armed = true;
+    backend.vt_release_pause_queued = true;
+    backend.vt_release_probe_client = Some(client.0);
+    backend.vt_release_probe_source = Some(source);
+    let release_finished = backend.vt_release_finished.clone();
+    backend
+        .device_config_start_results
+        .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(610))));
+    let request = xi_vt_accel_request(client, 1, device, &state, 0.75);
+    let registry_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| {
+            (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.session_enabled,
+                entry.client_disabled,
+                entry.attached_master,
+            )
+        })
+        .collect();
+    let property_maps_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| (entry.id, entry.properties.clone()))
+        .collect();
+    let held_before = (
+        state.keys_down,
+        state.buttons_down,
+        state.key_down_by_device.clone(),
+        state.xi_devices.device(device).unwrap().buttons_down,
+    );
+    let detached_before = state.xi2_detached_masters.clone();
+    let floating_before = state.floating_pointer_positions.clone();
+    let selections_before = (
+        state.clients[&client.0].xi2_masks.clone(),
+        state.clients[&client.0].xi1_event_classes.clone(),
+        state.clients[&client.0].xi1_window_event_classes.clone(),
+        state.clients[&client.0].event_masks.clone(),
+    );
+
+    let started_at = Instant::now();
+    let (state, backend, mut peer, inventory) = run_core_for_vt_test_with_timeout(
+        state,
+        backend,
+        peer,
+        std::time::Duration::from_secs(2),
+        move |sender, requests| {
+            sender
+                .send(Message::HostInput(HostInputEvent::DeviceAdded(
+                    info.clone(),
+                )))
+                .unwrap();
+            send_vt_test_request(requests, request);
+            sender.send(Message::VtRelease).unwrap();
+            sender.send(Message::VtAcquire).unwrap();
+            sender
+                .send(Message::HostInput(HostInputEvent::DeviceResumed(info)))
+                .unwrap();
+            let late_result_sender = sender.clone_handle();
+            drop(std::thread::spawn(move || {
+                std::thread::sleep(VT_INPUT_PAUSE_TIMEOUT + std::time::Duration::from_millis(100));
+                while !release_finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                late_result_sender
+                    .send(Message::DeviceConfigResult {
+                        token: DeviceConfigToken(610),
+                        source,
+                        result: Ok(()),
+                    })
+                    .unwrap();
+                late_result_sender.send(Message::Shutdown).unwrap();
+            }));
+        },
+    )
+    .unwrap_or_else(|error| panic!("unacknowledged VT pause barrier timed out: {error:?}"));
+    assert!(
+        started_at.elapsed() >= VT_INPUT_PAUSE_TIMEOUT,
+        "a queued pause barrier must receive the full bounded wait",
+    );
+
+    assert!(backend.vt_release_wire_visible_before_finish);
+    assert!(
+        backend
+            .vt_release_finished
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+    assert_eq!(backend.started_device_configs.len(), 1);
+    assert!(
+        backend.device_config_cancel_tokens[0].is_cancelled(),
+        "VT timeout shares cancellation with the submitted input command",
+    );
+    let mut error = [0; 32];
+    peer.read_exact(&mut error).unwrap();
+    assert_eq!(error[0], 0);
+    assert_eq!(error[1], yserver_protocol::x11::error::BAD_MATCH);
+    for (id, properties) in property_maps_before {
+        let current = &state.xi_devices.device(id).unwrap().properties;
+        if id == device {
+            assert_eq!(current.len(), properties.len());
+            for (property, previous) in properties {
+                let actual = current.get(&property).expect("property remains present");
+                if property == accel_atom {
+                    assert_eq!(actual.data, 0.75_f32.to_le_bytes());
+                    assert_eq!(actual.format, previous.format);
+                    assert_eq!(actual.type_atom, previous.type_atom);
+                } else {
+                    assert_eq!(actual, &previous);
+                }
+            }
+        } else {
+            assert_eq!(current, &properties);
+        }
+    }
+    assert_eq!(backend.vt_release_inventory_accel_before_finish, Some(0.0));
+    assert_eq!(
+        inventory.get(source).unwrap().config.accel.current,
+        0.75,
+        "confirmed late result updates the process-lifetime inventory",
+    );
+    assert_eq!(
+        state
+            .xi_devices
+            .source(source)
+            .unwrap()
+            .config
+            .accel
+            .current,
+        0.75,
+        "confirmed late result updates the active XI source snapshot",
+    );
+    let mut property_event = [0; 32];
+    peer.read_exact(&mut property_event).unwrap();
+    assert_eq!(property_event[0], 35, "XI2 GenericEvent");
+    assert_eq!(
+        u16::from_le_bytes([property_event[8], property_event[9]]),
+        12,
+        "XI_PropertyEvent follows reconciliation",
+    );
+    assert_eq!(
+        u16::from_le_bytes([property_event[10], property_event[11]]),
+        device,
+        "property event names the current facet",
+    );
+    assert_eq!(
+        u32::from_le_bytes(property_event[16..20].try_into().unwrap()),
+        accel_atom.0,
+    );
+    assert_eq!(property_event[20], 2, "what = Modified");
+    peer.set_nonblocking(true).unwrap();
+    let mut late_reply = [0; 1];
+    assert!(
+        matches!(peer.read(&mut late_reply), Err(ref err) if err.kind() == io::ErrorKind::WouldBlock),
+        "late reconciliation emits no second reply",
+    );
+    assert_eq!(
+        state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.session_enabled,
+                entry.client_disabled,
+                entry.attached_master,
+            ))
+            .collect::<Vec<_>>(),
+        registry_before,
+    );
+    assert_eq!(
+        (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+            state.xi_devices.device(device).unwrap().buttons_down,
+        ),
+        held_before,
+    );
+    assert_eq!(state.xi2_detached_masters, detached_before);
+    assert_eq!(state.floating_pointer_positions, floating_before);
+    assert_eq!(
+        (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        ),
+        selections_before,
+    );
+}
+
+#[test]
+fn xi_config_completion_same_client_request_order_survives_error() {
+    use crate::xinput::libinput_props::{DeviceConfigError, DeviceConfigStart, DeviceConfigToken};
+    use std::io::Read;
+    use yserver_protocol::x11::{ClientId, SequenceNumber};
+
+    let client = ClientId(57);
+    let mut state = ServerState::new();
+    let mut peer = install_xi_config_test_client(&mut state, client.0);
+    let info = crate::core_loop::DeviceInfo {
+        source_id: crate::xinput::InputSourceId(570),
+        enabled: true,
+        resume_key: None,
+        capabilities: crate::xinput::InputCapabilities {
+            pointer: true,
+            ..Default::default()
+        },
+        name: "ordered config pointer".into(),
+        device_node: "/dev/input/event570".into(),
+        sysname: "event570".into(),
+        vendor_id: 1,
+        product_id: 2,
+        is_touchpad: false,
+        config: crate::core_loop::message::LibinputConfigSnapshot {
+            accel: crate::core_loop::message::FloatSetting {
+                available: true,
+                current: 0.0,
+                default: 0.0,
+            },
+            ..Default::default()
+        },
+    };
+    let ids = state.xi_register_source(&info);
+    let device_id = ids[0];
+    let source = info.source_id;
+    let mut inventory = InputInventory::new();
+    inventory.add(info);
+    let property = state.atoms.id_for("libinput Accel Speed").unwrap();
+    let before = state
+        .xi_devices
+        .device(device_id)
+        .unwrap()
+        .properties
+        .clone();
+    let mut body = Vec::new();
+    body.extend_from_slice(&device_id.to_le_bytes());
+    body.push(crate::xinput::XI_PROP_MODE_REPLACE);
+    body.push(32);
+    body.extend_from_slice(&property.0.to_le_bytes());
+    body.extend_from_slice(&state.float_atom.0.to_le_bytes());
+    body.extend_from_slice(&1u32.to_le_bytes());
+    body.extend_from_slice(&0.5_f32.to_le_bytes());
+    let first = DeferredRequest {
+        id: client,
+        sequence: SequenceNumber(1),
+        accepted_at: None,
+        header: yserver_protocol::x11::RequestHeader {
+            opcode: 137,
+            data: 57,
+            length_units: 6,
+        },
+        body,
+        attached_fd: None,
+    };
+
+    let token = DeviceConfigToken(570);
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    backend
+        .device_config_start_results
+        .push_back(Ok(DeviceConfigStart::Pending(token)));
+    let mut pending = PendingBackendRequests::default();
+    let mut lane = XiConfigLane::default();
+    let mut reset_trigger = ResetTrigger::new(ResetPolicy::NoReset);
+    let mut requests_this_iter = 0;
+    let mut request_budget = 10;
+    process_one_request(
+        &mut state,
+        &mut backend,
+        &mut inventory,
+        &mut LoopTelemetry::default(),
+        &mut pending,
+        &mut lane,
+        &mut reset_trigger,
+        Generation::default(),
+        &mut requests_this_iter,
+        &mut request_budget,
+        first,
+    );
+    assert!(pending.client_is_blocked(client));
+    assert!(!lane.is_empty());
+    assert_eq!(backend.started_device_configs.len(), 1);
+    assert_eq!(
+        state.xi_devices.device(device_id).unwrap().properties,
+        before
+    );
+
+    let mut later = DeferredRequest {
+        id: client,
+        sequence: SequenceNumber(2),
+        accepted_at: None,
+        header: yserver_protocol::x11::RequestHeader {
+            opcode: 43, // GetInputFocus reply is easy to identify.
+            data: 0,
+            length_units: 1,
+        },
+        body: Vec::new(),
+        attached_fd: None,
+    };
+    let mut deferred = FairRequestQueue::default();
+    deferred.push_back(later);
+    assert!(deferred.pop_front_unblocked(&pending, &state).is_none());
+    peer.set_nonblocking(true).unwrap();
+    let mut bytes = [0u8; 64];
+    assert!(
+        matches!(peer.read(&mut bytes), Err(ref error) if error.kind() == io::ErrorKind::WouldBlock)
+    );
+    peer.set_nonblocking(false).unwrap();
+
+    dispatch_device_config_result(
+        &mut state,
+        &mut backend,
+        &mut inventory,
+        &mut pending,
+        &mut lane,
+        &mut reset_trigger,
+        Message::DeviceConfigResult {
+            token,
+            source,
+            result: Err(DeviceConfigError::Invalid),
+        },
+        Generation::default(),
+    );
+    assert!(!pending.client_is_blocked(client));
+    later = deferred
+        .pop_front_unblocked(&pending, &state)
+        .expect("later request unblocks after the earlier error");
+    process_one_request(
+        &mut state,
+        &mut backend,
+        &mut inventory,
+        &mut LoopTelemetry::default(),
+        &mut pending,
+        &mut lane,
+        &mut reset_trigger,
+        Generation::default(),
+        &mut requests_this_iter,
+        &mut request_budget,
+        later,
+    );
+
+    let mut wire = [0u8; 64];
+    peer.read_exact(&mut wire).unwrap();
+    assert_eq!(wire[0], 0, "first packet is the earlier request's X_Error");
+    assert_eq!(wire[1], yserver_protocol::x11::error::BAD_VALUE);
+    assert_eq!(u16::from_le_bytes([wire[2], wire[3]]), 1);
+    assert_eq!(u16::from_le_bytes([wire[8], wire[9]]), 57);
+    assert_eq!(wire[10], 137);
+    assert_eq!(wire[32], 1, "second packet answers GetInputFocus");
+    assert_eq!(u16::from_le_bytes([wire[34], wire[35]]), 2);
+    assert_eq!(
+        state.xi_devices.device(device_id).unwrap().properties,
+        before
+    );
+    assert_eq!(inventory.get(source).unwrap().config.accel.current, 0.0);
+    assert!(lane.is_empty());
+    assert!(pending.is_empty());
+}
+
+#[test]
+fn xi_vt_release_config_write_applied_reply_precedes_release_completion() {
+    // Mutation killed: finish VT release before the pause barrier drains
+    // the in-flight XI config, leaving the client blocked across release.
+    use crate::xinput::libinput_props::{DeviceConfigStart, DeviceConfigToken};
+    use std::io::Read;
+
+    let client = yserver_protocol::x11::ClientId(58);
+    let source = crate::xinput::InputSourceId(580);
+    let (mut state, mut peer, _fixture_inventory, info, device) =
+        xi_vt_config_fixture(client.0, source);
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    backend.vt_switching_armed = true;
+    backend.vt_release_pause_queued = true;
+    backend.vt_release_probe_client = Some(client.0);
+    backend.vt_release_probe_source = Some(source);
+    backend
+        .device_config_start_results
+        .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(580))));
+    let registry_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| {
+            (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.session_enabled,
+                entry.client_disabled,
+                entry.attached_master,
+            )
+        })
+        .collect();
+    let property_maps_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| (entry.id, entry.properties.clone()))
+        .collect();
+    let held_before = (
+        state.keys_down,
+        state.buttons_down,
+        state.key_down_by_device.clone(),
+        state.xi_devices.device(device).unwrap().buttons_down,
+    );
+    let detached_before = state.xi2_detached_masters.clone();
+    let floating_before = state.floating_pointer_positions.clone();
+    let selections_before = (
+        state.clients[&client.0].xi2_masks.clone(),
+        state.clients[&client.0].xi1_event_classes.clone(),
+        state.clients[&client.0].xi1_window_event_classes.clone(),
+        state.clients[&client.0].event_masks.clone(),
+    );
+    let request = xi_vt_accel_request(client, 1, device, &state, 0.5);
+    run_core_for_vt_test(&mut state, &mut backend, |sender, requests| {
+        sender
+            .send(Message::HostInput(HostInputEvent::DeviceAdded(info)))
+            .unwrap();
+        send_vt_test_request(requests, request);
+        sender.send(Message::VtRelease).unwrap();
+        send_vt_test_request(requests, xi_vt_following_focus_request(client));
+        sender
+            .send(Message::DeviceConfigResult {
+                token: DeviceConfigToken(580),
+                source,
+                result: Ok(()),
+            })
+            .unwrap();
+        sender.send(Message::InputPaused).unwrap();
+        sender.send(Message::Shutdown).unwrap();
+    });
+    assert!(
+        backend.vt_release_wire_visible_before_finish,
+        "runner must write the following reply before VT release finishes",
+    );
+    assert_eq!(
+        backend.vt_release_inventory_accel_before_finish,
+        Some(0.5),
+        "the runner inventory carries the applied value at the release boundary",
+    );
+    let mut reply = [0; 32];
+    peer.read_exact(&mut reply).unwrap();
+    assert_eq!(reply[0], 1);
+    assert_eq!(u16::from_le_bytes([reply[2], reply[3]]), 2);
+    assert!(
+        backend
+            .vt_release_finished
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+    assert_eq!(backend.started_device_configs.len(), 1);
+    assert_eq!(
+        state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.session_enabled,
+                entry.client_disabled,
+                entry.attached_master,
+            ))
+            .collect::<Vec<_>>(),
+        registry_before,
+    );
+    for (id, before) in property_maps_before {
+        let after = &state.xi_devices.device(id).unwrap().properties;
+        if id != device {
+            assert_eq!(*after, before);
+            continue;
+        }
+        assert_eq!(after.len(), before.len());
+        for (atom, old_value) in before {
+            if atom == state.atoms.id_for("libinput Accel Speed").unwrap() {
+                assert_eq!(after.get(&atom).unwrap().data, 0.5_f32.to_le_bytes());
+            } else {
+                assert_eq!(after.get(&atom), Some(&old_value));
+            }
+        }
+    }
+    assert_eq!(
+        (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+            state.xi_devices.device(device).unwrap().buttons_down,
+        ),
+        held_before,
+    );
+    assert_eq!(state.xi2_detached_masters, detached_before);
+    assert_eq!(state.floating_pointer_positions, floating_before);
+    assert_eq!(
+        (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        ),
+        selections_before,
+    );
+}
+
+#[test]
+fn xi_vt_release_config_write_retired_handle_bad_match_has_no_resume_reply() {
+    // Mutation killed: park SourceGone until source rebind (or expose it as
+    // BadDevice), allowing the pre-pause property write to answer late.
+    use crate::xinput::libinput_props::{DeviceConfigStart, DeviceConfigToken};
+    use std::io::Read;
+
+    let client = yserver_protocol::x11::ClientId(59);
+    let source = crate::xinput::InputSourceId(590);
+    let (mut state, mut peer, _fixture_inventory, info, device) =
+        xi_vt_config_fixture(client.0, source);
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    backend.vt_switching_armed = true;
+    backend.vt_release_pause_queued = true;
+    backend.vt_release_probe_client = Some(client.0);
+    backend.vt_release_probe_source = Some(source);
+    backend
+        .device_config_start_results
+        .push_back(Ok(DeviceConfigStart::Pending(DeviceConfigToken(590))));
+    let request = xi_vt_accel_request(client, 1, device, &state, 0.75);
+    let property_maps_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| (entry.id, entry.properties.clone()))
+        .collect();
+    let inventory_accel_before = 0.0;
+    let registry_before: Vec<_> = state
+        .xi_devices
+        .devices()
+        .iter()
+        .map(|entry| {
+            (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.session_enabled,
+                entry.client_disabled,
+                entry.attached_master,
+            )
+        })
+        .collect();
+    let held_before = (
+        state.keys_down,
+        state.buttons_down,
+        state.key_down_by_device.clone(),
+    );
+    let detached_before = state.xi2_detached_masters.clone();
+    let floating_before = state.floating_pointer_positions.clone();
+    let selections_before = (
+        state.clients[&client.0].xi2_masks.clone(),
+        state.clients[&client.0].xi1_event_classes.clone(),
+        state.clients[&client.0].xi1_window_event_classes.clone(),
+        state.clients[&client.0].event_masks.clone(),
+    );
+
+    run_core_for_vt_test(&mut state, &mut backend, |sender, requests| {
+        sender
+            .send(Message::HostInput(HostInputEvent::DeviceAdded(
+                info.clone(),
+            )))
+            .unwrap();
+        send_vt_test_request(requests, request);
+        sender.send(Message::VtRelease).unwrap();
+        sender
+            .send(Message::DeviceConfigResult {
+                token: DeviceConfigToken(590),
+                source,
+                result: Err(crate::xinput::libinput_props::DeviceConfigError::SourceGone),
+            })
+            .unwrap();
+        sender.send(Message::InputPaused).unwrap();
+        sender.send(Message::VtAcquire).unwrap();
+        sender
+            .send(Message::HostInput(HostInputEvent::DeviceResumed(info)))
+            .unwrap();
+        sender.send(Message::Shutdown).unwrap();
+    });
+    assert!(backend.vt_release_wire_visible_before_finish);
+    assert!(
+        backend
+            .vt_release_finished
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+    let mut error = [0; 32];
+    peer.read_exact(&mut error).unwrap();
+    assert_eq!(error[0], 0);
+    assert_eq!(error[1], yserver_protocol::x11::error::BAD_MATCH);
+    for (id, properties) in property_maps_before {
+        assert_eq!(
+            state.xi_devices.device(id).unwrap().properties,
+            properties,
+            "failed SourceGone does not alter any device property map",
+        );
+    }
+    assert_eq!(
+        backend.vt_release_inventory_accel_before_finish,
+        Some(inventory_accel_before),
+    );
+    peer.set_nonblocking(true).unwrap();
+    let mut late_reply = [0; 1];
+    assert!(
+        matches!(peer.read(&mut late_reply), Err(ref err) if err.kind() == io::ErrorKind::WouldBlock),
+        "resume must not emit a second or delayed answer for the pre-pause write",
+    );
+    assert_eq!(
+        state
+            .xi_devices
+            .devices()
+            .iter()
+            .map(|entry| (
+                entry.id,
+                entry.source_id,
+                entry.enabled,
+                entry.session_enabled,
+                entry.client_disabled,
+                entry.attached_master,
+            ))
+            .collect::<Vec<_>>(),
+        registry_before,
+    );
+    assert_eq!(
+        (
+            state.keys_down,
+            state.buttons_down,
+            state.key_down_by_device.clone(),
+        ),
+        held_before,
+    );
+    assert_eq!(state.xi2_detached_masters, detached_before);
+    assert_eq!(state.floating_pointer_positions, floating_before);
+    assert_eq!(
+        (
+            state.clients[&client.0].xi2_masks.clone(),
+            state.clients[&client.0].xi1_event_classes.clone(),
+            state.clients[&client.0].xi1_window_event_classes.clone(),
+            state.clients[&client.0].event_masks.clone(),
+        ),
+        selections_before,
+    );
+}
+
+/// #132: `xrandr --dpi` (RRSetScreenSize with the same pixels, new mm)
+/// reaches NEW clients' setup reply, as Xorg's `pScreen->mmWidth`.
+/// Measured in vng (tools/vng-scenarios/xrandr-dpi.sh): 1280x800 at
+/// `--dpi 108` → 301x188 mm on Xorg 21.1.24 and on yserver.
+#[test]
+fn setup_allocate_reports_randr_screen_mm() {
+    let mut state = ServerState::new();
+    let (w, h) = (state.randr.screen_width, state.randr.screen_height);
+    state.randr.set_logical_size(w, h, 301, 188);
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    handle_setup_allocate(&mut state, yserver_protocol::x11::ClientId(1), tx);
+    let resp = rx.try_recv().expect("setup allocate response");
+    assert_eq!((resp.screen_width_mm, resp.screen_height_mm), (301, 188));
+}
+use std::os::unix::net::UnixStream;
+
+#[test]
+fn listener_accept_budget_leaves_flood_backlog_for_next_turn() {
+    let path = std::env::temp_dir().join(format!("yserver-accept-budget-{}", std::process::id()));
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let peers: Vec<_> = (0..33)
+        .map(|_| UnixStream::connect(&path).unwrap())
+        .collect();
+    std::fs::remove_file(path).unwrap();
+    let listener = Listener::Unix(listener);
+    let alloc = ClientIdAllocator::new();
+    let (_poll, sender, _rx) = channel().unwrap();
+    let registry = setup_thread::make_registry();
+
+    accept_pending(&listener, &alloc, &sender, &registry, &AuthState::new(None));
+    let accepted = alloc.peek().0 - 1;
+    setup_thread::shutdown_all(&registry);
+    drop(peers);
+    assert_eq!(
+        accepted, 16,
+        "one listener must yield after its accept budget"
+    );
+}
+
+#[test]
+fn ready_listeners_round_robin_under_accept_flood() {
+    for tcp_count in [1, 33] {
+        let path = std::env::temp_dir().join(format!(
+            "yserver-accept-fair-{}-{tcp_count}",
+            std::process::id()
+        ));
+        let unix = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let unix_peers: Vec<_> = (0..33)
+            .map(|_| UnixStream::connect(&path).unwrap())
+            .collect();
+        let tcp_peers: Vec<_> = (0..tcp_count)
+            .map(|_| std::net::TcpStream::connect(tcp.local_addr().unwrap()).unwrap())
+            .collect();
+        std::fs::remove_file(path).unwrap();
+        let listeners = [Listener::Unix(unix), Listener::Tcp(tcp)];
+        for listener in &listeners {
+            listener.set_nonblocking(true).unwrap();
+        }
+        let alloc = ClientIdAllocator::new();
+        let (_poll, sender, _rx) = channel().unwrap();
+        let registry = setup_thread::make_registry();
+        let mut readiness = ListenerReadiness::new(2);
+        readiness.mark_ready(0);
+        readiness.mark_ready(1);
+        readiness.accept_ready(
+            &listeners,
+            &alloc,
+            &sender,
+            &registry,
+            &AuthState::new(None),
+        );
+        {
+            let clients = registry.lock().unwrap();
+            assert!(matches!(
+                clients[&yserver_protocol::x11::ClientId(1)],
+                Transport::Unix(_)
+            ));
+            assert!(
+                matches!(
+                    clients[&yserver_protocol::x11::ClientId(17)],
+                    Transport::Tcp(_)
+                ),
+                "TCP must be accepted within one Unix accept budget, even during a flood"
+            );
+            assert_eq!(clients.len(), if tcp_count == 1 { 17 } else { 32 });
+        }
+        // No fresh readiness marks. Queued accepts must persist, and the
+        // second round must start at TCP rather than repeat Unix-first.
+        readiness.accept_ready(
+            &listeners,
+            &alloc,
+            &sender,
+            &registry,
+            &AuthState::new(None),
+        );
+        if tcp_count == 33 {
+            let clients = registry.lock().unwrap();
+            assert!(matches!(
+                clients[&yserver_protocol::x11::ClientId(33)],
+                Transport::Tcp(_)
+            ));
+            assert!(matches!(
+                clients[&yserver_protocol::x11::ClientId(49)],
+                Transport::Unix(_)
+            ));
+        }
+        readiness.accept_ready(
+            &listeners,
+            &alloc,
+            &sender,
+            &registry,
+            &AuthState::new(None),
+        );
+        assert!(
+            !readiness.has_pending(),
+            "WouldBlock clears retained readiness"
+        );
+        assert_eq!(alloc.peek().0 - 1, 33 + tcp_count);
+        setup_thread::shutdown_all(&registry);
+        drop((unix_peers, tcp_peers));
+    }
+}
+
+#[test]
+fn listener_backlog_completes_without_a_fresh_readiness_edge() {
+    use std::io::{Read, Write};
+    let path = std::env::temp_dir().join(format!("yserver-accept-edge-{}", std::process::id()));
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    // Queue more than two accept budgets before the listener is registered:
+    // there is one readiness edge, with no later connection to wake it.
+    let mut peers: Vec<_> = (0..33)
+        .map(|_| {
+            let mut peer = UnixStream::connect(&path).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+                .unwrap();
+            peer
+        })
+        .collect();
+    std::fs::remove_file(path).unwrap();
+    let (poll, sender, rx) = channel().unwrap();
+    let sender_for_core = sender.clone_handle();
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            [Listener::Unix(listener)],
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        )
+    });
+    let result: io::Result<()> = (|| {
+        for peer in &mut peers {
+            let mut header = [0; 8];
+            peer.read_exact(&mut header)?;
+            assert_eq!(header[0], 1);
+            let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
+            peer.read_exact(&mut vec![0; len])?;
+        }
+        Ok(())
+    })();
+    sender.send(Message::Shutdown).unwrap();
+    handle.join().unwrap().unwrap();
+    result.expect("all queued connections must finish setup without another accept edge");
+}
+
+#[test]
+fn randr_change_fanout_orders_screen_then_all_crtcs_then_all_outputs() {
+    use crate::server::ClientState;
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        io::Read,
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
+    };
+    use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
+
+    let mut state = ServerState::new();
+    let first = state.randr.outputs[0].clone();
+    let mut second = first.clone();
+    second.name = "HDMI-A-1".into();
+    second.output_id = first.output_id + 10;
+    second.crtc_id = first.crtc_id + 10;
+    state.randr.outputs.push(second.clone());
+
+    let (mut peer, writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    state.clients.insert(
+        7,
+        ClientState {
+            admission: crate::access::Admission::Internal,
+            writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(9)),
+            resource_id_base: 0,
+            resource_id_mask: 0,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
+            watching_writable: false,
+            write_failed: false,
+            gone: false,
+            focused_window: crate::resources::ROOT_WINDOW,
+            reader_control: None,
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+        },
+    );
+    state.randr_select_masks.insert(
+        (7, crate::resources::ROOT_WINDOW),
+        x11randr::NOTIFY_MASK_SCREEN_CHANGE
+            | x11randr::NOTIFY_MASK_CRTC_CHANGE
+            | x11randr::NOTIFY_MASK_OUTPUT_CHANGE,
+    );
+
+    emit_randr_connector_change_notifications(
+        &mut state,
+        &[(first.output_id, first.crtc_id, first.mode_id)],
+        &[(second.output_id, second.crtc_id, second.mode_id)],
+    );
+
+    let mut wire = [0; 96];
+    peer.read_exact(&mut wire).unwrap();
+    const RANDR_FIRST_EVENT: u8 = 89;
+    assert_eq!(wire[0] & 0x7f, RANDR_FIRST_EVENT);
+    assert_eq!(wire[32] & 0x7f, RANDR_FIRST_EVENT + 1);
+    assert_eq!(wire[33], x11randr::NOTIFY_CRTC_CHANGE);
+    assert_eq!(wire[64] & 0x7f, RANDR_FIRST_EVENT + 1);
+    assert_eq!(wire[65], x11randr::NOTIFY_OUTPUT_CHANGE);
+    assert_eq!(
+        u32::from_le_bytes(wire[44..48].try_into().unwrap()),
+        first.crtc_id
+    );
+    assert_eq!(
+        u32::from_le_bytes(wire[80..84].try_into().unwrap()),
+        second.output_id
+    );
+}
+
+/// The count cap alone was sized on an assumption of ~0.25 ms per
+/// request (`MAX_REQUESTS_PER_ITER`'s own doc comment). Measured on
+/// silence under MATE + adapta-nokto during a window drag, single
+/// requests reach 44-50 ms (`longest=op70:44.23ms`), so 32 of them
+/// is ~1.4 s in one iteration — during which host input and backend-fd
+/// readiness sit undelivered and the cursor visibly stalls (`gap_max`
+/// 225-360 ms). These pin the deadline half of the budget.
+#[test]
+fn budget_not_exhausted_when_both_count_and_time_remain() {
+    assert!(!budget_exhausted(31, Duration::from_millis(1)));
+}
+
+#[test]
+fn budget_exhausted_when_count_runs_out() {
+    assert!(budget_exhausted(0, Duration::from_millis(0)));
+}
+
+/// THE FIX: slow requests must stop the drain even with count left.
+#[test]
+fn budget_exhausted_when_deadline_passed_despite_count_remaining() {
+    assert!(budget_exhausted(31, REQUEST_TIME_BUDGET));
+    assert!(budget_exhausted(
+        31,
+        REQUEST_TIME_BUDGET + Duration::from_millis(40)
+    ));
+}
+
+/// One 44 ms request must not authorise 31 more. This is the
+/// 1.4 s-iteration case the count-only cap allowed.
+#[test]
+fn budget_stops_after_a_single_overrunning_request() {
+    let elapsed_after_one_slow_request = Duration::from_millis(44);
+    assert!(budget_exhausted(
+        MAX_REQUESTS_PER_ITER - 1,
+        elapsed_after_one_slow_request
+    ));
+}
+
+/// Forward progress: the budget is checked before each request with
+/// elapsed measured from the top of the iteration, so the first
+/// request of an iteration always runs. Without this the loop could
+/// livelock without draining anything.
+#[test]
+fn budget_permits_the_first_request_of_an_iteration() {
+    assert!(!budget_exhausted(MAX_REQUESTS_PER_ITER, Duration::ZERO));
+}
+
+/// The fast path must be unchanged: 32 × 0.25 ms = 8 ms, so a
+/// well-behaved burst still exhausts on count, not on time.
+#[test]
+fn typical_fast_requests_still_exhaust_on_count_first() {
+    let typical = Duration::from_micros(250);
+    let elapsed_at_cap = typical * u32::try_from(MAX_REQUESTS_PER_ITER).unwrap();
+    assert!(
+        elapsed_at_cap <= REQUEST_TIME_BUDGET,
+        "time budget must not bind before the count cap for ~0.25ms requests \
+             (elapsed_at_cap={elapsed_at_cap:?}, budget={REQUEST_TIME_BUDGET:?})"
+    );
+}
+
+#[test]
+fn export_holders_report_is_gated_paced_and_rechecks_after_change() {
+    let t0 = Instant::now();
+    let off = LoopTelemetry::default();
+    assert!(!off.export_holders_due(t0));
+    let mut on = LoopTelemetry {
+        enabled: true,
+        ..LoopTelemetry::default()
+    };
+    assert!(on.export_holders_due(t0));
+    on.note_export_holders(t0, true);
+    assert!(!on.export_holders_due(t0 + Duration::from_millis(999)));
+    assert!(on.export_holders_due(t0 + TELEMETRY_EMIT_INTERVAL));
+    assert_eq!(
+        on.export_holders_deadline(),
+        Some(t0 + TELEMETRY_EMIT_INTERVAL)
+    );
+    on.note_export_holders(t0 + TELEMETRY_EMIT_INTERVAL, false);
+    assert_eq!(on.export_holders_deadline(), None);
+}
+
+#[test]
+fn loop_telemetry_attributes_burst_depth_age_and_sequence_boundary() {
+    let client = yserver_protocol::x11::ClientId(17);
+    let other = yserver_protocol::x11::ClientId(23);
+    let mut telemetry = LoopTelemetry {
+        enabled: true,
+        ..LoopTelemetry::default()
+    };
+
+    telemetry.record_channel_drain(65_541, &HashMap::from([(client, 65_536), (other, 5)]));
+    telemetry.record_request_accepted(client, yserver_protocol::x11::SequenceNumber(0xffff));
+    telemetry.record_request_accepted(client, yserver_protocol::x11::SequenceNumber(0x0000));
+    telemetry.record_deferred_push(client);
+    telemetry.record_deferred_push(client);
+    telemetry.record_deferred_push(other);
+    telemetry.record_deferred_pop(client);
+    telemetry.record_request(
+        client,
+        133,
+        26,
+        Duration::from_micros(20),
+        Duration::from_millis(1_750),
+    );
+
+    assert_eq!(telemetry.channel_request_batch_max, 65_541);
+    assert_eq!(telemetry.channel_client_batch_max, (17, 65_536));
+    assert_eq!(telemetry.deferred_current, 2);
+    assert_eq!(telemetry.max_deferred_depth, 3);
+    let client_stats = &telemetry.clients[&client];
+    assert_eq!(client_stats.deferred_current, 1);
+    assert_eq!(client_stats.deferred_max, 2);
+    assert_eq!(client_stats.accepted, 2);
+    assert_eq!(client_stats.request_age_max, Duration::from_millis(1_750));
+    assert_eq!(client_stats.requests_by_opcode[&(133, Some(26))], 1);
+    assert_eq!(client_stats.sequence_ffff, 1);
+    assert_eq!(client_stats.sequence_zero, 1);
+}
+
+fn deferred_request(id: u32, opcode: u8) -> DeferredRequest {
+    DeferredRequest {
+        id: yserver_protocol::x11::ClientId(id),
+        sequence: yserver_protocol::x11::SequenceNumber(1),
+        accepted_at: None,
+        header: yserver_protocol::x11::RequestHeader {
+            opcode,
+            data: 0,
+            length_units: 1,
+        },
+        body: Vec::new(),
+        attached_fd: None,
+    }
+}
+
+#[test]
+fn server_grab_blocks_only_non_owner_requests() {
+    let mut state = ServerState::new();
+    state.server_grab_owner = Some(yserver_protocol::x11::ClientId(7));
+
+    assert!(!blocked_by_server_grab(&state, &deferred_request(7, 127)));
+    assert!(blocked_by_server_grab(&state, &deferred_request(8, 127)));
+    state.server_grab_owner = None;
+    assert!(!blocked_by_server_grab(&state, &deferred_request(8, 127)));
+}
+
+#[test]
+fn released_server_grab_waiters_join_round_robin_in_waiter_order() {
+    let mut deferred = FairRequestQueue::default();
+    deferred.push_back(deferred_request(9, 90));
+    let mut waiters = VecDeque::from([deferred_request(2, 20), deferred_request(3, 30)]);
+
+    release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
+
+    let mut order = Vec::new();
+    while let Some(req) = deferred.pop_front() {
+        order.push((req.id.0, req.header.opcode));
+    }
+    assert_eq!(order, [(9, 90), (2, 20), (3, 30)]);
+    assert!(waiters.is_empty());
+}
+
+#[test]
+fn released_server_grab_prefix_stays_ahead_of_same_client_suffix() {
+    let mut deferred = FairRequestQueue::default();
+    // Requests 16 and 17 were popped and parked while another client held
+    // GrabServer. Requests 18 and 19 were already the remaining suffix in
+    // the fair queue. The old release path appended the parked prefix and
+    // dispatched 18,19,16,17, corrupting Xlib/XCB sequence tracking.
+    deferred.push_back(deferred_request(66, 18));
+    deferred.push_back(deferred_request(66, 19));
+    deferred.push_back(deferred_request(12, 90));
+    let mut waiters = VecDeque::from([deferred_request(66, 16), deferred_request(66, 17)]);
+
+    release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
+
+    let mut client_66_order = Vec::new();
+    while let Some(req) = deferred.pop_front() {
+        if req.id.0 == 66 {
+            client_66_order.push(req.header.opcode);
+        }
+    }
+    assert_eq!(client_66_order, [16, 17, 18, 19]);
+    assert!(waiters.is_empty());
+}
+
+#[test]
+fn fair_queue_round_robins_clients_and_preserves_each_clients_order() {
+    let mut queue = FairRequestQueue::default();
+    queue.push_back(deferred_request(57, 1));
+    queue.push_back(deferred_request(57, 2));
+    queue.push_back(deferred_request(12, 10));
+    queue.push_back(deferred_request(57, 3));
+    queue.push_back(deferred_request(12, 11));
+
+    let mut order = Vec::new();
+    while let Some(req) = queue.pop_front() {
+        order.push((req.id.0, req.header.opcode));
+    }
+    assert_eq!(order, [(57, 1), (12, 10), (57, 2), (12, 11), (57, 3)]);
+    assert!(queue.is_empty());
+}
+
+#[test]
+fn pending_backend_request_blocks_only_its_clients_fifo() {
+    use yserver_protocol::x11::ClientByteOrder;
+
+    let blocked = yserver_protocol::x11::ClientId(57);
+    let other = yserver_protocol::x11::ClientId(12);
+    let token = CrtcConfigToken(91);
+    let mut pending = PendingBackendRequests::default();
+    pending
+        .park_crtc(ParkedCrtcConfig {
+            client_id: blocked,
+            sequence: yserver_protocol::x11::SequenceNumber(1),
+            continuation: PendingCrtcConfig {
+                token,
+                completion: crate::core_loop::process_request::CrtcConfigCompletion {
+                    output_id: 1,
+                    set_time: 0,
+                    output_bbox_before: None,
+                    byte_order: ClientByteOrder::LittleEndian,
+                    apply_transform: None,
+                    apply_rotation: None,
+                    reply: crate::core_loop::process_request::CrtcConfigReply::CrtcConfig,
+                },
+            },
+            request_wire_bytes: 28,
+        })
+        .unwrap();
+
+    let state = ServerState::new();
+    let mut queue = FairRequestQueue::default();
+    queue.push_back(deferred_request(blocked.0, 2));
+    queue.push_back(deferred_request(other.0, 10));
+    queue.push_back(deferred_request(blocked.0, 3));
+
+    let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+    assert!(
+        queue.pop_front_unblocked(&pending, &state).is_none(),
+        "later requests from the pending client must stay parked"
+    );
+    assert!(
+        !queue.has_runnable(&pending, &state),
+        "a blocked-only queue must not force a zero-timeout poll spin"
+    );
+
+    pending.take_crtc(token).unwrap();
+    let first = queue.pop_front_unblocked(&pending, &state).unwrap();
+    let second = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
+}
+
+/// A client suspended by SYNC Await (Xorg `IgnoreClient`) keeps its
+/// later requests queued in order while other clients run, the queue
+/// does not spin the poll on it, and resuming releases them in order.
+#[test]
+fn sync_await_suspends_only_the_awaiting_client() {
+    let awaiting = yserver_protocol::x11::ClientId(57);
+    let other = yserver_protocol::x11::ClientId(12);
+    let pending = PendingBackendRequests::default();
+    let mut state = ServerState::new();
+    state
+        .sync_awaits
+        .insert(awaiting.0, crate::server::SyncAwait::default());
+
+    let mut queue = FairRequestQueue::default();
+    queue.push_back(deferred_request(awaiting.0, 2));
+    queue.push_back(deferred_request(other.0, 10));
+    queue.push_back(deferred_request(awaiting.0, 3));
+
+    let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+    assert!(queue.pop_front_unblocked(&pending, &state).is_none());
+    assert!(!queue.has_runnable(&pending, &state));
+
+    state.sync_awaits.remove(&awaiting.0);
+    assert!(queue.has_runnable(&pending, &state));
+    let first = queue.pop_front_unblocked(&pending, &state).unwrap();
+    let second = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
+}
+
+/// A RECORD data connection whose stream write failed is no longer
+/// recording, but its pipelined requests must not run before the core
+/// loop disconnects it.
+#[test]
+fn failed_record_client_keeps_its_queued_requests_parked() {
+    let failed = yserver_protocol::x11::ClientId(57);
+    let other = yserver_protocol::x11::ClientId(12);
+    let pending = PendingBackendRequests::default();
+    let mut state = ServerState::new();
+    state.record.fail_recorder_for_test(failed);
+    assert!(!crate::core_loop::record::client_is_recording(
+        &state, failed
+    ));
+
+    let mut queue = FairRequestQueue::default();
+    queue.push_back(deferred_request(failed.0, 2));
+    queue.push_back(deferred_request(other.0, 10));
+
+    let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+    assert!(queue.pop_front_unblocked(&pending, &state).is_none());
+    assert!(!queue.has_runnable(&pending, &state));
+    assert_eq!(
+        crate::core_loop::record::take_failed_recorders(&mut state),
+        [failed]
+    );
+}
+
+/// A client a write failed on must not run its pipelined requests
+/// (GrabServer, SetCloseDownMode…) before the core loop disconnects
+/// it; other clients keep running.
+#[test]
+fn failed_writer_keeps_its_queued_requests_parked() {
+    let failed = yserver_protocol::x11::ClientId(57);
+    let other = yserver_protocol::x11::ClientId(12);
+    let pending = PendingBackendRequests::default();
+    let mut state = ServerState::new();
+    for id in [failed.0, other.0] {
+        let (a, _) = std::os::unix::net::UnixStream::pair().unwrap();
+        state.clients.insert(id, unix_client(a, id, 0));
+    }
+    state.clients.get_mut(&failed.0).unwrap().write_failed = true;
+
+    let mut queue = FairRequestQueue::default();
+    queue.push_back(deferred_request(failed.0, 2));
+    queue.push_back(deferred_request(other.0, 10));
+
+    let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
+    assert!(queue.pop_front_unblocked(&pending, &state).is_none());
+    assert!(!queue.has_runnable(&pending, &state));
+}
+
+#[test]
+fn ready_crtc_completion_replies_unblocks_and_returns_reader_credit() {
+    use crate::{backend::recording::RecordingBackend, server::ClientState};
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        io::Read,
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
+    };
+    use yserver_protocol::x11::{ClientByteOrder, ClientId, SequenceNumber};
+
+    let client_id = ClientId(57);
+    let token = CrtcConfigToken(92);
+    let (mut peer, writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let (control_tx, control_rx) = crossbeam_channel::unbounded();
+    let mut state = ServerState::new();
+    state.clients.insert(
+        client_id.0,
+        ClientState {
+            admission: crate::access::Admission::Internal,
+            writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: u32::MAX,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
+            watching_writable: false,
+            write_failed: false,
+            gone: false,
+            focused_window: crate::resources::ROOT_WINDOW,
+            reader_control: Some(control_tx),
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+        },
+    );
+
+    let completion = crate::core_loop::process_request::CrtcConfigCompletion {
+        output_id: state.randr.outputs[0].output_id,
+        set_time: 123,
+        output_bbox_before: enabled_output_bbox(&state),
+        byte_order: ClientByteOrder::LittleEndian,
+        apply_transform: None,
+        apply_rotation: None,
+        reply: crate::core_loop::process_request::CrtcConfigReply::CrtcConfig,
+    };
+    let continuation = PendingCrtcConfig {
+        token,
+        completion: completion.clone(),
+    };
+    let mut pending = PendingBackendRequests::default();
+    pending
+        .park_crtc(ParkedCrtcConfig {
+            client_id,
+            sequence: SequenceNumber(9),
+            continuation,
+            request_wire_bytes: 28,
+        })
+        .unwrap();
+    let mut backend = RecordingBackend::new();
+    backend.ready_crtc_configs.push(token);
+    backend.crtc_config_results.insert(token, Ok(false));
+    let mut xi_config_lane = XiConfigLane::default();
+
+    drain_ready_crtc_configs(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut xi_config_lane,
+        &mut ResetTrigger::new(ResetPolicy::NoReset),
+    );
+
+    let mut reply = [0_u8; 32];
+    peer.read_exact(&mut reply).unwrap();
+    assert_eq!((reply[0], reply[1]), (1, 0), "success reply, status=0");
+    assert!(!pending.client_is_blocked(client_id));
+    assert_eq!(backend.finished_crtc_configs, [token]);
+    assert!(backend.cancelled_crtc_configs.is_empty());
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(crate::server::ReaderControl::GrantRequestBytes(28))
+    ));
+
+    // Disconnecting a still-pending client cancels its backend token and
+    // never waits for the worker to finish.
+    let cancel_token = CrtcConfigToken(93);
+    pending
+        .park_crtc(ParkedCrtcConfig {
+            client_id,
+            sequence: SequenceNumber(10),
+            continuation: PendingCrtcConfig {
+                token: cancel_token,
+                completion,
+            },
+            request_wire_bytes: 28,
+        })
+        .unwrap();
+    let mut xi_config_lane = XiConfigLane::default();
+    disconnect_with_pending_cleanup(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut xi_config_lane,
+        &mut ResetTrigger::new(ResetPolicy::NoReset),
+        client_id,
+    );
+    assert_eq!(backend.cancelled_crtc_configs, [cancel_token]);
+    assert!(!state.clients.contains_key(&client_id.0));
+}
+
+/// A deferred DRI3 export parks its client like a CRTC configuration:
+/// later requests from that client wait, the ready token answers with one
+/// reply, returns the reader credit and releases the token; a disconnect
+/// while parked releases it too.
+#[test]
+fn deferred_dri3_export_parks_replies_once_and_releases_its_token() {
+    use crate::{
+        backend::{Dri3ExportToken, recording::RecordingBackend},
+        core_loop::process_request::{Dri3ExportOp, process_request},
+        resources::ROOT_WINDOW,
+    };
+    use std::{io::Read, os::unix::net::UnixStream};
+    use yserver_protocol::x11::{
+        ClientId, CreatePixmapRequest, RequestHeader, ResourceId, SequenceNumber,
+    };
+
+    let client_id = ClientId(57);
+    let other = ClientId(12);
+    let token = Dri3ExportToken(7);
+    let (mut peer, writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let (control_tx, control_rx) = crossbeam_channel::unbounded();
+    let mut state = ServerState::new();
+    let mut client = unix_client(writer, client_id.0, 0);
+    client.reader_control = Some(control_tx);
+    client.resource_id_base = 0;
+    client.resource_id_mask = u32::MAX;
+    state.clients.insert(client_id.0, client);
+    let pixmap = 0x1000;
+    state.resources.create_pixmap(
+        client_id,
+        CreatePixmapRequest {
+            depth: 24,
+            pixmap: ResourceId(pixmap),
+            drawable: ROOT_WINDOW,
+            width: 64,
+            height: 16,
+        },
+    );
+    assert!(state.resources.set_pixmap_host_xid(
+        ResourceId(pixmap),
+        crate::backend::PixmapHandle::from_raw(0xdead_cafe).unwrap(),
+    ));
+
+    let mut backend = RecordingBackend::new();
+    backend.pending_dri3_export = Some(token);
+    let outcome = process_request(
+        &mut state,
+        &mut backend,
+        client_id,
+        SequenceNumber(9),
+        RequestHeader {
+            opcode: 147,
+            data: 8,
+            length_units: 2,
+        },
+        &pixmap.to_le_bytes(),
+        None,
+    )
+    .unwrap();
+    let RequestOutcome::PendingDri3Export(continuation) = outcome else {
+        panic!("a scanned-out export must defer, got {outcome:?}");
+    };
+    assert_eq!(continuation.token, token);
+    assert_eq!(continuation.op, Dri3ExportOp::BuffersFromPixmap);
+    assert!(state.clients[&client_id.0].outbound.is_empty());
+
+    let mut pending = PendingBackendRequests::default();
+    pending
+        .park_dri3(ParkedDri3Export {
+            client_id,
+            sequence: SequenceNumber(9),
+            continuation,
+            request_wire_bytes: 8,
+        })
+        .unwrap();
+    let mut queue = FairRequestQueue::default();
+    queue.push_back(deferred_request(client_id.0, 2));
+    queue.push_back(deferred_request(other.0, 10));
+    let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!(runnable.id, other);
+    assert!(
+        queue.pop_front_unblocked(&pending, &state).is_none(),
+        "the parked client's later request must not dispatch"
+    );
+
+    let mut lane = XiConfigLane::default();
+    let mut reset = ResetTrigger::new(ResetPolicy::NoReset);
+    drain_ready_dri3_exports(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut lane,
+        &mut reset,
+    );
+    assert!(backend.finished_dri3_exports.is_empty(), "not ready yet");
+    assert!(pending.dri3_export_is_parked_for_test(client_id));
+
+    backend.ready_dri3_exports.push(token);
+    drain_ready_dri3_exports(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut lane,
+        &mut reset,
+    );
+    let mut reply = [0_u8; 32];
+    peer.read_exact(&mut reply).unwrap();
+    assert_eq!((reply[0], reply[1]), (1, 1), "a reply carrying one fd");
+    assert_eq!(u16::from_le_bytes([reply[2], reply[3]]), 9);
+    let extra = u32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]]) as usize * 4;
+    peer.read_exact(&mut vec![0; extra]).unwrap();
+    assert_eq!(backend.finished_dri3_exports, [token]);
+    assert_eq!(backend.released_dri3_exports, [token]);
+    assert!(!pending.client_is_blocked(client_id));
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(crate::server::ReaderControl::GrantRequestBytes(8))
+    ));
+    let next = queue.pop_front_unblocked(&pending, &state).unwrap();
+    assert_eq!((next.id, next.header.opcode), (client_id, 2));
+
+    // A failed deferred export answers BadPixmap and still frees the client.
+    let failed = Dri3ExportToken(9);
+    backend.failed_dri3_exports.push(failed);
+    pending
+        .park_dri3(ParkedDri3Export {
+            client_id,
+            sequence: SequenceNumber(10),
+            continuation: crate::core_loop::process_request::PendingDri3Export {
+                token: failed,
+                ..continuation
+            },
+            request_wire_bytes: 8,
+        })
+        .unwrap();
+    backend.ready_dri3_exports.push(failed);
+    drain_ready_dri3_exports(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut lane,
+        &mut reset,
+    );
+    peer.read_exact(&mut reply).unwrap();
+    assert_eq!(
+        (reply[0], reply[1]),
+        (0, yserver_protocol::x11::error::BAD_PIXMAP)
+    );
+    assert_eq!(backend.released_dri3_exports, [token, failed]);
+    assert!(!pending.client_is_blocked(client_id));
+    assert!(matches!(
+        control_rx.try_recv(),
+        Ok(crate::server::ReaderControl::GrantRequestBytes(8))
+    ));
+
+    let cancelled = Dri3ExportToken(8);
+    pending
+        .park_dri3(ParkedDri3Export {
+            client_id,
+            sequence: SequenceNumber(11),
+            continuation: crate::core_loop::process_request::PendingDri3Export {
+                token: cancelled,
+                ..continuation
+            },
+            request_wire_bytes: 8,
+        })
+        .unwrap();
+    disconnect_with_pending_cleanup(
+        &mut state,
+        &mut backend,
+        &mut pending,
+        &mut lane,
+        &mut reset,
+        client_id,
+    );
+    assert_eq!(backend.released_dri3_exports, [token, failed, cancelled]);
+    assert_eq!(backend.finished_dri3_exports, [token, failed]);
+    assert!(pending.is_empty());
+}
+
+/// The grab owner can be dropped by paths that carry no release check of
+/// their own — `process_disconnect` runs at two sites outside the message
+/// loop (a failed outbound write, and the writable-interest reconcile).
+/// The loop therefore re-checks once per iteration. This pins the state
+/// that made that necessary: waiters parked while `deferred_requests` is
+/// EMPTY, because the poll timeout keys off `deferred_requests` alone, so
+/// a waiter left in the side queue would strand its client until
+/// unrelated traffic happened to wake the loop.
+#[test]
+fn owner_disconnect_outside_the_message_loop_still_frees_waiters() {
+    let mut state = ServerState::new();
+    state.server_grab_owner = Some(yserver_protocol::x11::ClientId(1));
+    let mut deferred = FairRequestQueue::default();
+    let mut waiters = VecDeque::from([deferred_request(2, 20)]);
+
+    // While the grab is held, a waiter must stay parked.
+    if state.server_grab_owner.is_none() {
+        release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
+    }
+    assert_eq!(waiters.len(), 1, "grab still held: waiter stays parked");
+    assert!(deferred.is_empty(), "nothing runnable while grabbed");
+
+    // Owner reaped by a path with no release check of its own (this is
+    // what process_disconnect does at run.rs' two non-message sites).
+    state.server_grab_owner = None;
+
+    // The per-iteration re-check must pick it up on its own.
+    if state.server_grab_owner.is_none() {
+        release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
+    }
+    assert!(waiters.is_empty(), "released grab must free its waiters");
+    assert_eq!(deferred.pop_front().map(|r| r.id.0), Some(2));
+    assert!(deferred.is_empty());
+}
+use crate::{
+    backend::recording::RecordingBackend,
+    core_loop::sender::channel,
+    server::{ScreenSaverActive, ServerState},
+};
+use std::time::Duration;
+
+/// I5 test: `reconcile_client_writable_interest` toggles a client's
+/// `watching_writable` flag in lock-step with `outbound`'s emptiness,
+/// and is a no-op when nothing changed. Tests against a real
+/// `mio::Registry` so the reregister error path is also exercised.
+#[test]
+fn reconcile_writable_interest_tracks_outbound_state() {
+    use crate::server::ClientState;
+    use mio::{Interest, Poll, unix::SourceFd};
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        io::{Read, Write},
+        os::{fd::AsRawFd, unix::net::UnixStream},
+        sync::{Arc, Mutex, atomic::AtomicU16},
+    };
+    use yserver_protocol::x11::{ClientByteOrder, ClientId as Cid};
+
+    let poll = Poll::new().unwrap();
+    // We just need a real fd registered with the poller.
+    let (mut peer, writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let writer_arc = Arc::new(Mutex::new(crate::transport::Transport::Unix(writer)));
+    let raw = writer_arc.lock().unwrap().as_raw_fd();
+    let token = client_token(Cid(7));
+    poll.registry()
+        .register(&mut SourceFd(&raw), token, Interest::READABLE)
+        .unwrap();
+
+    let mut state = ServerState::new();
+    state.clients.insert(
+        7,
+        ClientState {
+            admission: crate::access::Admission::Internal,
+            writer: writer_arc,
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: 0,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
+            watching_writable: false,
+            write_failed: false,
+            gone: false,
+            focused_window: crate::resources::ROOT_WINDOW,
+            reader_control: None,
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+        },
+    );
+
+    // outbound is empty, watching_writable is false → no-op.
+    let disc = reconcile_client_writable_interest(poll.registry(), &mut state);
+    assert!(disc.is_empty());
+    assert!(!state.clients[&7].watching_writable);
+
+    // Outbound becomes non-empty AND the peer doesn't read → reconcile's
+    // proactive drain attempt cannot empty it, so watching_writable
+    // flips on.
+    //
+    // Fill the kernel buffer first so any drain attempt returns
+    // WouldBlock instead of writing through to `peer`.
+    //
+    // Fill until the kernel actually reports WouldBlock rather than
+    // writing one fixed-size buffer: the capacity is a tunable the
+    // test cannot assume. On the Linux box this was reported from,
+    // `net.core.wmem_default` was the stock 212992 (~228 KiB
+    // absorbed), so a single 256 KiB write cleared it by only ~11%
+    // and was swallowed whole where that sysctl had been raised;
+    // other platforms size it differently again. The drain
+    // inside reconcile then succeeded, `outbound` emptied, and
+    // `watching_writable` never flipped on — #107.
+    //
+    // SO_SNDBUF is also raised, best-effort, so a machine with the
+    // stock sysctl still exercises the large-buffer case. It is only
+    // an amplifier: the kernel may clamp it (Linux) or refuse it
+    // (FreeBSD ENOBUFS), and the loop below is correct either way,
+    // so the result is deliberately not asserted on.
+    unsafe {
+        let sz: libc::c_int = 512 * 1024;
+        libc::setsockopt(
+            raw,
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            std::ptr::addr_of!(sz).cast(),
+            u32::try_from(std::mem::size_of::<libc::c_int>()).unwrap(),
+        );
+    }
+    let chunk = vec![0xABu8; 64 * 1024];
+    let mut filled = false;
+    // Bounded so a kernel that never reports WouldBlock fails the
+    // assertion below instead of spinning.
+    for _ in 0..1024 {
+        match state.clients[&7].writer.lock().unwrap().write(&chunk) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                filled = true;
+                break;
+            }
+            // Anything else (EPIPE, EINTR…) is a broken fixture, not
+            // a full buffer — surface it rather than folding it into
+            // the generic "never reported WouldBlock" failure.
+            Err(err) => panic!("unexpected error filling the send buffer: {err}"),
+        }
+    }
+    assert!(filled, "kernel send buffer never reported WouldBlock");
+    state
+        .clients
+        .get_mut(&7)
+        .unwrap()
+        .outbound
+        .extend([1u8, 2, 3]);
+    let disc = reconcile_client_writable_interest(poll.registry(), &mut state);
+    assert!(disc.is_empty());
+    assert!(state.clients[&7].watching_writable);
+
+    // Peer drains → kernel buffer empties → drain succeeds inside reconcile,
+    // outbound goes empty, watching_writable flips off.
+    //
+    // Read until WouldBlock for the same reason the fill loops: one
+    // read of a fixed size is not guaranteed to empty the queue, and
+    // leftover bytes would make reconcile's drain block again and
+    // leave `outbound` non-empty.
+    let mut sink = vec![0u8; 64 * 1024];
+    peer.set_nonblocking(true).unwrap();
+    loop {
+        match peer.read(&mut sink) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => panic!("unexpected error draining the peer: {err}"),
+        }
+    }
+    let disc = reconcile_client_writable_interest(poll.registry(), &mut state);
+    assert!(disc.is_empty());
+    assert!(state.clients[&7].outbound.is_empty());
+    assert!(!state.clients[&7].watching_writable);
+
+    drop(peer);
+}
+
+/// A client's writer fd is in the poller only while output waits for
+/// room: starting unregistered, reconcile registers it WRITABLE when
+/// output queues on a full socket, the drain's WRITABLE edge arrives,
+/// reconcile deregisters it, and bytes the client sends wake nothing.
+#[test]
+fn reconcile_registers_an_unregistered_writer_only_while_output_waits() {
+    use crate::server::ClientState;
+    use mio::{Events, Poll};
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        sync::{Arc, Mutex, atomic::AtomicU16},
+    };
+    use yserver_protocol::x11::{ClientByteOrder, ClientId as Cid};
+
+    // Whether a poll of `timeout` reports `token` at all, and writable.
+    fn woke(poll: &mut Poll, token: mio::Token, timeout: Duration) -> (bool, bool) {
+        let mut events = Events::with_capacity(8);
+        poll.poll(&mut events, Some(timeout)).unwrap();
+        let mut seen = (false, false);
+        for ev in events.iter().filter(|ev| ev.token() == token) {
+            seen.0 = true;
+            seen.1 |= ev.is_writable();
+        }
+        seen
+    }
+
+    let mut poll = Poll::new().unwrap();
+    let (mut peer, writer) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    peer.set_nonblocking(true).unwrap();
+    let writer_arc = Arc::new(Mutex::new(crate::transport::Transport::Unix(writer)));
+    let token = client_token(Cid(7));
+
+    let mut state = ServerState::new();
+    state.clients.insert(
+        7,
+        ClientState {
+            admission: crate::access::Admission::Internal,
+            writer: writer_arc,
+            byte_order: ClientByteOrder::LittleEndian,
+            last_sequence: Arc::new(AtomicU16::new(0)),
+            resource_id_base: 0,
+            resource_id_mask: 0,
+            event_masks: HashMap::new(),
+            save_set: HashSet::new(),
+            big_requests_enabled: false,
+            xi2_masks: HashMap::new(),
+            xi1_event_classes: HashSet::new(),
+            xi1_window_event_classes: HashMap::new(),
+            outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
+            watching_writable: false,
+            write_failed: false,
+            gone: false,
+            focused_window: crate::resources::ROOT_WINDOW,
+            reader_control: None,
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+        },
+    );
+
+    // Unregistered and idle: the client's bytes wake nothing.
+    peer.write_all(&[0x55; 32]).unwrap();
+    assert_eq!(
+        woke(&mut poll, token, Duration::from_millis(50)),
+        (false, false)
+    );
+
+    // Fill the send buffer until WouldBlock (see the test above for why
+    // a fixed-size write is not enough), then queue output.
+    let chunk = vec![0xABu8; 64 * 1024];
+    let mut filled = false;
+    for _ in 0..1024 {
+        match state.clients[&7].writer.lock().unwrap().write(&chunk) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                filled = true;
+                break;
+            }
+            Err(err) => panic!("unexpected error filling the send buffer: {err}"),
+        }
+    }
+    assert!(filled, "kernel send buffer never reported WouldBlock");
+    state
+        .clients
+        .get_mut(&7)
+        .unwrap()
+        .outbound
+        .extend([1u8, 2, 3]);
+
+    // Reconcile takes the register path, not the AlreadyExists fallback.
+    let disc = reconcile_client_writable_interest(poll.registry(), &mut state);
+    assert!(disc.is_empty());
+    assert!(state.clients[&7].watching_writable);
+
+    // Registered WRITABLE on a full socket: the client's bytes still
+    // wake nothing.
+    peer.write_all(&[0x55; 32]).unwrap();
+    assert_eq!(
+        woke(&mut poll, token, Duration::from_millis(50)),
+        (false, false)
+    );
+
+    // The peer drains: the WRITABLE edge arrives.
+    let mut sink = vec![0u8; 64 * 1024];
+    loop {
+        match peer.read(&mut sink) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => panic!("unexpected error draining the peer: {err}"),
+        }
+    }
+    assert_eq!(woke(&mut poll, token, Duration::from_secs(1)), (true, true));
+
+    // Reconcile drains outbound and deregisters the fd.
+    let disc = reconcile_client_writable_interest(poll.registry(), &mut state);
+    assert!(disc.is_empty());
+    assert!(state.clients[&7].outbound.is_empty());
+    assert!(!state.clients[&7].watching_writable);
+    // epoll reports a second deregister as NotFound; kqueue's deregister
+    // in mio ignores ENOENT, so this check is Linux-only.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::fd::AsRawFd;
+        let raw = state.clients[&7].writer.lock().unwrap().as_raw_fd();
+        let err = poll
+            .registry()
+            .deregister(&mut mio::unix::SourceFd(&raw))
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // Deregistered: neither the client's bytes nor a writable socket
+    // wake anything.
+    peer.write_all(&[0x55; 32]).unwrap();
+    assert_eq!(
+        woke(&mut poll, token, Duration::from_millis(50)),
+        (false, false)
+    );
+}
+
+/// Multi-device regression: two DRM fds of the same kind must get
+/// distinct poll tokens, and readiness on the second fd must carry
+/// that exact fd through `Backend::on_page_flip_ready`.
+#[test]
+fn drm_readiness_routes_to_the_exact_backend_fd() {
+    use crate::backend::{BackendFdKind, recording::RecordingBackend};
+    use std::{io::Write, os::fd::AsRawFd};
+
+    let (poll, sender, rx) = channel().unwrap();
+    let sender_for_core = sender.clone_handle();
+    let (drm_reader_a, _drm_writer_a) = UnixStream::pair().unwrap();
+    let (drm_reader_b, mut drm_writer_b) = UnixStream::pair().unwrap();
+    let drm_fd_a = drm_reader_a.as_raw_fd();
+    let drm_fd_b = drm_reader_b.as_raw_fd();
+    let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
+    let mut backend = RecordingBackend::new().with_poll_sources(
+        vec![
+            (drm_fd_a, BackendFdKind::Drm),
+            (drm_fd_b, BackendFdKind::Drm),
+        ],
+        ready_tx,
+    );
+    let handle = std::thread::spawn(move || {
+        // `RecordingBackend` intentionally stores only raw fds; keep
+        // their owners alive for the duration of the core loop.
+        let _drm_readers = (drm_reader_a, drm_reader_b);
+        let mut state = ServerState::new();
+        let alloc = ClientIdAllocator::new();
+        let result = run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            None,
+            &alloc,
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        );
+        (result, backend)
+    });
+
+    drm_writer_b.write_all(&[1]).unwrap();
+    assert_eq!(
+        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        drm_fd_b,
+        "readiness from the second DRM source must retain its fd identity"
+    );
+    sender.send(Message::Shutdown).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished(), "run_core did not return");
+    let (result, backend) = handle.join().unwrap();
+    result.unwrap();
+    let dispatched_fds = backend.page_flip_fds.lock().unwrap();
+    assert!(
+        !dispatched_fds.is_empty(),
+        "the readable DRM source must be dispatched"
+    );
+    assert!(
+        dispatched_fds.iter().all(|fd| *fd == drm_fd_b),
+        "idle DRM fd {drm_fd_a} was dispatched: {dispatched_fds:?}",
+    );
+}
+
+/// A fake XDMCP manager on loopback, for the two loop-level tests
+/// below. The service-level behaviour is covered in `core_loop::xdmcp`;
+/// what these prove is the *plumbing* — the UDP socket really is in
+/// this poll set, its readiness really is dispatched, and the reset
+/// hook really runs after the new generation is installed.
+#[cfg(feature = "xdmcp")]
+struct XdmcpManagerFixture {
+    socket: std::net::UdpSocket,
+}
+
+#[cfg(feature = "xdmcp")]
+impl XdmcpManagerFixture {
+    fn new() -> Self {
+        let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        Self { socket }
+    }
+
+    fn service(&self, once: bool) -> XdmcpService {
+        use crate::core_loop::xdmcp::{XdmcpMode, XdmcpSetup};
+        XdmcpService::bind(&XdmcpSetup {
+            mode: XdmcpMode::Query("127.0.0.1".into()),
+            port: self.socket.local_addr().unwrap().port(),
+            from: Some("127.0.0.1".into()),
+            class: None,
+            display_id: None,
+            once,
+            display_number: 7,
+        })
+        .unwrap()
+    }
+
+    fn expect(&self, what: &str) -> (yserver_protocol::xdmcp::XdmcpMessage, std::net::SocketAddr) {
+        let mut buf = [0_u8; 8192];
+        let (len, from) = self
+            .socket
+            .recv_from(&mut buf)
+            .unwrap_or_else(|e| panic!("no {what} from the display: {e}"));
+        (
+            yserver_protocol::xdmcp::decode_message(&buf[..len]).unwrap(),
+            from,
+        )
+    }
+
+    fn send(&self, to: std::net::SocketAddr, message: &yserver_protocol::xdmcp::XdmcpMessage) {
+        let packet = yserver_protocol::xdmcp::encode_message(message).unwrap();
+        self.socket.send_to(&packet, to).unwrap();
+    }
+}
+
+/// The socket is registered with the core poller, its readiness is
+/// dispatched, and a reset re-queries — from the loop, not from a
+/// hand-driven service.
+#[cfg(feature = "xdmcp")]
+#[test]
+fn the_xdmcp_socket_is_polled_and_a_reset_re_queries() {
+    use crate::backend::recording::RecordingBackend;
+    use yserver_protocol::xdmcp::XdmcpMessage;
+
+    let manager = XdmcpManagerFixture::new();
+    let service = manager.service(false);
+    let (poll, sender, rx) = channel().unwrap();
+    let sender_for_core = sender.clone_handle();
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let alloc = ClientIdAllocator::new();
+        run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            None,
+            &alloc,
+            AuthState::new_with_xdmcp(None, true),
+            ResetPolicy::Reset,
+            Some(service),
+        )
+    });
+
+    let (query, display) = manager.expect("the startup Query");
+    assert!(matches!(query, XdmcpMessage::Query { .. }), "{query:?}");
+
+    manager.send(
+        display,
+        &XdmcpMessage::Willing {
+            authentication_name: Vec::new(),
+            hostname: b"fake-dm".to_vec(),
+            status: b"willing".to_vec(),
+        },
+    );
+    let (request, _) = manager.expect("a Request");
+    assert!(
+        matches!(request, XdmcpMessage::Request { .. }),
+        "the loop did not dispatch the socket's readiness: {request:?}"
+    );
+
+    // A forced reset (the SIGHUP path) crosses the boundary; the XDMCP
+    // hook then re-queries on the NEW generation.
+    sender.send(Message::ResetRequested).unwrap();
+    let (requery, _) = manager.expect("a re-query after the reset");
+    assert!(matches!(requery, XdmcpMessage::Query { .. }), "{requery:?}");
+
+    sender.send(Message::Shutdown).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished(), "run_core did not return");
+    handle.join().unwrap().unwrap();
+}
+
+/// A `Terminate` from the machine ends the loop cleanly — the other
+/// half of the outcome wiring. `Failed` gets there in three packets
+/// instead of the 126 seconds a retransmission timeout would take.
+#[cfg(feature = "xdmcp")]
+#[test]
+fn an_xdmcp_terminate_ends_the_core_loop() {
+    use crate::backend::recording::RecordingBackend;
+    use yserver_protocol::xdmcp::{MIT_MAGIC_COOKIE_1, XdmcpMessage};
+
+    let manager = XdmcpManagerFixture::new();
+    let service = manager.service(false);
+    let (poll, sender, rx) = channel().unwrap();
+    let sender_for_core = sender.clone_handle();
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let alloc = ClientIdAllocator::new();
+        run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            None,
+            &alloc,
+            AuthState::new_with_xdmcp(None, true),
+            ResetPolicy::Reset,
+            Some(service),
+        )
+    });
+
+    let (_, display) = manager.expect("the startup Query");
+    manager.send(
+        display,
+        &XdmcpMessage::Willing {
+            authentication_name: Vec::new(),
+            hostname: b"fake-dm".to_vec(),
+            status: b"willing".to_vec(),
+        },
+    );
+    let _ = manager.expect("a Request");
+    manager.send(
+        display,
+        &XdmcpMessage::Accept {
+            session_id: 0x1234,
+            authentication_name: Vec::new(),
+            authentication_data: Vec::new(),
+            authorization_name: MIT_MAGIC_COOKIE_1.to_vec(),
+            authorization_data: b"cookie".to_vec(),
+        },
+    );
+    let _ = manager.expect("a Manage");
+    manager.send(
+        display,
+        &XdmcpMessage::Failed {
+            session_id: 0x1234,
+            status: b"no session for you".to_vec(),
+        },
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        handle.is_finished(),
+        "a fatal XDMCP packet did not stop the loop"
+    );
+    handle.join().unwrap().unwrap();
+    drop(sender);
+}
+/// A setup that lost the `Refuse` race is dropped as orphaned — and
+/// that drop must not start a generation.
+///
+/// `AuthState` is atomic per call, but a setup thread that already
+/// passed `check` is past that point: a `Refuse` can clear the
+/// session cookie while the thread is one instruction from sending
+/// its `ClientSetupComplete`. `XdmcpService::note_client_established`
+/// reports that loser and the loop disconnects it. Under XDMCP the
+/// policy is an implied `-reset`, so if the completion had armed the
+/// reset trigger, the orphan's *own* disconnect would drain an armed
+/// client set and cross the generation boundary — tearing down the
+/// negotiation that is at that very moment retrying its `Request`.
+///
+/// Arming therefore belongs to the caller, after XDMCP admission has
+/// decided. What this pins is that decision order: the orphan goes
+/// away, the generation does not move, and the manager's outstanding
+/// offer is undisturbed. The injected message stands in for the
+/// racing setup thread exactly as it reaches the loop — a **remote**
+/// client, because the orphan rule deliberately spares local ones
+/// (Xorg's `XdmcpOpenDisplay` ignores a unix client, which the XDMCP
+/// cookie never authorized).
+/// `is_local` is an ADDRESS property. A TCP peer on this machine is a
+/// local client — Xorg's `xtransLocalClient` says so — and therefore
+/// keeps MIT-SHM, whose legacy `Attach` passes a SysV shmid rather
+/// than a descriptor and so works fine without fd passing.
+///
+/// Deriving it from the transport instead, as this did until
+/// 2026-09-10, refused shared memory to a same-machine XDMCP session
+/// (`DISPLAY=127.0.0.1:1`) and pushed every image over the wire.
+#[test]
+fn a_tcp_peer_on_this_machine_is_a_local_client() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    assert!(
+        address_is_ours(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        "127.0.0.1 is ours"
+    );
+    assert!(
+        address_is_ours(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
+        "the whole loopback range is ours, not just 127.0.0.1"
+    );
+    // TEST-NET-3 (RFC 5737): reserved for documentation, so it cannot
+    // be a real interface address on the machine running this test.
+    assert!(
+        !address_is_ours(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
+        "a documentation-range address is not ours"
+    );
+    assert!(
+        address_is_ours(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        "::1 is ours"
+    );
+    // 2001:db8::/32 (RFC 3849) is the IPv6 documentation prefix.
+    assert!(
+        !address_is_ours(IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))),
+        "a documentation-range IPv6 address is not ours"
+    );
+}
+
+#[cfg(feature = "xdmcp")]
+#[test]
+fn an_orphaned_xdmcp_client_does_not_reset_the_generation() {
+    use crate::backend::recording::RecordingBackend;
+    use std::io::Read;
+    use yserver_protocol::{
+        x11::ClientByteOrder,
+        xdmcp::{MIT_MAGIC_COOKIE_1, XdmcpMessage, decode_message},
+    };
+
+    /// How long the "no reset happened" assertions watch for. The
+    /// XDMCP retransmit floor is `XDM_MIN_RTX` = 2 s, so nothing the
+    /// healthy machine does can land inside this window; a reset's
+    /// re-query would land immediately.
+    const QUIET: Duration = Duration::from_millis(400);
+    const SESSION: u32 = 0x1234;
+
+    let manager = XdmcpManagerFixture::new();
+    let service = manager.service(false);
+    let (poll, sender, rx) = channel().unwrap();
+    // The generation is read from the counter, not inferred from
+    // timing: the boundary bumps it and nothing else in the loop
+    // does.
+    let generations = rx.generation_counter();
+    let sender_for_core = sender.clone_handle();
+    let client_ids = std::sync::Arc::new(ClientIdAllocator::new());
+    let client_ids_for_core = client_ids.clone();
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            None,
+            &client_ids_for_core,
+            AuthState::new_with_xdmcp(None, true),
+            ResetPolicy::Reset,
+            Some(service),
+        )
+    });
+
+    let start_generation = generations.current();
+
+    // Query -> Willing -> Request -> Accept installs the session
+    // cookie, and the machine answers with Manage.
+    let (query, display) = manager.expect("the startup Query");
+    assert!(matches!(query, XdmcpMessage::Query { .. }), "{query:?}");
+    manager.send(
+        display,
+        &XdmcpMessage::Willing {
+            authentication_name: Vec::new(),
+            hostname: b"fake-dm".to_vec(),
+            status: b"willing".to_vec(),
+        },
+    );
+    let (request, _) = manager.expect("a Request");
+    assert!(
+        matches!(request, XdmcpMessage::Request { .. }),
+        "{request:?}"
+    );
+    manager.send(
+        display,
+        &XdmcpMessage::Accept {
+            session_id: SESSION,
+            authentication_name: Vec::new(),
+            authentication_data: Vec::new(),
+            authorization_name: MIT_MAGIC_COOKIE_1.to_vec(),
+            authorization_data: b"cookie".to_vec(),
+        },
+    );
+    let (manage, _) = manager.expect("a Manage");
+    assert!(matches!(manage, XdmcpMessage::Manage { .. }), "{manage:?}");
+
+    // The Refuse clears the cookie and sends the machine back round
+    // to Request. Reading that retry is the synchronisation point:
+    // it cannot be on the wire until the Refuse has been fully
+    // applied, so the injection below is unambiguously *after* the
+    // clear. No generation change — the offer is being retried, not
+    // abandoned.
+    manager.send(
+        display,
+        &XdmcpMessage::Refuse {
+            session_id: SESSION,
+        },
+    );
+    let (retry, _) = manager.expect("the Request retry after the Refuse");
+    assert!(
+        matches!(retry, XdmcpMessage::Request { .. }),
+        "a Refuse must resend the Request, got {retry:?}"
+    );
+    assert_eq!(
+        generations.current(),
+        start_generation,
+        "a Refuse retries the offer; it does not cross a boundary"
+    );
+
+    // The racing setup thread's completion, arriving now.
+    let orphan = client_ids.allocate();
+    let (core_side, mut peer) = UnixStream::pair().expect("socketpair");
+    peer.set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let stale = sender.bind();
+    stale
+        .send(Message::ClientSetupComplete {
+            id: orphan,
+            generation: stale.generation(),
+            stream: Transport::Unix(core_side),
+            resource_id_base: 0x0020_0000,
+            resource_id_mask: 0x000F_FFFF,
+            byte_order: ClientByteOrder::LittleEndian,
+            // Remote: only a TCP client can have been authorized by
+            // the session credential the Refuse just revoked.
+            is_local: false,
+            fd_passing: false,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+            admission: crate::access::Admission::Internal,
+            setup_reply: Vec::new(),
+        })
+        .expect("send the racing completion");
+
+    // 1. The orphan is dropped. `process_disconnect` shuts the
+    //    socket down on both sides, so this is EOF, not a timeout.
+    let mut sink = [0_u8; 1];
+    match peer.read(&mut sink) {
+        Ok(0) => {}
+        other => panic!("a client with no session must be disconnected; read {other:?}"),
+    }
+
+    // Watch the manager socket for a while before judging anything.
+    // The boundary is crossed at the *end* of the iteration the
+    // disconnect ran in, so EOF above races the bump by microseconds
+    // — this window is what makes the two assertions below decisive
+    // rather than a coin flip. Collect only; asserting inside the
+    // loop would let the re-query fire first and hide which of the
+    // two actually broke.
+    manager
+        .socket
+        .set_read_timeout(Some(QUIET))
+        .expect("quiet-window timeout");
+    let mut buf = [0_u8; 8192];
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + QUIET;
+    while Instant::now() < deadline {
+        let len = match manager.socket.recv_from(&mut buf) {
+            Ok((len, _)) => len,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(err) => panic!("unexpected error reading the manager socket: {err}"),
+        };
+        seen.push(decode_message(&buf[..len]).expect("decode"));
+    }
+
+    // 2. The regression itself.
+    assert_eq!(
+        generations.current(),
+        start_generation,
+        "an orphaned client never became established; its disconnect must not \
+             drain an armed session and start a new generation"
+    );
+
+    // 3. And the negotiation carried on untouched: the retry read
+    //    above is the manager's Request, and no Query followed it —
+    //    a Query is what a reset's re-query looks like.
+    assert!(
+        !seen
+            .iter()
+            .any(|message| matches!(message, XdmcpMessage::Query { .. })),
+        "the display re-queried mid-negotiation: {seen:?}"
+    );
+
+    sender.send(Message::Shutdown).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished(), "run_core did not return");
+    handle.join().unwrap().unwrap();
+}
+
+#[test]
+fn copied_scanout_completion_fd_dispatches_dedicated_hook() {
+    use crate::backend::{BackendFdKind, recording::RecordingBackend};
+    use std::{io::Write, os::fd::AsRawFd, sync::atomic::Ordering};
+
+    let (poll, sender, rx) = channel().unwrap();
+    let sender_for_core = sender.clone_handle();
+    let (completion_reader, mut completion_writer) = UnixStream::pair().unwrap();
+    let completion_fd = completion_reader.as_raw_fd();
+    let (unused_page_tx, _unused_page_rx) = crossbeam_channel::unbounded();
+    let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
+    let mut backend = RecordingBackend::new()
+        .with_poll_sources(
+            vec![(completion_fd, BackendFdKind::ScanoutRenderCompletion)],
+            unused_page_tx,
+        )
+        .with_scanout_render_completion_notification(ready_tx);
+    let handle = std::thread::spawn(move || {
+        // `RecordingBackend` stores only the raw fd, so retain its owner
+        // until `run_core` has unregistered every backend source.
+        let _completion_reader = completion_reader;
+        let mut state = ServerState::new();
+        let alloc = ClientIdAllocator::new();
+        let result = run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            None,
+            &alloc,
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        );
+        (result, backend)
+    });
+
+    completion_writer.write_all(&[1]).unwrap();
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    sender.send(Message::Shutdown).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished(), "run_core did not return");
+    let (result, backend) = handle.join().unwrap();
+    result.unwrap();
+    assert!(
+        backend
+            .scanout_render_completion_count
+            .load(Ordering::Relaxed)
+            >= 1,
+        "readiness must dispatch the copied-scanout completion hook"
+    );
+    assert_eq!(
+        backend.page_flip_count.load(Ordering::Relaxed),
+        0,
+        "copied-scanout readiness must not be misrouted as a DRM page flip"
+    );
+}
+
+/// Regression (project_reclamation_starvation_leak): the core loop
+/// must drive backend GPU-resource reclamation (`before_block`) every
+/// iteration, INDEPENDENT of page-flips. The KMS v2 backend reaped
+/// per-op command buffers only from `on_page_flip_ready`; while the
+/// display was dark (DPMS-off / standby / VT-away) no flips occurred,
+/// so a client that kept drawing grew the engine `submitted` queue
+/// without bound until the GPU lost its device. Here we run the loop
+/// with ZERO DRM readiness events and assert `before_block` still
+/// fired — i.e. reclamation rides the dispatch loop, not scanout.
+#[test]
+fn before_block_runs_without_any_page_flip() {
+    use crate::backend::recording::RecordingBackend;
+    use std::sync::atomic::Ordering;
+
+    let (poll, sender, rx) = channel().unwrap();
+    let sender_for_core = sender.clone_handle();
+    let mut backend = RecordingBackend::new();
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let alloc = ClientIdAllocator::new();
+        let result = run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            None,
+            &alloc,
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        );
+        (result, backend)
+    });
+    // No DRM readiness — only a Shutdown. The loop must still run at
+    // least one iteration, calling before_block before it blocks.
+    sender.send(Message::Shutdown).unwrap();
+    // Generous deadline so a slow/loaded CI box can't spuriously fail:
+    // the loop breaks the instant the thread finishes, so this only
+    // bounds the pathological-hang case.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished(), "run_core did not return");
+    let (result, backend) = handle.join().unwrap();
+    result.unwrap();
+    assert_eq!(
+        backend.page_flip_count.load(Ordering::Relaxed),
+        0,
+        "test must exercise the no-page-flip path",
+    );
+    assert!(
+        backend.before_block_count.load(Ordering::Relaxed) >= 1,
+        "before_block must run each iteration even with no page-flips \
+             (reclamation must not be gated on scanout)",
+    );
+}
+
+/// `handle_host_input` arms the auto-repeat timer on a real
+/// KeyPress, replaces it on a different KeyPress, and clears it
+/// on the matching KeyRelease. Regression coverage for backend-owned input
+/// dispatch paths that must not call `backend.on_host_input` directly,
+/// bypassing this wrapper.
+#[test]
+fn handle_host_input_arms_repeat_state() {
+    use crate::{backend::recording::RecordingBackend, host_x11::HostKeyEvent};
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+
+    let key = |keycode: u8, pressed: bool| {
+        HostInputEvent::Key(HostKeyEvent {
+            origin: crate::core_loop::InputOrigin::NestedHost,
+            pressed,
+            keycode,
+            time: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            state: 0,
+        })
+    };
+
+    // Press A → armed on A.
+    handle_host_input(&mut state, &mut backend, key(38, true));
+    let armed = state
+        .key_repeats
+        .get(&crate::core_loop::InputOrigin::NestedHost)
+        .expect("press should arm repeat state for NestedHost");
+    assert_eq!(armed.event.keycode, 38);
+    assert!(armed.event.pressed);
+
+    // Press B (different keycode) → replaces armed key.
+    handle_host_input(&mut state, &mut backend, key(39, true));
+    let armed = state
+        .key_repeats
+        .get(&crate::core_loop::InputOrigin::NestedHost)
+        .expect("second press should replace the same origin's repeat");
+    assert_eq!(armed.event.keycode, 39);
+
+    // Release A while B is armed → ignored (only the armed key's
+    // release clears).
+    handle_host_input(&mut state, &mut backend, key(38, false));
+    assert!(
+        state
+            .key_repeats
+            .contains_key(&crate::core_loop::InputOrigin::NestedHost),
+        "release of non-armed key must not clear",
+    );
+
+    // Release B → clears.
+    handle_host_input(&mut state, &mut backend, key(39, false));
+    assert!(state.key_repeats.is_empty());
+}
+
+/// `fire_pending_repeats` returns `false` on the every-iteration "armed but
+/// not yet due" path and `true` only when it fans out.
+#[test]
+fn fire_pending_repeats_reports_whether_it_fired() {
+    use std::time::{Duration, Instant};
+
+    use crate::{backend::recording::RecordingBackend, host_x11::HostKeyEvent};
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+
+    // Nothing armed → no fire.
+    assert!(!fire_pending_repeats(&mut state, &mut backend));
+
+    // Arm a repeatable key (keycode 38 auto-repeats by default —
+    // the sibling test relies on this too).
+    handle_host_input(
+        &mut state,
+        &mut backend,
+        HostInputEvent::Key(HostKeyEvent {
+            origin: crate::core_loop::InputOrigin::NestedHost,
+            pressed: true,
+            keycode: 38,
+            time: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            state: 0,
+        }),
+    );
+    assert!(
+        state
+            .key_repeats
+            .contains_key(&crate::core_loop::InputOrigin::NestedHost)
+    );
+    let transition = crate::core_loop::key_fanout::key_transition_status(
+        &state,
+        crate::core_loop::InputOrigin::NestedHost,
+        38,
+        true,
+    )
+    .expect("NestedHost has a master keyboard");
+    crate::core_loop::key_fanout::commit_key_transition(
+        &mut state,
+        crate::core_loop::InputOrigin::NestedHost,
+        38,
+        true,
+        transition,
+    );
+
+    // Freshly armed → `next_fire` is INITIAL_DELAY in the future →
+    // NOT due → must return false (the idle busy-spin case).
+    assert!(
+        !fire_pending_repeats(&mut state, &mut backend),
+        "armed-but-not-due must not report a fire",
+    );
+
+    // Force the deadline into the past → must fire.
+    if let Some(s) = state
+        .key_repeats
+        .get_mut(&crate::core_loop::InputOrigin::NestedHost)
+    {
+        s.next_fire = Instant::now() - Duration::from_millis(1);
+    }
+    assert!(
+        fire_pending_repeats(&mut state, &mut backend),
+        "a due repeat must report a fire",
+    );
+}
+
+/// A fired repeat reaches the backend as `KeyRepeat`, not device `Key`:
+/// it models Xorg's XKB soft repeat, which bypasses GetKeyboardEvents
+/// and so generates no XI2 raw key event (issue #173).
+#[test]
+fn fire_pending_repeats_sends_key_repeat_not_device_key() {
+    use std::time::{Duration, Instant};
+
+    use crate::{
+        backend::recording::{RecordedCall, RecordingBackend},
+        host_x11::HostKeyEvent,
+    };
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    handle_host_input(
+        &mut state,
+        &mut backend,
+        HostInputEvent::Key(HostKeyEvent {
+            origin: crate::core_loop::InputOrigin::NestedHost,
+            pressed: true,
+            keycode: 38,
+            time: 0,
+            root_x: 0,
+            root_y: 0,
+            event_x: 0,
+            event_y: 0,
+            state: 0,
+        }),
+    );
+    let transition = crate::core_loop::key_fanout::key_transition_status(
+        &state,
+        crate::core_loop::InputOrigin::NestedHost,
+        38,
+        true,
+    )
+    .expect("NestedHost has a master keyboard");
+    crate::core_loop::key_fanout::commit_key_transition(
+        &mut state,
+        crate::core_loop::InputOrigin::NestedHost,
+        38,
+        true,
+        transition,
+    );
+    if let Some(s) = state
+        .key_repeats
+        .get_mut(&crate::core_loop::InputOrigin::NestedHost)
+    {
+        s.next_fire = Instant::now() - Duration::from_millis(1);
+    }
+    assert!(fire_pending_repeats(&mut state, &mut backend));
+
+    let keys: Vec<RecordedCall> = backend
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, RecordedCall::HostKey { .. }))
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            RecordedCall::HostKey {
+                keycode: 38,
+                pressed: true,
+                repeat: false,
+            },
+            RecordedCall::HostKey {
+                keycode: 38,
+                pressed: false,
+                repeat: true,
+            },
+            RecordedCall::HostKey {
+                keycode: 38,
+                pressed: true,
+                repeat: true,
+            },
+        ]
+    );
+    let transition = crate::core_loop::key_fanout::key_transition_status(
+        &state,
+        crate::core_loop::InputOrigin::NestedHost,
+        38,
+        true,
+    )
+    .expect("NestedHost has a master keyboard");
+    crate::core_loop::key_fanout::commit_key_transition(
+        &mut state,
+        crate::core_loop::InputOrigin::NestedHost,
+        38,
+        true,
+        transition,
+    );
+}
+
+/// Helper: a touchpad `DeviceInfo` mirroring libinput's enumeration
+/// of a Synaptics pad (matches xinput.rs's `touchpad_info`).
+#[cfg(test)]
+fn probe_touchpad_info() -> crate::core_loop::DeviceInfo {
+    use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
+    crate::core_loop::DeviceInfo {
+        source_id: crate::xinput::InputSourceId(u64::from(line!())),
+        enabled: true,
+        resume_key: None,
+        capabilities: crate::xinput::InputCapabilities {
+            keyboard: false,
+            pointer: true,
+            touch: false,
+        },
+        name: "SynPS/2 Synaptics TouchPad".into(),
+        device_node: "/dev/input/event4".into(),
+        sysname: "event4".into(),
+        vendor_id: 0x046d,
+        product_id: 0xc52f,
+        is_touchpad: true,
+        config: LibinputConfigSnapshot {
+            tap: BoolSetting {
+                available: true,
+                current: true,
+                default: false,
+            },
+            natural_scroll: BoolSetting {
+                available: true,
+                current: false,
+                default: true,
+            },
+            dwt: BoolSetting {
+                available: true,
+                current: true,
+                default: true,
+            },
+            ..Default::default()
+        },
+    }
+}
+
+#[cfg(test)]
+fn xtest_pointer_name(state: &ServerState) -> String {
+    state
+        .xi_devices
+        .iter()
+        .find(|d| d.id == crate::xinput::DEVICEID_XTEST_POINTER)
+        .expect("XTEST pointer (id 4) always present")
+        .name
+        .clone()
+}
+
+/// A backend with no on-core libinput (the trait default, and what
+/// Direct-mode / host-X11 / ynest present) is a clean no-op probe:
+/// returns 0 and leaves the static device model untouched.
+#[test]
+fn probe_input_devices_default_is_noop() {
+    use crate::backend::recording::RecordingBackend;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new(); // no probe_rounds configured
+    let before = xtest_pointer_name(&state);
+
+    let seeded = backend.probe_input_devices(&mut state);
+
+    assert_eq!(seeded, 0, "no-op probe seeds nothing");
+    assert_eq!(
+        xtest_pointer_name(&state),
+        before,
+        "device 4 unchanged when nothing to probe",
+    );
+}
+
+/// A backend whose startup probe enumerates a touchpad seeds its
+/// physical facet before the serve loop while keeping XTEST 4 intact.
+#[test]
+fn probe_input_devices_seeds_touchpad_before_loop() {
+    use crate::backend::recording::RecordingBackend;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    // One non-empty round (the touchpad), then libinput goes quiet.
+    backend.probe_rounds.push_back(vec![probe_touchpad_info()]);
+
+    assert_ne!(
+        xtest_pointer_name(&state),
+        "SynPS/2 Synaptics TouchPad",
+        "precondition: device 4 starts as the virtual XTEST pointer",
+    );
+
+    let seeded = backend.probe_input_devices(&mut state);
+
+    assert_eq!(seeded, 1, "exactly one device seeded");
+    assert_eq!(
+        xtest_pointer_name(&state),
+        crate::xinput::registry::NAME_XTEST_POINTER,
+        "device 4 remains the virtual XTEST pointer after startup probe",
+    );
+    let physical_pointer = state
+        .xi_devices
+        .iter()
+        .find(|device| {
+            device.name == "SynPS/2 Synaptics TouchPad"
+                && device.facet == Some(crate::xinput::XiFacetKind::PointerTouch)
+        })
+        .expect("startup probe registers a physical touchpad pointer facet");
+    assert!(physical_pointer.id >= 6, "physical facet IDs start at 6");
+    let tap_atom = state
+        .atoms
+        .id_for(crate::xinput::PROP_TAPPING_ENABLED)
+        .unwrap();
+    assert!(physical_pointer.properties.contains_key(&tap_atom));
+    assert!(
+        !state
+            .xi_devices
+            .device(crate::xinput::DEVICEID_XTEST_POINTER)
+            .unwrap()
+            .properties
+            .contains_key(&tap_atom)
+    );
+}
+
+/// The bounded drain TERMINATES: with libinput perpetually empty it
+/// stops after two consecutive empty rounds (not the MAX_ROUNDS
+/// ceiling), and even an adversarial always-non-empty source is
+/// capped at the ceiling rather than spinning forever.
+#[test]
+fn probe_input_devices_bounded_drain_terminates() {
+    use crate::backend::recording::RecordingBackend;
+
+    // Empty source → stops after the 2 empty rounds, well under the
+    // 8-round ceiling.
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let seeded = backend.probe_input_devices(&mut state);
+    assert_eq!(seeded, 0);
+    assert_eq!(
+        backend.probe_rounds_run.get(),
+        2,
+        "two consecutive empty rounds end the drain",
+    );
+
+    // Adversarial source that never goes empty → capped at the
+    // MAX_ROUNDS ceiling, never unbounded.
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    for _ in 0..100 {
+        backend.probe_rounds.push_back(vec![probe_touchpad_info()]);
+    }
+    let seeded = backend.probe_input_devices(&mut state);
+    assert_eq!(
+        backend.probe_rounds_run.get(),
+        8,
+        "drain is capped at the MAX_ROUNDS ceiling",
+    );
+    assert_eq!(seeded, 8, "one device seeded per capped round");
+}
+
+#[test]
+fn shutdown_returns() {
+    use crate::{backend::recording::RecordingBackend, core_loop::poll_tokens::ClientIdAllocator};
+
+    let (poll, sender, rx) = channel().unwrap();
+    let sender_for_core = sender.clone_handle();
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let mut backend = RecordingBackend::new();
+        let alloc = ClientIdAllocator::new();
+        run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            None,
+            &alloc,
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        )
+    });
+    sender.send(Message::Shutdown).unwrap();
+    // Bound the wait so a regression that fails to return does not
+    // hang the test runner.
+    for _ in 0..50 {
+        if handle.is_finished() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished(), "run_core did not return on Shutdown");
+    handle.join().unwrap().unwrap();
+}
+
+#[test]
+fn evaluator_fires_idle_activation_when_deadline_elapsed() {
+    let mut state = ServerState::new();
+    state.screensaver.timeout_ms = 60_000;
+    state.dpms.last_activity = Instant::now() - Duration::from_secs(61);
+    // No client installed — emit_screen_saver_notify short-circuits
+    // on empty selected_by; we're asserting state transition only.
+    let mut backend = RecordingBackend::default();
+
+    super::evaluate_screen_saver_post_poll(&mut state, &mut backend);
+
+    assert_eq!(
+        state.screensaver.active,
+        ScreenSaverActive::On,
+        "elapsed idle deadline must drive SS On"
+    );
+}
+
+#[test]
+fn evaluator_fires_cycle_and_advances_next_cycle() {
+    let mut state = ServerState::new();
+    state.screensaver.active = ScreenSaverActive::On;
+    state.screensaver.interval_ms = 60_000;
+    let past = Instant::now() - Duration::from_millis(10);
+    state.screensaver.next_cycle = Some(past);
+    let mut backend = RecordingBackend::default();
+
+    super::evaluate_screen_saver_post_poll(&mut state, &mut backend);
+
+    let next = state.screensaver.next_cycle.expect("re-armed by evaluator");
+    assert!(
+        next > past,
+        "next_cycle must advance past the prior deadline"
+    );
+}
+
+#[test]
+fn evaluator_idle_path_skipped_while_dpms_blanked() {
+    // Xorg WaitFor.c:457 — when DPMS is non-On the SS idle timer
+    // is suppressed; the DPMS→SS coupling already handled it.
+    let mut state = ServerState::new();
+    state.screensaver.timeout_ms = 60_000;
+    state.dpms.last_activity = Instant::now() - Duration::from_secs(120);
+    state.dpms.power_level = 3; // Off
+    let mut backend = RecordingBackend::default();
+
+    super::evaluate_screen_saver_post_poll(&mut state, &mut backend);
+
+    assert_eq!(
+        state.screensaver.active,
+        ScreenSaverActive::Off,
+        "evaluator must not fire SS when DPMS is blanked"
+    );
+}
+
+#[test]
+fn idletime_evaluator_fires_pos_transition_when_deadline_elapsed() {
+    use std::time::Duration;
+    use yserver_protocol::x11::{ClientId, sync as x11sync};
+    let mut state = ServerState::new();
+    // Pre-arm: a PositiveTransition alarm at 60_000ms, last_activity 61s ago.
+    state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(61);
+    let alarm_id = 0x2000;
+    state.sync_alarms.insert(
+        alarm_id,
+        crate::server::SyncAlarm {
+            owner: ClientId(1),
+            counter: x11sync::IDLETIME_COUNTER,
+            wait_value: 60_000,
+            delta: 0,
+            test_type: x11sync::TEST_POSITIVE_TRANSITION,
+            events: false, // skip wire delivery; assert state mutation only
+            state: x11sync::ALARM_STATE_ACTIVE,
+            event_clients: Vec::new(),
+            value_type: 0,
+            raw_wait: 60_000,
+            check_type: x11sync::TEST_POSITIVE_TRANSITION,
+        },
+    );
+    let mut backend = RecordingBackend::default();
+
+    super::evaluate_idletime_alarms_post_poll(&mut state, &mut backend);
+
+    // PositiveTransition + delta=0 stays Active (Task 2 fix).
+    let after = &state.sync_alarms[&alarm_id];
+    assert_eq!(after.state, x11sync::ALARM_STATE_ACTIVE);
+    // last_evaluated cache updated for global IDLETIME.
+    assert!(
+        state
+            .idletime_last_evaluated
+            .get(&x11sync::IDLETIME_COUNTER)
+            .copied()
+            .unwrap_or(0)
+            >= 60_000,
+        "last_evaluated cache should advance past the trigger value"
+    );
+}
+
+#[test]
+fn idletime_evaluator_skips_when_no_idletime_alarms() {
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::default();
+    // No alarms at all — must not panic, must not insert spurious cache entries.
+    super::evaluate_idletime_alarms_post_poll(&mut state, &mut backend);
+    assert!(state.idletime_last_evaluated.is_empty());
+}
+
+/// Task 4/7 completion pacing: a completion whose gate targets a future
+/// vblank parks on drain (its wake is NOT signalled yet), and only fires —
+/// signalling `signal_present_wake` — once `fire_due_present_completions`
+/// runs at an MSC that has reached the target. Sibling to the NotifyMSC
+/// `parks_then_fires_on_vblank_advance` test.
+#[test]
+fn gated_present_completion_parks_then_fires_on_vblank_advance() {
+    use crate::{
+        backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+        server::PresentCompleteGate,
+    };
+    use yserver_protocol::x11::ClientId;
+
+    const PRESENT_ID: u64 = 0x42;
+    const TARGET_MSC: u64 = 200;
+    const WINDOW_XID: u32 = 0x0000_0101;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+
+    // A standalone sequence has advanced the general clock beyond the
+    // target, but the completion-eligible clock is still zero. The gate
+    // must park rather than taking the old already-due immediate path.
+    state.present_crtc_clocks.insert(
+        (0, 0),
+        crate::server::PresentCrtcClock {
+            epoch: 0,
+            msc: 250,
+            ust: 0,
+            completion: crate::backend::PresentClockSample {
+                msc: 0,
+                ust: 0,
+                source: crate::backend::PresentClockSource::Immediate,
+            },
+        },
+    );
+    state.present_complete_gate.insert(
+        PRESENT_ID,
+        PresentCompleteGate {
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            effective_target_msc: TARGET_MSC,
+            owner: ClientId(1),
+            dst_window_xid: WINDOW_XID,
+        },
+    );
+    // Backend reports the copy's GPU completion this iteration.
+    backend
+        .completed_present_events_to_drain
+        .push(CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 7,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: Some(crate::backend::PresentClockSample {
+                msc: 0,
+                ust: 0,
+                source: crate::backend::PresentClockSource::Immediate,
+            }),
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+    // Drain: the future-target gate parks the completion — no wake yet.
+    // (RecordingBackend's completion clock is (0,0), so the drain's own
+    // `fire_due_present_completions` is skipped and the park holds.)
+    drain_present_completions(&mut state, &mut backend);
+    assert_eq!(
+        state.present_pending_complete.len(),
+        1,
+        "future-target completion parks on drain"
+    );
+    assert!(
+        state.present_complete_gate.is_empty(),
+        "gate consumed when the copy completes"
+    );
+    assert!(
+        backend.signalled_present_wakes.is_empty(),
+        "parked completion's wake is NOT signalled before the vblank"
+    );
+
+    // Vblank advances to the target: the parked completion fires + signals.
+    // The zero sample above is a fixture-only stand-in for the initial
+    // copy-completion clock. Real copy completions carry `None`, allowing
+    // the later selected-domain vblank sample to stamp the paced event.
+    state.present_pending_complete[0].event.completion_clock = None;
+    crate::core_loop::process_request::fire_due_present_completions(
+        &mut state,
+        &mut backend,
+        crate::backend::PresentClockSample {
+            msc: TARGET_MSC,
+            ust: 0x1234,
+            source: crate::backend::PresentClockSource::PageFlip,
+        },
+    );
+    assert!(
+        state.present_pending_complete.is_empty(),
+        "parked completion released once its target MSC is reached"
+    );
+    assert_eq!(
+        backend.signalled_present_wakes,
+        vec![PRESENT_ID],
+        "signal_present_wake fires exactly once at the target vblank"
+    );
+}
+
+/// The gate-absent / already-reached path must NOT park: the completion
+/// fires immediately on drain and signals its wake once.
+#[test]
+fn ungated_present_completion_fires_immediately_without_parking() {
+    use crate::backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend};
+    use yserver_protocol::x11::ClientId;
+
+    const PRESENT_ID: u64 = 0x43;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    // No gate recorded for this present_id → complete-now arm.
+    backend
+        .completed_present_events_to_drain
+        .push(CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 8,
+            host_xid: 0x0000_0202,
+            dst_host_xid: 0x0000_0202,
+            options: 0,
+            present_id: PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+    drain_present_completions(&mut state, &mut backend);
+    assert!(
+        state.present_pending_complete.is_empty(),
+        "gate-absent completion does not park"
+    );
+    assert_eq!(
+        backend.signalled_present_wakes,
+        vec![PRESENT_ID],
+        "gate-absent completion signals its wake immediately"
+    );
+}
+
+/// Spec §"Ordered completion delivery" item 2: the due arm of the
+/// drain (a completion whose gate is already satisfied when its GPU
+/// fence retires) must route through `present_pending_complete`
+/// instead of firing inline via `complete_present_with_clock` — so
+/// that the per-window sweep in `fire_due_present_completions`, not
+/// raw arrival order, decides delivery order against anything else
+/// already parked for the same window. Pre-fix this fired here
+/// directly and never touched the queue at all.
+#[test]
+fn due_gate_arm_pushes_into_queue_instead_of_firing_inline() {
+    use crate::{
+        backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+        server::PresentCompleteGate,
+    };
+    use yserver_protocol::x11::ClientId;
+
+    const PRESENT_ID: u64 = 0x44;
+    const WINDOW_XID: u32 = 0x0000_0303;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    // effective_target_msc 0 is already satisfied against
+    // RecordingBackend's default (0, 0) completion clock — the "due"
+    // arm, not the "still future" park arm.
+    state.present_complete_gate.insert(
+        PRESENT_ID,
+        PresentCompleteGate {
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            effective_target_msc: 0,
+            owner: ClientId(1),
+            dst_window_xid: WINDOW_XID,
+        },
+    );
+    backend
+        .completed_present_events_to_drain
+        .push(CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 9,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+    drain_present_completions(&mut state, &mut backend);
+    assert!(
+        state.present_complete_gate.is_empty(),
+        "gate consumed when the copy completes"
+    );
+    assert_eq!(
+        state.present_pending_complete.len(),
+        1,
+        "the due arm pushes into the ordered queue rather than firing \
+             inline (RecordingBackend's zero completion clock means the \
+             same-pass sweep can't drain it yet, which is fine — this test \
+             only pins that it did NOT fire inline)"
+    );
+    assert!(
+        backend.signalled_present_wakes.is_empty(),
+        "must not signal the wake inline — delivery is the sweep's job"
+    );
+}
+
+/// Spec round-4 F6: presents without a usable clock
+/// (`effective_target_msc == None`, no gate entry — the drain's
+/// gate-absent arm) sit outside the
+/// per-window hold-back entirely and complete immediately, even ahead
+/// of an earlier-arrived, still-unresolved synced present parked for
+/// the same window. This is Xorg-parity and pre-existing; documented
+/// so it isn't mistaken for a hold-back bug.
+#[test]
+fn no_clock_present_completion_bypasses_per_window_hold_back() {
+    use crate::{
+        backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+        server::PendingPresentComplete,
+    };
+    use yserver_protocol::x11::{ClientId, present as x11present};
+
+    const WINDOW_XID: u32 = 0x0000_0606;
+    const PARKED_SMALLER_ID: u64 = 5;
+    const ASYNC_ID: u64 = 6;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+
+    // An earlier, smaller-id synced present is still parked/unresolved
+    // for this window.
+    state.present_pending_complete.push(PendingPresentComplete {
+        event: CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 1,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: PARKED_SMALLER_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        },
+        effective_target_msc: 0,
+        mode: x11present::COMPLETE_MODE_COPY,
+        emit_idle: true,
+    });
+
+    // A later async completion for the same window: no gate entry at all.
+    backend
+        .completed_present_events_to_drain
+        .push(CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 2,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: ASYNC_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+    drain_present_completions(&mut state, &mut backend);
+    assert_eq!(
+        backend.signalled_present_wakes,
+        vec![ASYNC_ID],
+        "the async completion fires immediately, bypassing hold-back"
+    );
+    assert_eq!(
+        state.present_pending_complete.len(),
+        1,
+        "the earlier parked synced present is untouched by the async path"
+    );
+}
+
+/// Review fix (post-Task-6): the async exemption above covers async
+/// firing ahead of a still-HELD entry — it must NOT cover an async
+/// completion overtaking a gated Copy that is already due and simply
+/// hasn't been swept yet. In one `drain_present_completions` pass,
+/// `completed = [X(gated, due, id=5), Y(async, id=7)]` for the SAME
+/// window: X's due-arm pushes into the queue (per Task 6 Step 3), then
+/// Y's gate-absent arm used to fire straight through, landing before
+/// X's post-loop sweep — id=7 then id=5, a backward serial that
+/// didn't exist pre-Task-6 (eager firing kept them in arrival order).
+/// Fixed by flushing due-and-unblocked entries from the queue before
+/// the async arm fires inline, so id=5 goes out first.
+#[test]
+fn gated_due_copy_delivers_before_same_drain_async_completion() {
+    use crate::{
+        backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
+        server::PresentCompleteGate,
+    };
+    use yserver_protocol::x11::ClientId;
+
+    const WINDOW_XID: u32 = 0x0000_0808;
+    const GATED_ID: u64 = 5;
+    const ASYNC_ID: u64 = 7;
+    const TARGET_MSC: u64 = 300;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    // A real, nonzero completion clock this time (RecordingBackend
+    // defaults to (0,0), which would make fire_due_present_completions
+    // bail before ever reaching the ordering bug this test pins).
+    backend.present_ust_msc = (TARGET_MSC, 0xABCD);
+
+    state.present_complete_gate.insert(
+        GATED_ID,
+        PresentCompleteGate {
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            effective_target_msc: TARGET_MSC,
+            owner: ClientId(1),
+            dst_window_xid: WINDOW_XID,
+        },
+    );
+    // Arrival order within one drain: the gated-due entry first, the
+    // async one second — matching the reviewer's vector.
+    backend
+        .completed_present_events_to_drain
+        .push(CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 1,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: GATED_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: Some(crate::backend::PresentClockSample {
+                msc: TARGET_MSC,
+                ust: 0xABCD,
+                source: crate::backend::PresentClockSource::PageFlip,
+            }),
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+    backend
+        .completed_present_events_to_drain
+        .push(CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 2,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: ASYNC_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+    drain_present_completions(&mut state, &mut backend);
+    assert_eq!(
+        backend.signalled_present_wakes,
+        vec![GATED_ID, ASYNC_ID],
+        "Copy(5) must deliver before async(7) in the same drain pass — \
+             pre-fix this reads [7, 5]"
+    );
+}
+
+/// Task 4 (spec "Loop-order and clock contract" item 1): the tail's
+/// drain must run BEFORE `maybe_composite`, so a present executed in
+/// this iteration's drain is visible to this iteration's compose
+/// instead of slipping a full period behind unrelated damage. Drives
+/// both halves of the drain — a source-ready `PresentPixmap` copy
+/// (whose execution marks dirty, `process_request.rs:8714`) and a
+/// canned GPU-completion event (`drain_completed_present_events`) —
+/// and asserts both are recorded before `maybe_composite` in
+/// `RecordingBackend`'s call log. Fails against the pre-Task-4 order
+/// (`maybe_composite` before the drain).
+#[test]
+fn run_iteration_tail_drains_present_work_before_compositing() {
+    use crate::{
+        backend::{
+            CompletedPresentEvent, PresentWake,
+            recording::{RecordedCall, RecordingBackend},
+        },
+        server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest},
+    };
+    use yserver_protocol::x11::{ClientId, present::PixmapRequest};
+
+    const WAIT_ID: u64 = 7;
+    const DEFERRED_PRESENT_ID: u64 = 0x77;
+    const PRESENT_ID: u64 = 0x99;
+    const WINDOW_XID: u32 = 0x0000_0303;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+
+    // A source-ready PresentPixmap copy: draining it runs
+    // `execute_present_pixmap_copy` then `mark_dirty` — the real
+    // production link between "the drain executed something" and
+    // "compose must see it this iteration".
+    state
+        .present_wait_to_id
+        .insert(WAIT_ID, DEFERRED_PRESENT_ID);
+    state.present_pending_exec.insert(
+        DEFERRED_PRESENT_ID,
+        PendingPresentEntry {
+            pending: PendingPresentPixmap {
+                origin: None,
+                client_id: ClientId(1),
+                request: PendingPresentRequest::Pixmap(PixmapRequest {
+                    window: WINDOW_XID,
+                    pixmap: 0x304,
+                    serial: 9,
+                    valid: 0,
+                    update: 0,
+                    x_off: 0,
+                    y_off: 0,
+                    target_crtc: 0,
+                    wait_fence: 0,
+                    idle_fence: 0,
+                    options: 0,
+                    target_msc: 0,
+                    divisor: 0,
+                    remainder: 0,
+                    notifies: Vec::new(),
+                }),
+                wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
+                masked_options: 0,
+                src_host_xid: 0x0040_0304,
+                paint_dst_host_xid: 0x0040_0303,
+                completion_dst_host_xid: 0x0040_0303,
+                src_width: 10,
+                src_height: 10,
+                update_rects: None,
+                present_id: DEFERRED_PRESENT_ID,
+                window_generation: 0,
+                crtc_id: 0,
+                crtc_epoch: 0,
+                msc_offset: 0,
+                effective_target_msc: None,
+            },
+            source_ready: false,
+            superseded_by_executed_present_id: None,
+            wait_id: Some(WAIT_ID),
+            pin: None,
+        },
+    );
+    backend.ready_present_source_waits.push(WAIT_ID);
+
+    // A canned GPU-completion event: exercises the second drain half.
+    backend
+        .completed_present_events_to_drain
+        .push(CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 9,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+    run_iteration_tail(&mut state, &mut backend);
+
+    let calls = backend.calls();
+    let mark_dirty_idx = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::MarkDirty))
+        .expect("source-ready copy executed and marked dirty");
+    let drain_completed_idx = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
+        .expect("completed present events drained");
+    let composite_idx = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::MaybeComposite))
+        .expect("maybe_composite invoked");
+
+    assert!(
+        mark_dirty_idx < composite_idx,
+        "drain's mark_dirty ({mark_dirty_idx}) must precede maybe_composite ({composite_idx})"
+    );
+    assert!(
+        drain_completed_idx < composite_idx,
+        "drain_completed_present_events ({drain_completed_idx}) must precede maybe_composite ({composite_idx})"
+    );
+}
+
+/// Spec §4.1 loop order: rootless events are handed to the backend after
+/// this iteration's Present drain and before its `maybe_composite`.
+/// Mutation: move the call to `before_block`, or after `maybe_composite`.
+#[test]
+fn run_iteration_tail_dispatches_rootless_events_between_drain_and_compose() {
+    use crate::{
+        backend::recording::{RecordedCall, RecordingBackend},
+        rootless::{self, CoordinatePolicy, RootlessEvent},
+    };
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new().with_redirect_activation();
+    rootless::enable(&mut state, &mut backend, CoordinatePolicy::Opaque).unwrap();
+    let event = RootlessEvent::ScreenChanged { root: (640, 480) };
+    rootless::queue_event_for_test(&mut state, event.clone());
+
+    run_iteration_tail(&mut state, &mut backend);
+
+    let calls = backend.calls();
+    let drain = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
+        .expect("drain ran");
+    let rootless_idx = calls
+        .iter()
+        .position(|c| *c == RecordedCall::RootlessEvents(vec![event.clone()]))
+        .expect("rootless events dispatched");
+    let compose = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::MaybeComposite))
+        .expect("maybe_composite ran");
+    assert!(drain < rootless_idx && rootless_idx < compose, "{calls:?}");
+}
+
+/// Spec §4.1: a window mapped by a request in this iteration is in this
+/// iteration's events, before compose. Mutation: reconcile in `before_block`.
+#[test]
+fn run_iteration_tail_reports_a_window_mapped_this_iteration() {
+    use crate::{
+        backend::recording::{RecordedCall, RecordingBackend},
+        core_loop::process_request::process_request,
+        rootless::{self, CoordinatePolicy, RootlessEvent},
+    };
+    use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new().with_redirect_activation();
+    let (writer, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    state.clients.insert(1, unix_client(writer, 1, 0));
+    rootless::enable(&mut state, &mut backend, CoordinatePolicy::Opaque).unwrap();
+
+    let wid: u32 = 1 << 21 | 1;
+    let mut create = wid.to_le_bytes().to_vec();
+    create.extend_from_slice(&crate::resources::ROOT_WINDOW.0.to_le_bytes());
+    for v in [0u16, 0, 40, 30, 0, 1] {
+        create.extend_from_slice(&v.to_le_bytes());
+    }
+    create.extend_from_slice(&[0; 8]); // visual CopyFromParent, no values
+    for (seq, opcode, data, body) in [(1, 1, 24, create), (2, 8, 0, wid.to_le_bytes().to_vec())] {
+        process_request(
+            &mut state,
+            &mut backend,
+            ClientId(1),
+            SequenceNumber(seq),
+            RequestHeader {
+                opcode,
+                data,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        )
+        .unwrap();
+    }
+
+    run_iteration_tail(&mut state, &mut backend);
+
+    let calls = backend.calls();
+    let drain = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
+        .expect("drain ran");
+    let mapped = calls
+        .iter()
+        .position(|c| {
+            matches!(c, RecordedCall::RootlessEvents(events)
+                if matches!(events.as_slice(), [RootlessEvent::Mapped { window, .. }]
+                    if window.0 == wid))
+        })
+        .expect("Mapped dispatched");
+    let compose = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::MaybeComposite))
+        .expect("maybe_composite ran");
+    assert!(drain < mapped && mapped < compose, "{calls:?}");
+}
+
+/// Rooted control: without `enable` the tail dispatches no rootless events.
+/// Mutation: drop the `None` guard in `reconcile_and_dispatch`.
+#[test]
+fn rooted_tail_records_no_rootless_events() {
+    use crate::backend::recording::{RecordedCall, RecordingBackend};
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new().with_redirect_activation();
+    run_iteration_tail(&mut state, &mut backend);
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::RootlessEvents(_)))
+    );
+}
+
+/// Spec §4.2.1 rule 7: an iteration with nothing to report emits nothing.
+#[test]
+fn empty_reconcile_records_nothing() {
+    use crate::{
+        backend::recording::{RecordedCall, RecordingBackend},
+        rootless::{self, CoordinatePolicy},
+    };
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new().with_redirect_activation();
+    rootless::enable(&mut state, &mut backend, CoordinatePolicy::Opaque).unwrap();
+    run_iteration_tail(&mut state, &mut backend);
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::RootlessEvents(_)))
+    );
+}
+
+/// Fix-forward: idle-vblank arming for a parked Present completion must
+/// run AFTER `maybe_composite`, not inside the pre-compose drain.
+/// `mark_dirty()` alone (no output damage) makes a real KMS compose
+/// return `Skipped(EmptyDamage)`, which still clears
+/// `scene_wants_compose()` — so `present_completion_is_idle()` only
+/// reports idle post-compose. Arming pre-compose would see a dirty
+/// scene and arm nothing, stranding the parked `CompleteNotify` with no
+/// fd left to wake `poll`. Fails against the arm folded into
+/// `drain_present_completions` (landing before `MaybeComposite`).
+#[test]
+fn run_iteration_tail_arms_present_completion_idle_vblanks_after_compositing() {
+    use crate::{
+        backend::{
+            CompletedPresentEvent, PresentWake,
+            recording::{RecordedCall, RecordingBackend},
+        },
+        server::PendingPresentComplete,
+    };
+    use yserver_protocol::x11::ClientId;
+
+    const PARKED_PRESENT_ID: u64 = 0x55;
+    const DRAINED_PRESENT_ID: u64 = 0x56;
+    const WINDOW_XID: u32 = 0x0000_0505;
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+
+    // Something for the arm to arm: a completion already parked on a
+    // future target MSC.
+    state.present_pending_complete.push(PendingPresentComplete {
+        event: CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 10,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: PARKED_PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        },
+        effective_target_msc: 500,
+        mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+        emit_idle: true,
+    });
+
+    // A canned GPU-completion event so the drain half also runs.
+    backend
+        .completed_present_events_to_drain
+        .push(CompletedPresentEvent {
+            client_id: ClientId(1),
+            serial: 11,
+            host_xid: WINDOW_XID,
+            dst_host_xid: WINDOW_XID,
+            options: 0,
+            present_id: DRAINED_PRESENT_ID,
+            window_generation: 0,
+            crtc_id: 0,
+            crtc_epoch: 0,
+            msc_offset: 0,
+            completion_clock: None,
+            wake: PresentWake::Pixmap { idle_fence_xid: 0 },
+            completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
+            emit_idle: true,
+        });
+
+    run_iteration_tail(&mut state, &mut backend);
+
+    let calls = backend.calls();
+    let drain_completed_idx = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
+        .expect("completed present events drained");
+    let composite_idx = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::MaybeComposite))
+        .expect("maybe_composite invoked");
+    let arm_idx = calls
+        .iter()
+        .position(|c| matches!(c, RecordedCall::ArmPresentCompletionIdleVblanks))
+        .expect("parked completion armed an idle vblank");
+
+    assert!(
+        drain_completed_idx < composite_idx,
+        "drain ({drain_completed_idx}) must still precede compose ({composite_idx})"
+    );
+    assert!(
+        composite_idx < arm_idx,
+        "arm ({arm_idx}) must run after compose ({composite_idx}), not inside the pre-compose drain"
+    );
+}
+
+#[test]
+fn run_iteration_tail_flushes_damage_before_compositing() {
+    use crate::backend::recording::{RecordedCall, RecordingBackend};
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    state.damage_notify_flush_pending = true;
+
+    run_iteration_tail(&mut state, &mut backend);
+
+    let calls = backend.calls();
+    let flush = calls
+        .iter()
+        .position(|call| matches!(call, RecordedCall::FlushBeforeDamageNotify))
+        .expect("damage boundary flushed");
+    let compose = calls
+        .iter()
+        .position(|call| matches!(call, RecordedCall::MaybeComposite))
+        .expect("compose attempted");
+    assert!(flush < compose);
+    assert!(!state.damage_notify_flush_pending);
+}
+
+/// XKB SetControls(RepeatKeys, delay 200, interval 20) drives the repeat
+/// timer: a held key's first repeat fires 200 ms after the press, then one
+/// every 20 ms (Xorg's `TimerSet(repeat_delay)` and
+/// `AccessXRepeatKeyExpire` returning `repeat_interval`).
+#[test]
+fn held_key_repeats_at_the_set_controls_delay_and_interval() {
+    use std::time::{Duration, Instant};
+
+    use crate::{
+        backend::recording::{RecordedCall, RecordingBackend},
+        core_loop::InputOrigin,
+        host_x11::HostKeyEvent,
+    };
+
+    let mut state = ServerState::new();
+    let mut backend = RecordingBackend::new();
+    let mut body = [0u8; 96];
+    body[28..32].copy_from_slice(&1u32.to_le_bytes()); // changeCtrls = RepeatKeys
+    body[32..34].copy_from_slice(&200u16.to_le_bytes());
+    body[34..36].copy_from_slice(&20u16.to_le_bytes());
+    crate::core_loop::xkb_controls::set_controls(&mut state, &backend, 136, &body)
+        .expect("SetControls");
+
+    let t0 = Instant::now();
+    let press = HostInputEvent::Key(HostKeyEvent {
+        origin: InputOrigin::NestedHost,
+        pressed: true,
+        keycode: 38,
+        time: 0,
+        root_x: 0,
+        root_y: 0,
+        event_x: 0,
+        event_y: 0,
+        state: 0,
+    });
+    update_repeat_state_at(&mut state, &press, t0);
+    let transition = crate::core_loop::key_fanout::key_transition_status(
+        &state,
+        InputOrigin::NestedHost,
+        38,
+        true,
+    )
+    .expect("NestedHost has a master keyboard");
+    crate::core_loop::key_fanout::commit_key_transition(
+        &mut state,
+        InputOrigin::NestedHost,
+        38,
+        true,
+        transition,
+    );
+
+    let ms = |n: u64| t0 + Duration::from_millis(n);
+    let fired: Vec<u64> = [199, 200, 219, 220, 239, 240]
+        .into_iter()
+        .filter(|&n| fire_pending_repeats_at(&mut state, &mut backend, ms(n)))
+        .collect();
+    assert_eq!(fired, [200, 220, 240]);
+    let repeats = backend
+        .calls()
+        .into_iter()
+        .filter(|c| matches!(c, RecordedCall::HostKey { repeat: true, .. }))
+        .count();
+    assert_eq!(repeats, 6, "a release + press pair per fire");
+}
+
+/// `Message::PlatformEvent` reaches `Backend::on_platform_event` once per
+/// message, on the core thread.
+#[test]
+fn platform_event_message_reaches_the_backend() {
+    let mut state = ServerState::new();
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    run_core_for_vt_test(&mut state, &mut backend, |sender, _requests| {
+        sender.send(Message::PlatformEvent).unwrap();
+        sender.send(Message::PlatformEvent).unwrap();
+        sender.send(Message::Shutdown).unwrap();
+    });
+    assert_eq!(backend.platform_events, 2);
+}
+
+/// A handled request leaves the composite wake to the backend calls it made:
+/// the request path itself never calls `mark_dirty`.
+#[test]
+fn handled_request_does_not_mark_the_backend_dirty() {
+    use crate::backend::recording::{RecordedCall, RecordingBackend};
+    use yserver_protocol::x11::{ClientId, RequestHeader, SequenceNumber};
+
+    let mut state = ServerState::new();
+    let _peer = install_xi_config_test_client(&mut state, 7);
+    let mut backend = RecordingBackend::new();
+    for (opcode, body) in [
+        (127u8, Vec::new()),                           // NoOperation
+        (43, Vec::new()),                              // GetInputFocus
+        (16, [&[4u8, 0, 0, 0][..], b"WAKE"].concat()), // InternAtom "WAKE"
+    ] {
+        let outcome = process_request_inline(
+            &mut state,
+            &mut backend,
+            ClientId(7),
+            SequenceNumber(1),
+            RequestHeader {
+                opcode,
+                data: 0,
+                length_units: u32::try_from(1 + body.len().div_ceil(4)).unwrap(),
+            },
+            &body,
+            None,
+        );
+        assert!(
+            matches!(outcome, RequestOutcome::Handled),
+            "opcode {opcode}"
+        );
+    }
+    assert!(
+        !backend
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::MarkDirty)),
+        "no request may wake the composite generically"
+    );
+}
+
+/// Mutation: drop the reader release on the max-length `BadLength`; the GetInputFocus reply times out.
+#[test]
+fn oversized_big_requests_enable_keeps_the_connection_working() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    let mut state = ServerState::new();
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let client_sender = sender.bind();
+    let (server_stream, mut peer) = UnixStream::pair().expect("client socket pair");
+    peer.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("peer read timeout");
+    client_sender
+        .send(Message::ClientSetupComplete {
+            id: yserver_protocol::x11::ClientId(1),
+            generation: client_sender.generation(),
+            stream: crate::transport::Transport::Unix(server_stream),
+            resource_id_base: 1 << 20,
+            resource_id_mask: 0x000F_FFFF,
+            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+            admission: crate::access::Admission::Internal,
+            setup_reply: Vec::new(),
+        })
+        .expect("queue test client setup");
+    let sender_for_core = sender.clone_handle();
+    let runner = std::thread::spawn(move || {
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        run_core(
+            poll,
+            receiver,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        )
+    });
+
+    let interaction = (|| -> std::io::Result<([u8; 32], [u8; 32], [u8; 32])> {
+        peer.write_all(&[135, 0, 1, 0])?;
+        let mut enable = [0; 32];
+        peer.read_exact(&mut enable)?;
+        // A second Enable in big-request form whose big length (1) cannot hold its header.
+        peer.write_all(&[135, 0, 0, 0, 1, 0, 0, 0, 43, 0, 1, 0])?;
+        let mut error = [0; 32];
+        peer.read_exact(&mut error)?;
+        let mut focus = [0; 32];
+        peer.read_exact(&mut focus)?;
+        Ok((enable, error, focus))
+    })();
+    sender.send(Message::Shutdown).expect("shutdown core");
+    runner
+        .join()
+        .expect("core thread panicked")
+        .expect("run core");
+    let (enable, error, focus) = interaction.expect("reader resumes after the oversized Enable");
+    assert_eq!(enable[0], 1, "first Enable is answered");
+    // Xorg: BadLength, value 0, minor 0, major (os/io.c:450-459, Xext/bigreq.c REQUEST_SIZE_MATCH).
+    assert_eq!(
+        &error[..11],
+        &[
+            0,
+            yserver_protocol::x11::error::BAD_LENGTH,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            135
+        ]
+    );
+    assert_eq!(focus[0], 1, "GetInputFocus is answered");
+    assert_eq!(&focus[2..4], &3u16.to_le_bytes());
+}
+
+#[test]
+fn run_core_installs_its_auth_state_as_the_host_access_handle() {
+    let mut state = ServerState::new();
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let generation = receiver.current_generation();
+    let auth = AuthState::new(None);
+    assert!(!Arc::ptr_eq(&state.host_access.auth, &auth));
+    sender.send(Message::Shutdown).unwrap();
+    run_core(
+        poll,
+        receiver,
+        sender.clone_handle(),
+        &mut state,
+        &mut backend,
+        [],
+        &ClientIdAllocator::new(),
+        Arc::clone(&auth),
+        ResetPolicy::NoReset,
+        None,
+    )
+    .expect("run core to shutdown");
+    assert!(Arc::ptr_eq(&state.host_access.auth, &auth));
+    assert_eq!(state.host_access.generation, generation);
+}
+
+/// Mutation: initialize the run-core handle with an empty policy list; this pointer assertion must fail.
+#[test]
+fn run_core_keeps_policies_installed_before_it() {
+    use crate::access::AccessPolicy;
+    use std::sync::Arc;
+
+    struct Policy;
+    impl AccessPolicy for Policy {}
+
+    let mut state = ServerState::new();
+    let policy: Arc<dyn AccessPolicy> = Arc::new(Policy);
+    state.install_access_policy(Arc::clone(&policy));
+
+    let mut backend = crate::backend::recording::RecordingBackend::new();
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    sender.send(Message::Shutdown).unwrap();
+    run_core(
+        poll,
+        receiver,
+        sender.clone_handle(),
+        &mut state,
+        &mut backend,
+        [],
+        &ClientIdAllocator::new(),
+        AuthState::new(None),
+        ResetPolicy::NoReset,
+        None,
+    )
+    .expect("run core to shutdown");
+
+    assert_eq!(state.host_access.policies.len(), 1);
+    assert!(Arc::ptr_eq(&state.host_access.policies[0], &policy));
+}
+
+fn queue_reader_test_client(
+    sender: &crate::core_loop::sender::BoundSender,
+    id: u32,
+    stream: std::os::unix::net::UnixStream,
+) {
+    sender
+        .send(Message::ClientSetupComplete {
+            id: yserver_protocol::x11::ClientId(id),
+            generation: sender.generation(),
+            stream: crate::transport::Transport::Unix(stream),
+            resource_id_base: id << 20,
+            resource_id_mask: 0x000F_FFFF,
+            byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+            is_local: true,
+            fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
+            admission: crate::access::Admission::Internal,
+            setup_reply: Vec::new(),
+        })
+        .expect("queue test client setup");
+}
+
+fn enqueue_test_request(
+    sender: &crate::core_loop::sender::BoundSender,
+    id: u32,
+    sequence: u16,
+    opcode: u8,
+    minor: u8,
+    body: &[u8],
+) {
+    sender
+        .send(Message::Request {
+            id: yserver_protocol::x11::ClientId(id),
+            sequence: yserver_protocol::x11::SequenceNumber(sequence),
+            accepted_at: None,
+            header: yserver_protocol::x11::RequestHeader {
+                opcode,
+                data: minor,
+                length_units: u32::try_from(1 + body.len() / 4).unwrap(),
+            },
+            body: body.to_vec(),
+            attached_fd: None,
+        })
+        .expect("queue test request");
+}
+
+struct DenyExtensionDispatchPolicy;
+
+impl crate::access::AccessPolicy for DenyExtensionDispatchPolicy {
+    fn extension_dispatch(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        _client: yserver_protocol::x11::ClientId,
+        _extension: &str,
+    ) -> crate::access::Decision {
+        crate::access::Decision::Deny(crate::access::DenyError {
+            code: yserver_protocol::x11::error::BAD_VALUE,
+            value: 0x55,
+        })
+    }
+}
+
+#[test]
+fn denied_big_requests_enable_keeps_the_connection_working() {
+    // Mutation: drop IgnoreBigRequests on dispatch denial; the following GetInputFocus reply times out.
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+        time::Duration,
+    };
+
+    let mut state = ServerState::new();
+    state.install_access_policy(std::sync::Arc::new(DenyExtensionDispatchPolicy));
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let client_sender = sender.bind();
+    let (server_stream, mut peer) = UnixStream::pair().expect("client socket pair");
+    peer.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("peer read timeout");
+    queue_reader_test_client(&client_sender, 1, server_stream);
+    let sender_for_core = sender.clone_handle();
+    let runner = std::thread::spawn(move || {
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        run_core(
+            poll,
+            receiver,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        )
+    });
+
+    let interaction = (|| -> std::io::Result<([u8; 32], [u8; 32])> {
+        // BIG-REQUESTS Enable, followed immediately by normally framed GetInputFocus.
+        peer.write_all(&[135, 0, 1, 0, 43, 0, 1, 0])?;
+        let mut error = [0; 32];
+        peer.read_exact(&mut error)?;
+        let mut focus = [0; 32];
+        peer.read_exact(&mut focus)?;
+        Ok((error, focus))
+    })();
+    sender.send(Message::Shutdown).expect("shutdown core");
+    runner
+        .join()
+        .expect("core thread panicked")
+        .expect("run core");
+    let (error, focus) = interaction.expect("reader resumes after denied Enable");
+    assert_eq!(error[0], 0);
+    assert_eq!(error[1], yserver_protocol::x11::error::BAD_REQUEST);
+    assert_eq!(&error[2..4], &1u16.to_le_bytes());
+    assert_eq!(&error[4..10], &[0; 6]);
+    assert_eq!(error[10], 135);
+    assert_eq!(focus[0], 1, "second request receives GetInputFocus reply");
+    assert_eq!(&focus[2..4], &2u16.to_le_bytes());
+}
+
+struct RevokeOnOwnerDispatch(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl crate::access::AccessPolicy for RevokeOnOwnerDispatch {
+    fn extension_dispatch(
+        &self,
+        _ctx: &crate::access::AccessContext<'_>,
+        client: yserver_protocol::x11::ClientId,
+        _extension: &str,
+    ) -> crate::access::Decision {
+        if client.0 == 1 {
+            // Client A's checked XFIXES request runs only after B's request
+            // has been parked behind A's server grab.
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            crate::access::Decision::Allow
+        } else if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+            crate::access::Decision::Deny(crate::access::DenyError {
+                code: yserver_protocol::x11::error::BAD_VALUE,
+                value: 0x55,
+            })
+        } else {
+            crate::access::Decision::Allow
+        }
+    }
+}
+
+#[test]
+fn held_extension_request_is_checked_when_the_grab_releases() {
+    // Mutation: cache B's Allow while queueing its held request; after A revokes, B would get a normal reply.
+    use std::{io::Read, os::unix::net::UnixStream, time::Duration};
+
+    let revoked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut state = ServerState::new();
+    state.install_access_policy(std::sync::Arc::new(RevokeOnOwnerDispatch(Arc::clone(
+        &revoked,
+    ))));
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let client_sender = sender.bind();
+    let (server_a, mut peer_a) = UnixStream::pair().expect("client A socket pair");
+    let (server_b, mut peer_b) = UnixStream::pair().expect("client B socket pair");
+    for peer in [&peer_a, &peer_b] {
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("peer read timeout");
+    }
+    queue_reader_test_client(&client_sender, 1, server_a);
+    queue_reader_test_client(&client_sender, 2, server_b);
+    let sender_for_core = sender.clone_handle();
+    let runner = std::thread::spawn(move || {
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        run_core(
+            poll,
+            receiver,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        )
+    });
+
+    let extension = crate::nested::EXTENSIONS
+        .iter()
+        .find(|extension| extension.name == "XFIXES")
+        .expect("XFIXES metadata");
+    let query_version = [5, 0, 0, 0, 0, 0, 0, 0];
+    enqueue_test_request(&client_sender, 1, 1, 36, 0, &[]); // GrabServer
+    enqueue_test_request(
+        &client_sender,
+        2,
+        1,
+        extension.major_opcode,
+        0,
+        &query_version,
+    );
+    enqueue_test_request(
+        &client_sender,
+        1,
+        2,
+        extension.major_opcode,
+        0,
+        &query_version,
+    );
+    enqueue_test_request(&client_sender, 1, 3, 37, 0, &[]); // UngrabServer
+
+    let replies = (|| -> std::io::Result<([u8; 32], [u8; 32])> {
+        let mut owner_reply = [0; 32];
+        peer_a.read_exact(&mut owner_reply)?;
+        let mut held_reply = [0; 32];
+        peer_b.read_exact(&mut held_reply)?;
+        Ok((owner_reply, held_reply))
+    })();
+    sender.send(Message::Shutdown).expect("shutdown core");
+    runner
+        .join()
+        .expect("core thread panicked")
+        .expect("run core");
+    let (owner_reply, held_reply) = replies.expect("both clients receive their dispatch results");
+    assert!(revoked.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        owner_reply[0], 1,
+        "A's request was allowed before revocation"
+    );
+    assert_eq!(held_reply[0], 0, "B's held request is denied on replay");
+    assert_eq!(held_reply[1], yserver_protocol::x11::error::BAD_REQUEST);
+    assert_eq!(&held_reply[2..4], &1u16.to_le_bytes());
+    assert_eq!(&held_reply[4..10], &[0; 6]);
+    assert_eq!(held_reply[10], extension.major_opcode);
+}
+
+// Mutation: assigning HostAccess to an InternalClient makes the stored-state
+// assertion fail after the production Message::InternalClient dispatch.
+#[test]
+fn internal_client_admits_as_internal() {
+    use std::{
+        io::{Read, Write},
+        os::unix::net::UnixStream,
+    };
+
+    let (server_stream, mut peer) = UnixStream::pair().expect("internal socket pair");
+    peer.set_read_timeout(Some(Duration::from_secs(5)))
+        .expect("peer read timeout");
+    let (poll, sender, receiver) = crate::core_loop::channel().expect("core channel");
+    let sender_for_core = sender.clone_handle();
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let mut backend = crate::backend::recording::RecordingBackend::new();
+        let result = run_core(
+            poll,
+            receiver,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            [],
+            &ClientIdAllocator::new(),
+            AuthState::new_with_xdmcp(None, true),
+            ResetPolicy::NoReset,
+            None,
+        );
+        (result, state)
+    });
+
+    let interaction = (|| -> io::Result<(u8, u8)> {
+        sender.send(Message::InternalClient(server_stream.into()))?;
+
+        // The internal path bypasses authorization even with a protocol name
+        // the configured auth state would reject.
+        let auth_name = b"invalid-protocol";
+        let auth_data = [0x51u8; 16];
+        let mut setup = [0u8; 12];
+        setup[0] = b'l';
+        setup[2] = 11;
+        setup[6..8].copy_from_slice(&(auth_name.len() as u16).to_le_bytes());
+        setup[8..10].copy_from_slice(&(auth_data.len() as u16).to_le_bytes());
+        peer.write_all(&setup)?;
+        peer.write_all(auth_name)?;
+        let padding = (4 - auth_name.len() % 4) % 4;
+        peer.write_all(&[0; 3][..padding])?;
+        peer.write_all(&auth_data)?;
+
+        let mut setup_reply = [0u8; 8];
+        peer.read_exact(&mut setup_reply)?;
+        if setup_reply[0] != 1 {
+            return Ok((setup_reply[0], 0));
+        }
+        let body_len = usize::from(u16::from_le_bytes([setup_reply[6], setup_reply[7]])) * 4;
+        let mut setup_body = vec![0; body_len];
+        peer.read_exact(&mut setup_body)?;
+
+        // A request round trip proves the core processed ClientSetupComplete
+        // and installed the client before the assertion reads ServerState.
+        peer.write_all(&[43, 0, 1, 0])?;
+        let mut focus_reply = [0u8; 32];
+        peer.read_exact(&mut focus_reply)?;
+        Ok((setup_reply[0], focus_reply[0]))
+    })();
+
+    let shutdown = sender.send(Message::Shutdown);
+    let (core_result, state) = handle.join().expect("core thread");
+    shutdown.expect("send shutdown");
+    core_result.expect("run core");
+    let (setup_status, focus_status) = interaction.expect("internal handshake and round trip");
+    assert_eq!(setup_status, 1, "internal setup must bypass auth");
+    assert_eq!(
+        focus_status, 1,
+        "core must process the internal client's request"
+    );
+    assert_eq!(state.clients.len(), 1);
+    let client = state.clients.values().next().expect("installed client");
+    assert!(client.internal);
+    assert_eq!(client.admission, crate::access::Admission::Internal);
+}
+
+/// A host display connection whose flush left output queued gets it out
+/// once its socket drains, with nothing else for the loop to do: the loop
+/// watches the fd for writable while output is queued. Watched for
+/// readable alone, the queued output waited for the host's next work, and
+/// with none the host stalled. Once it is out the loop goes back to sleep.
+#[test]
+fn a_host_display_flush_left_queued_goes_out_when_the_socket_drains() {
+    use crate::backend::{
+        BackendFdKind,
+        recording::{HostDisplayOut, RecordingBackend},
+    };
+    use std::{
+        io::{Read, Write},
+        os::fd::AsRawFd,
+        sync::{Arc, atomic::AtomicU32},
+    };
+
+    let (poll, sender, rx) = channel().unwrap();
+    let sender_for_core = sender.clone_handle();
+    let (host, mut compositor) = UnixStream::pair().unwrap();
+    host.set_nonblocking(true).unwrap();
+    // The compositor is not reading: fill the socket.
+    let mut filled = 0usize;
+    loop {
+        match (&host).write(&[0x11; 4096]) {
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    const QUEUED: usize = 64 << 10;
+    let flushes = Arc::new(AtomicU32::new(0));
+    let (ready_tx, _ready_rx) = crossbeam_channel::unbounded();
+    let mut backend = RecordingBackend::new().with_poll_sources(
+        vec![(host.as_raw_fd(), BackendFdKind::HostDisplay)],
+        ready_tx,
+    );
+    backend.host_display_out = Some(HostDisplayOut {
+        stream: host,
+        pending: vec![0x22; QUEUED],
+        flushes: flushes.clone(),
+    });
+    let handle = std::thread::spawn(move || {
+        let mut state = ServerState::new();
+        let alloc = ClientIdAllocator::new();
+        let result = run_core(
+            poll,
+            rx,
+            sender_for_core,
+            &mut state,
+            &mut backend,
+            None,
+            &alloc,
+            AuthState::new(None),
+            ResetPolicy::NoReset,
+            None,
+        );
+        (result, backend)
+    });
+
+    // The loop has flushed what it could and blocked; now the compositor
+    // reads everything, what filled the socket and what was queued.
+    std::thread::sleep(Duration::from_millis(100));
+    compositor
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut got = 0usize;
+    let mut queued = 0usize;
+    let mut buf = vec![0u8; 64 << 10];
+    while got < filled + QUEUED {
+        let n = compositor
+            .read(&mut buf)
+            .expect("the queued output never went out");
+        queued += buf[..n].iter().filter(|b| **b == 0x22).count();
+        got += n;
+    }
+    assert_eq!(queued, QUEUED);
+    // All of it out, the loop sleeps: no flush without a reason.
+    std::thread::sleep(Duration::from_millis(50));
+    let settled = flushes.load(std::sync::atomic::Ordering::Relaxed);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        flushes.load(std::sync::atomic::Ordering::Relaxed),
+        settled,
+        "the loop kept waking with nothing queued"
+    );
+
+    sender.send(Message::Shutdown).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(handle.is_finished(), "run_core did not return");
+    let (result, backend) = handle.join().unwrap();
+    result.unwrap();
+    assert!(backend.host_display_out.unwrap().pending.is_empty());
+}

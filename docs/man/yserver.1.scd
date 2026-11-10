@@ -2,20 +2,21 @@ yserver(1)
 
 # NAME
 
-yserver - X11 server for Linux KMS/DRM
+yserver - X11 server for KMS/DRM on Linux, FreeBSD and OpenBSD
 
 # SYNOPSIS
 
-*yserver* [:_display_] [vt_N_] [-auth _file_] [-displayfd _fd_] [-layout _layout_] [-listen _protocol_] [-nolisten _protocol_] [-noreset|-reset|-terminate] [-query _host_|-indirect _host_|-broadcast] [-port _n_] [-from _address_] [-class _string_] [-displayID _string_] [-once] [--version]
+*yserver* [:_display_] [vt_N_] [-auth _file_] [-displayfd _fd_] [-layout _layout_] [-listen _protocol_] [-nolisten _protocol_] [-noreset|-reset|-terminate] [-query _host_|-indirect _host_|-broadcast] [-port _n_] [-from _address_] [-class _string_] [-displayID _string_] [-once] [--rootless] [--vrr [all]] [--version]
 
 # DESCRIPTION
 
 *yserver* is an X11 server written from scratch in Rust. It is not an Xorg
 derivative. It drives atomic KMS/DRM directly and renders with Vulkan.
 
-There is no seat manager. The server process opens _/dev/dri/\*_ and
-_/dev/input/event\*_ itself, so it needs read/write access to both, and it
-requires a working Vulkan driver. How that access is obtained depends on
+There is no seat manager. The server process opens _/dev/dri/\*_ and the
+input devices (_/dev/input/event\*_; _/dev/wskbd\*_ and _/dev/wsmouse\*_ on
+OpenBSD) itself, so it needs read/write access to both, and it requires a
+working Vulkan driver. How that access is obtained depends on
 how the server is started:
 
 *Launched by a display manager*
@@ -23,14 +24,15 @@ how the server is started:
 	_@DOCDIR@/examples/lightdm-99-yserver.conf_.
 
 *Launched by the user from a console*
-	Use *starty*(1). The invoking user needs the _video_ and _input_
-	groups, or equivalent seat ACLs:
+	Use *starty*(1). On Linux the invoking user needs the _video_ and
+	_input_ groups, or equivalent seat ACLs:
 
 	```
 	sudo usermod -aG video,input $USER
 	```
 
-	then log out and back in.
+	then log out and back in. For FreeBSD and OpenBSD see "Device access"
+	in _@DOCDIR@/setup.md_.
 
 Some options need a build feature that a given binary may not have; those
 entries say so. *--version* reports what this binary was built with.
@@ -54,6 +56,25 @@ entries say so. *--version* reports what this binary was built with.
 
 *-layout* _layout_
 	XKB layout name, e.g. *be*.
+
+*--rootless*
+	Run rootless as a client of the Wayland compositor *WAYLAND_DISPLAY*
+	names: each top-level X window is a window of the compositor's, input
+	comes from the compositor's seat, and the server opens no console, KMS
+	card or input device. Needs a build with the *wayland* feature (Linux
+	only); without it the server refuses to start.
+
+*--vrr*
+	Enable adaptive sync for a client window in direct scanout when its
+	*\_VARIABLE_REFRESH* property has format 32, exactly one item and a
+	nonzero value. VRR is off by default.
+
+*--vrr all*
+	Enable adaptive sync for direct-scanned client windows without requiring
+	*\_VARIABLE_REFRESH*. On *nvidia-drm*, NVIDIA application profiles,
+	Mesa driconf and the client's *\_\_GL_VRR_ALLOWED* or *adaptive_sync*
+	environment setting can exclude a process. On other drivers this behaves
+	like *--vrr* and uses the window property.
 
 *-listen* _protocol_, *-nolisten* _protocol_
 	Enable or disable a transport. Only *tcp* is understood; any other
@@ -227,6 +248,11 @@ above.
 	Log filter. Defaults to *info*; *warn* is quieter, *debug* and *trace*
 	are for diagnosis.
 
+*YSERVER_WM_NAME*
+	Under *--rootless* on a Wayland compositor, the window manager's name
+	(*\_NET_WM_NAME* of the *\_NET_SUPPORTING_WM_CHECK* window) when the
+	compositor's process name cannot be read from its socket.
+
 *YSERVER_DRM_DEVICE*
 	Path to the sole KMS device to use instead of auto-selecting devices,
 	e.g. _/dev/dri/card1_. Ignored when *YSERVER_DRM_DEVICES* is set.
@@ -243,7 +269,10 @@ above.
 	Path to the Vulkan/DRI3 render node to use instead of resolving one from
 	the first successfully opened KMS device, e.g. _/dev/dri/renderD128_.
 	Useful on split display/render systems and systems without sysfs-style
-	card/render parent metadata.
+	card/render parent metadata. A server with no KMS card otherwise uses
+	the render node of its Vulkan device; with a software Vulkan device
+	(lavapipe), DRI3 is on only when this names a node, and clients then
+	render on that GPU.
 
 *YSERVER_MODE*
 	Force a mode instead of the connector's preferred mode, as
@@ -274,9 +303,12 @@ socket's filesystem permissions are the access control.
 
 *-listen tcp* changes that completely. The server binds *0.0.0.0* — every
 interface — and the *only* thing standing between the network and the display
-is the MIT-MAGIC-COOKIE-1 cookie. There is no host-based access control:
-*xhost*(1) is not implemented yet, so there is nothing to restrict which hosts
-may connect, and no way to grant or revoke access per host.
+is the MIT-MAGIC-COOKIE-1 cookie. *xhost*(1) entries never admit a TCP
+client: neither a host entry nor *xhost +* lets anyone in without the cookie,
+unlike Xorg. On the UNIX socket, *xhost* works as usual:
+*xhost +si:localuser:*_user_ admits that user's clients without a cookie,
+*xhost +local:* admits every local client, and *xhost +* / *xhost -* switch
+the check off and on for local clients.
 
 Consequences worth being explicit about:
 

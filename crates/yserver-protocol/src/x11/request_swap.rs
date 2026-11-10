@@ -100,12 +100,14 @@ fn swap_xi_change_feedback_control(byte_order: ClientByteOrder, body: &mut [u8])
     swap_in_place(entries, byte_order, body);
 }
 
-/// `RRChangeOutputProperty` / `RRChangeProviderProperty`'s trailing value
-/// payload (from body offset 20) is a tagged union selected by the format
-/// byte at offset 12: 8 = bytes (untouched), 16 = `INT16[]`, 32 =
-/// `INT32[]`. Mirrors Xorg's `SProcRRChangeOutputProperty` `SwapRestS` /
-/// `SwapRestL` dispatch.
-fn swap_change_output_property_tail(byte_order: ClientByteOrder, body: &mut [u8]) {
+/// The trailing value payload of core `ChangeProperty` and of
+/// `RRChangeOutputProperty` / `RRChangeProviderProperty` (from body offset
+/// 20 in all three) is a tagged union selected by the format byte at
+/// offset 12: 8 = bytes (untouched), 16 = `CARD16[]`, 32 = `CARD32[]`.
+/// Swapping it here stores the data in server order, as Xorg's
+/// `SProcChangeProperty` (`dix/swapreq.c:209-229`) and
+/// `SProcRRChangeOutputProperty` do with `SwapRestS` / `SwapRestL`.
+fn swap_property_data_tail(byte_order: ClientByteOrder, body: &mut [u8]) {
     use FieldEntry::ElementArrayTail;
 
     let entries: &[FieldEntry] = match body.get(12) {
@@ -176,6 +178,90 @@ fn swap_xi_change_device_control(byte_order: ClientByteOrder, body: &mut [u8]) {
     );
 }
 
+/// Swap each XISelectEvents record header while leaving its event mask bytes
+/// in their protocol-defined bit-array order. The record count and fixed
+/// request fields have already been converted to LE by the table entries.
+fn swap_xi_select_events_records(_byte_order: ClientByteOrder, body: &mut [u8]) {
+    let Some(num_masks) = body.get(4..6).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+        return;
+    };
+    let mut pos = 8usize;
+    for _ in 0..num_masks {
+        let Some(header_end) = pos.checked_add(4) else {
+            return;
+        };
+        let Some(record_header) = body.get_mut(pos..header_end) else {
+            return;
+        };
+        record_header[..2].reverse(); // deviceid
+        record_header[2..4].reverse(); // mask_len
+        let mask_words = usize::from(u16::from_le_bytes([record_header[2], record_header[3]]));
+        let Some(mask_bytes) = mask_words.checked_mul(4) else {
+            return;
+        };
+        let Some(mask_end) = header_end.checked_add(mask_bytes) else {
+            return;
+        };
+        if mask_end > body.len() {
+            return;
+        }
+        pos = mask_end;
+    }
+}
+
+/// XIPassiveGrabDevice's mask is a byte array. Its modifiers begin after the
+/// declared mask words and are CARD32s in client byte order. Xorg validates
+/// the complete fixed-size tail before entering its modifier swap loop, so
+/// malformed tails are left untouched here for the request dispatcher to
+/// reject as BadLength.
+fn swap_xi_passive_grab_modifiers(_byte_order: ClientByteOrder, body: &mut [u8]) {
+    let (Some(num_modifiers), Some(mask_len)) = (
+        body.get(18..20).map(|b| u16::from_le_bytes([b[0], b[1]])),
+        body.get(20..22).map(|b| u16::from_le_bytes([b[0], b[1]])),
+    ) else {
+        return;
+    };
+    let Some(mask_bytes) = usize::from(mask_len).checked_mul(4) else {
+        return;
+    };
+    let Some(modifier_bytes) = usize::from(num_modifiers).checked_mul(4) else {
+        return;
+    };
+    let Some(modifiers_start) = 28usize.checked_add(mask_bytes) else {
+        return;
+    };
+    let Some(modifiers_end) = modifiers_start.checked_add(modifier_bytes) else {
+        return;
+    };
+    let Some(modifiers) = body.get_mut(modifiers_start..modifiers_end) else {
+        return;
+    };
+    for modifier in modifiers.chunks_exact_mut(4) {
+        modifier.reverse();
+    }
+}
+
+/// XIPassiveUngrabDevice has a CARD32 modifier array immediately after its
+/// 16-byte fixed body. Swap only the declared array; any trailing request
+/// bytes are not part of this field.
+fn swap_xi_passive_ungrab_modifiers(_byte_order: ClientByteOrder, body: &mut [u8]) {
+    let Some(num_modifiers) = body.get(10..12).map(|b| u16::from_le_bytes([b[0], b[1]])) else {
+        return;
+    };
+    let Some(modifier_bytes) = usize::from(num_modifiers).checked_mul(4) else {
+        return;
+    };
+    let Some(modifiers_end) = 16usize.checked_add(modifier_bytes) else {
+        return;
+    };
+    let Some(modifiers) = body.get_mut(16..modifiers_end) else {
+        return;
+    };
+    for modifier in modifiers.chunks_exact_mut(4) {
+        modifier.reverse();
+    }
+}
+
 /// Dispatch to a per-extension swap table by major opcode. yserver
 /// assigns a fixed major to every supported extension (see the
 /// `XI2_MAJOR_OPCODE` / `XFIXES_MAJOR_OPCODE` constants in
@@ -200,8 +286,8 @@ const fn extension_request_swap_table(major: u8, minor: u8) -> Option<&'static [
 }
 
 const fn xf86vidmode_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
-    use FieldEntry::Fixed;
-    use FieldKind::U16;
+    use FieldEntry::{ElementArrayTail, Fixed};
+    use FieldKind::{U16, U32};
 
     // `screen(u16) + pad(u16)`, shared by the ordinary screen-scoped reads.
     const SCREEN: &[FieldEntry] = &[Fixed {
@@ -211,9 +297,43 @@ const fn xf86vidmode_request_swap_table(minor: u8) -> Option<&'static [FieldEntr
 
     Some(match minor {
         // QueryVersion (0) has an empty body. ValidateModeLine (9) stays
-        // unswapped for its version-aware parser. Rejected write requests are
-        // not inspected.
+        // unswapped for its version-aware parser. The mode-setting writes,
+        // always rejected, are not inspected.
         1 | 4 | 6 | 11 | 13 | 16 | 19 | 20 => SCREEN,
+        // LockModeSwitch: screen(u16), lock(u16) (`SProcVidModeLockModeSwitch`).
+        5 => &[
+            Fixed {
+                offset: 0,
+                kind: U16,
+            },
+            Fixed {
+                offset: 2,
+                kind: U16,
+            },
+        ],
+        // SetGamma: screen(u16), pad(u16), red, green, blue (u32)
+        // (`SProcVidModeSetGamma`).
+        15 => &[
+            Fixed {
+                offset: 0,
+                kind: U16,
+            },
+            Fixed {
+                offset: 4,
+                kind: U32,
+            },
+            Fixed {
+                offset: 8,
+                kind: U32,
+            },
+            Fixed {
+                offset: 12,
+                kind: U32,
+            },
+        ],
+        // SetGammaRamp: screen(u16), size(u16), then the three channels,
+        // every CARD16 swapped (`SProcVidModeSetGammaRamp`'s `SwapRestS`).
+        18 => &[ElementArrayTail { from: 0, kind: U16 }],
         // GetGammaRamp: screen(u16), size(u16).
         17 => &[
             Fixed {
@@ -327,7 +447,7 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
             u32f!(4),
             u32f!(8),
             u32f!(16),
-            Custom(swap_change_output_property_tail),
+            Custom(swap_property_data_tail),
         ],
         // DestroyMode: a lone RRMode. FreeLease: RRLease + terminate byte.
         17 | 46 => &[u32f!(0)],
@@ -388,13 +508,31 @@ const fn randr_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         33..=35 => &[u32f!(0), u32f!(4), u32f!(8)],
         // GetMonitors: window + get_active byte.
         42 => &[u32f!(0)],
+        // SetMonitor: window, then xRRMonitorInfo (name, two BOOLs, noutput,
+        // x, y, width, height, mm width/height) and its RROutput tail
+        // (Xorg `SProcRRSetMonitor`, `SwapRestL`).
+        super::randr::RR_SET_MONITOR => &[
+            u32f!(0),
+            u32f!(4),
+            u16f!(10),
+            i16f!(12),
+            i16f!(14),
+            u16f!(16),
+            u16f!(18),
+            u32f!(20),
+            u32f!(24),
+            ElementArrayTail {
+                from: 28,
+                kind: U32,
+            },
+        ],
         _ => return None,
     })
 }
 
 #[allow(clippy::too_many_lines)]
 const fn core_request_swap_table(opcode: u8) -> Option<&'static [FieldEntry]> {
-    use FieldEntry::{ElementArrayTail, Fixed, OpaqueTail};
+    use FieldEntry::{Custom, ElementArrayTail, Fixed, OpaqueTail};
     use FieldKind::{I16, U16, U32};
 
     macro_rules! u32f {
@@ -457,18 +595,13 @@ const fn core_request_swap_table(opcode: u8) -> Option<&'static [FieldEntry]> {
         // 17 GetAtomName: atom(u32 at 0)
         17 => &[u32f!(0)],
         // 18 ChangeProperty: window(u32) property(u32) type(u32) format(u8)
-        //                   pad(u8 × 3) data_len(u32) data(opaque, format-
-        //                   dependent — swapping per format would belong in
-        //                   a Custom handler; for now treat as opaque so we
-        //                   don't corrupt e.g. format=32 data).
-        // The format byte at offset 12 is u8 — no swap needed. data_len
-        // at offset 16 is u32 — must be swapped.
+        //                   pad(u8 × 3) data_len(u32) data(format-typed)
         18 => &[
             u32f!(0),
             u32f!(4),
             u32f!(8),
             u32f!(16),
-            OpaqueTail { from: 20 },
+            Custom(swap_property_data_tail),
         ],
         // 19 DeleteProperty: window(u32) property(u32)
         19 => &[u32f!(0), u32f!(4)],
@@ -736,7 +869,7 @@ const fn core_request_swap_table(opcode: u8) -> Option<&'static [FieldEntry]> {
 /// `XIproto.h` / `XI2proto.h` struct definitions.
 #[allow(clippy::too_many_lines)]
 const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
-    use FieldEntry::{ElementArrayTail, Fixed, OpaqueTail};
+    use FieldEntry::{Custom, ElementArrayTail, Fixed, OpaqueTail};
     use FieldKind::{U16, U32};
 
     macro_rules! u32f {
@@ -904,7 +1037,7 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
         // 46 XISelectEvents: window(u32) num_masks(u16) [u16 pad]
         //   masks(opaque event-mask records, each: deviceid(u16) mask_len(u16)
         //   mask(u8 × pad32(mask_len)))
-        46 => &[u32f!(0), u16f!(4), OpaqueTail { from: 8 }],
+        46 => &[u32f!(0), u16f!(4), Custom(swap_xi_select_events_records)],
         // 47 XIQueryVersion: major(u16) minor(u16)
         47 => &[u16f!(0), u16f!(2)],
         // 48 XIQueryDevice: deviceid(u16) [u16 pad]
@@ -934,7 +1067,7 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
             u16f!(16),
             u16f!(18),
             u16f!(20),
-            OpaqueTail { from: 28 },
+            Custom(swap_xi_passive_grab_modifiers),
         ],
         // 55 XIPassiveUngrabDevice: grab_window(u32) detail(u32) deviceid(u16)
         //   num_modifiers(u16) grab_type(u8) [u8 pad u16 pad] modifiers(u32[])
@@ -943,10 +1076,7 @@ const fn xi_request_swap_table(minor: u8) -> Option<&'static [FieldEntry]> {
             u32f!(4),
             u16f!(8),
             u16f!(10),
-            ElementArrayTail {
-                from: 16,
-                kind: U32,
-            },
+            Custom(swap_xi_passive_ungrab_modifiers),
         ],
         // 56 XIListProperties: deviceid(u16) [u16 pad]
         56 => &[u16f!(0)],
@@ -1119,6 +1249,41 @@ mod tests {
         swap_request_body(153, 17, ClientByteOrder::BigEndian, &mut ramp);
         assert_eq!(u16::from_le_bytes(ramp[0..2].try_into().unwrap()), 0x1234);
         assert_eq!(u16::from_le_bytes(ramp[2..4].try_into().unwrap()), 0x0100);
+    }
+
+    #[test]
+    fn xf86vidmode_gamma_writes_and_lock_are_swapped() {
+        let mut lock = [0, 1, 0, 1];
+        swap_request_body(153, 5, ClientByteOrder::BigEndian, &mut lock);
+        assert_eq!(lock, [1, 0, 1, 0]);
+
+        let mut gamma = vec![0u8; 28];
+        gamma[0..2].copy_from_slice(&1u16.to_be_bytes());
+        for (at, value) in [(4, 15_000u32), (8, 10_000), (12, 5_000)] {
+            gamma[at..at + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        swap_request_body(153, 15, ClientByteOrder::BigEndian, &mut gamma);
+        assert_eq!(u16::from_le_bytes([gamma[0], gamma[1]]), 1);
+        for (at, value) in [(4, 15_000u32), (8, 10_000), (12, 5_000)] {
+            assert_eq!(
+                u32::from_le_bytes(gamma[at..at + 4].try_into().unwrap()),
+                value
+            );
+        }
+
+        let mut ramp = Vec::new();
+        for word in [0u16, 2, 0x0102, 0x0304, 0x0506, 0x0708, 0x090a, 0x0b0c] {
+            ramp.extend_from_slice(&word.to_be_bytes());
+        }
+        swap_request_body(153, 18, ClientByteOrder::BigEndian, &mut ramp);
+        let words: Vec<u16> = ramp
+            .chunks_exact(2)
+            .map(|w| u16::from_le_bytes([w[0], w[1]]))
+            .collect();
+        assert_eq!(
+            words,
+            [0, 2, 0x0102, 0x0304, 0x0506, 0x0708, 0x090a, 0x0b0c]
+        );
     }
 
     #[test]
@@ -1355,7 +1520,7 @@ mod tests {
         const XID: u32 = 0x00de_ad01;
         for minor in [
             2u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 25, 26, 27, 28, 29, 30,
-            31, 32, 33, 42, 46,
+            31, 32, 33, 42, 43, 44, 46,
         ] {
             let mut body = vec![0u8; 32];
             body[0..4].copy_from_slice(&XID.to_be_bytes());
@@ -1368,11 +1533,48 @@ mod tests {
         }
     }
 
+    /// `SProcRRSetMonitor`: every numeric xRRMonitorInfo field and the
+    /// RROutput tail are swapped; the primary/automatic BOOLs are bytes.
+    #[test]
+    fn randr_set_monitor_swaps_monitor_info_and_output_tail() {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0000_0123u32.to_be_bytes()); // window
+        body.extend_from_slice(&0x0000_0456u32.to_be_bytes()); // name
+        body.extend_from_slice(&[1, 0]); // primary, automatic
+        body.extend_from_slice(&2u16.to_be_bytes()); // noutput
+        body.extend_from_slice(&(-5i16).to_be_bytes()); // x
+        body.extend_from_slice(&7i16.to_be_bytes()); // y
+        body.extend_from_slice(&640u16.to_be_bytes()); // width
+        body.extend_from_slice(&800u16.to_be_bytes()); // height
+        body.extend_from_slice(&170u32.to_be_bytes()); // mm width
+        body.extend_from_slice(&211u32.to_be_bytes()); // mm height
+        body.extend_from_slice(&0x41u32.to_be_bytes());
+        body.extend_from_slice(&0x0001_0042u32.to_be_bytes());
+        swap_request_body(128, 43, ClientByteOrder::BigEndian, &mut body);
+        let req = crate::x11::randr::parse_set_monitor_request(&body).unwrap();
+        assert_eq!(
+            req,
+            crate::x11::randr::SetMonitorRequest {
+                window: 0x123,
+                name: 0x456,
+                primary: true,
+                noutput: 2,
+                x: -5,
+                y: 7,
+                width: 640,
+                height: 800,
+                width_mm: 170,
+                height_mm: 211,
+                outputs: vec![0x41, 0x0001_0042],
+            }
+        );
+    }
+
     /// A little-endian client's body must be left byte-for-byte alone, so the
     /// new entries cannot corrupt the common path.
     #[test]
     fn randr_little_endian_bodies_are_untouched() {
-        for minor in [2u8, 4, 7, 12, 13, 15, 21, 26, 29, 30, 42, 46] {
+        for minor in [2u8, 4, 7, 12, 13, 15, 21, 26, 29, 30, 42, 43, 46] {
             let mut body: Vec<u8> = (0..32u8).collect();
             let original = body.clone();
             swap_request_body(128, minor, ClientByteOrder::LittleEndian, &mut body);

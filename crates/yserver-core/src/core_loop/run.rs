@@ -7,30 +7,48 @@
 //! (host-X11) supply the missing token arms; D5 supplies the
 //! listener.
 
+mod dri3_export;
+
+/// The armed reset trigger, driven through a live `run_core` rather than
+/// against `ResetTrigger` directly (that state machine is unit-tested in
+/// `core_loop::reset`). What these pin is the *wiring*: which loop events
+/// arm it, which fire it, and what the boundary does afterwards.
+///
+/// A reset is observed through the generation counter — the boundary
+/// bumps it, and nothing else in the loop does — read from the clone the
+/// test keeps before handing `CoreReceiver` to the loop.
+#[cfg(test)]
+mod server_reset;
+#[cfg(test)]
+mod tests;
+
+use dri3_export::{ParkedDri3Export, drain_ready_dri3_exports};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io,
-    os::fd::{AsRawFd, OwnedFd, RawFd},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use log::{error, warn};
-use mio::{Events, Interest, Poll, unix::SourceFd};
+#[cfg(unix)]
+use mio::unix::SourceFd;
+use mio::{Events, Interest, Poll};
 
 use super::{
     auth::AuthState,
     client_io::{self, WriteOutcome},
-    generation,
+    generation::{self, Generation},
     input_inventory::InputInventory,
-    message::{HostInputEvent, Message, SetupAllocateResponse},
+    message::{HostInputEvent, Message, SetupAllocateResponse, XiConfigRequest},
     poll_tokens::{
-        ClientIdAllocator, NOTIFY_TOKEN, backend_token, client_token, listener_token,
-        token_to_backend_index, token_to_client, token_to_listener_index,
+        ClientIdAllocator, NOTIFY_TOKEN, client_token, listener_token, token_to_backend_index,
+        token_to_client, token_to_listener_index,
     },
     process_request::{
-        PendingCrtcConfig, RequestOutcome, complete_crtc_config,
-        fire_present_configure_notify_for_window, process_request,
+        PendingCrtcConfig, PendingDri3Export, PropertyDispatchError, RequestOutcome,
+        ValidatedXiChange, complete_crtc_config, fire_present_configure_notify_for_window,
+        process_request,
     },
     reset::{GenerationLocals, ResetAction, ResetPolicy, ResetTrigger, reset_generation},
     sender::{CoreReceiver, CoreSender},
@@ -38,8 +56,10 @@ use super::{
     xdmcp::{XDMCP_TOKEN, XdmcpOutcome, XdmcpService},
 };
 use crate::{
-    backend::{Backend, BackendFdKind, CrtcConfigToken, HostSocketStatus},
+    backend::{Backend, BackendFdKind, CrtcConfigToken, Dri3ExportToken, HostSocketStatus},
+    fd::{OwnedFd, RawFd},
     host_x11::HostEvent,
+    peer::address_is_ours,
     server::{KeyRepeatState, ServerState},
     transport::{Listener, Transport},
 };
@@ -62,6 +82,12 @@ use crate::{
 /// timestamps cross the reader boundary, and the core maintains small
 /// per-client maps in addition to the existing per-opcode counters.
 const TELEMETRY_EMIT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Maximum time the core waits for the input thread's VT pause barrier. Xorg
+/// handles XI property requests synchronously before its VT disable sequence
+/// (`Xi/xiproperty.c:1156-1158`, `hw/xfree86/common/xf86Events.c:310-313`);
+/// this deadline prevents a failed producer from freezing that boundary.
+const VT_INPUT_PAUSE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Number of opcodes to show in the per-second telemetry emit.
 const TELEMETRY_TOP_N: usize = 3;
@@ -575,23 +601,43 @@ struct ParkedCrtcConfig {
     request_wire_bytes: usize,
 }
 
-/// Backend waits indexed both by opaque token (completion) and by client
 /// (strict same-client FIFO blocking/cancellation).
 #[derive(Default)]
 pub(crate) struct PendingBackendRequests {
     crtc_by_token: HashMap<CrtcConfigToken, ParkedCrtcConfig>,
     crtc_by_client: HashMap<yserver_protocol::x11::ClientId, CrtcConfigToken>,
+    dri3_by_token: HashMap<Dri3ExportToken, ParkedDri3Export>,
+    dri3_by_client: HashMap<yserver_protocol::x11::ClientId, Dri3ExportToken>,
+    xi_config_clients: HashSet<yserver_protocol::x11::ClientId>,
 }
 
 impl PendingBackendRequests {
     fn client_is_blocked(&self, client: yserver_protocol::x11::ClientId) -> bool {
         self.crtc_by_client.contains_key(&client)
+            || self.dri3_by_client.contains_key(&client)
+            || self.xi_config_clients.contains(&client)
+    }
+
+    fn block_xi_config(&mut self, client: yserver_protocol::x11::ClientId) -> bool {
+        self.xi_config_clients.insert(client)
+    }
+
+    fn unblock_xi_config(&mut self, client: yserver_protocol::x11::ClientId) {
+        self.xi_config_clients.remove(&client);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn xi_config_client_is_blocked_for_test(
+        &self,
+        client: yserver_protocol::x11::ClientId,
+    ) -> bool {
+        self.xi_config_clients.contains(&client)
     }
 
     fn park_crtc(&mut self, parked: ParkedCrtcConfig) -> Result<(), &'static str> {
         let client = parked.client_id;
         let token = parked.continuation.token;
-        if self.crtc_by_client.contains_key(&client) {
+        if self.crtc_by_client.contains_key(&client) || self.dri3_by_client.contains_key(&client) {
             return Err("client already has a pending backend request");
         }
         if self.crtc_by_token.contains_key(&token) {
@@ -636,6 +682,9 @@ impl PendingBackendRequests {
                     set_time: 0,
                     output_bbox_before: None,
                     byte_order: yserver_protocol::x11::ClientByteOrder::LittleEndian,
+                    apply_transform: None,
+                    apply_rotation: None,
+                    reply: crate::core_loop::process_request::CrtcConfigReply::CrtcConfig,
                 },
             },
             request_wire_bytes: 0,
@@ -644,12 +693,70 @@ impl PendingBackendRequests {
 
     #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
-        self.crtc_by_token.is_empty() && self.crtc_by_client.is_empty()
+        self.crtc_by_token.is_empty()
+            && self.crtc_by_client.is_empty()
+            && self.dri3_by_token.is_empty()
+            && self.dri3_by_client.is_empty()
+            && self.xi_config_clients.is_empty()
     }
 
     pub(crate) fn take_all_crtc_tokens(&mut self) -> Vec<CrtcConfigToken> {
         self.crtc_by_client.clear();
         self.crtc_by_token.drain().map(|(token, _)| token).collect()
+    }
+}
+
+/// An accepted recognized property write waiting for its FIFO turn. The
+/// generation is stamped by the runner, after request parsing has captured
+/// only request-local wire data.
+struct QueuedXiConfig {
+    request: XiConfigRequest,
+    generation: Generation,
+    request_wire_bytes: usize,
+}
+
+struct XiConfigCompletion {
+    validated: ValidatedXiChange,
+    generation: Generation,
+    request_wire_bytes: usize,
+}
+
+/// The one submitted input operation remains here through reset or client
+/// disconnect. `protocol=None` drops generation/atom/reply metadata while the
+/// source, setting and token continue to occupy the global FIFO lane.
+struct XiConfigInFlight {
+    token: crate::xinput::libinput_props::DeviceConfigToken,
+    source: crate::xinput::InputSourceId,
+    change: crate::xinput::libinput_props::DeviceConfigChange,
+    cancel: crate::xinput::libinput_props::DeviceConfigCancelToken,
+    protocol: Option<XiConfigCompletion>,
+}
+
+/// The client has already received BadMatch, but the input thread may have
+/// crossed its pre-apply cancellation check before the timeout. Keep enough
+/// information to reconcile a later confirmation without another reply.
+struct TimedOutXiConfig {
+    change: crate::xinput::libinput_props::DeviceConfigChange,
+}
+
+#[derive(Default)]
+pub(crate) struct XiConfigLane {
+    queued: VecDeque<QueuedXiConfig>,
+    in_flight: Option<XiConfigInFlight>,
+    timed_out: HashMap<
+        (
+            crate::xinput::libinput_props::DeviceConfigToken,
+            crate::xinput::InputSourceId,
+        ),
+        TimedOutXiConfig,
+    >,
+    reject_unsubmitted_for_vt_release: bool,
+}
+
+impl XiConfigLane {
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.queued.is_empty() && self.in_flight.is_none() && self.timed_out.is_empty()
     }
 }
 
@@ -792,9 +899,11 @@ pub(crate) fn deferred_request_for_test(id: u32) -> DeferredRequest {
 }
 
 /// A client's queued requests may be dispatched unless it waits on
-/// asynchronous backend work or a SYNC `Await` / `AwaitFence` suspended it
-/// (Xorg `IgnoreClient`). Either way its requests keep their order and
-/// every other client keeps running.
+/// asynchronous backend work, a SYNC `Await` / `AwaitFence` suspended it, or
+/// it is the data connection of an enabled RECORD context (Xorg
+/// `IgnoreClient`), or a write to it failed and the core loop has yet to
+/// disconnect it (Xorg closes its fd at once, `AbortClient`). Either way
+/// its requests keep their order and every other client keeps running.
 fn client_runnable(
     pending: &PendingBackendRequests,
     state: &ServerState,
@@ -802,6 +911,8 @@ fn client_runnable(
 ) -> bool {
     !pending.client_is_blocked(client)
         && !crate::core_loop::sync_await::client_is_suspended(state, client)
+        && !crate::core_loop::record::client_blocks_requests(state, client)
+        && !state.clients.get(&client.0).is_some_and(|c| c.write_failed)
 }
 
 fn blocked_by_server_grab(state: &ServerState, req: &DeferredRequest) -> bool {
@@ -867,18 +978,718 @@ fn grant_request_credit(
 /// `ClientSetupComplete`, the reader thread's `ClientDisconnected`, a
 /// failed outbound drain and the writable-interest reconcile — which is
 /// what lets the trigger be an *event* rather than a state check.
-fn disconnect_with_pending_cleanup(
+pub(super) fn disconnect_with_pending_cleanup(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
     reset_trigger: &mut ResetTrigger,
     client: yserver_protocol::x11::ClientId,
 ) {
     if let Some(token) = pending.take_client_crtc(client) {
         backend.cancel_crtc_config(token);
     }
+    if let Some(token) = pending.take_client_dri3(client) {
+        backend.release_dri3_export(token);
+    }
+    xi_config_lane
+        .queued
+        .retain(|queued| queued.request.client != client);
+    if xi_config_lane
+        .in_flight
+        .as_ref()
+        .and_then(|in_flight| in_flight.protocol.as_ref())
+        .is_some_and(|protocol| protocol.validated.request.client == client)
+        && let Some(in_flight) = xi_config_lane.in_flight.as_mut()
+    {
+        in_flight.protocol = None;
+    }
+    pending.unblock_xi_config(client);
     crate::core_loop::process_disconnect::process_disconnect(state, backend, client);
-    reset_trigger.note_client_departed(state.clients.len());
+    reset_trigger.note_client_departed(state.counted_clients());
+    backend.note_client_count(state.counted_clients());
+}
+
+/// Disconnect every client a write failed on (`client_io` flags it; the
+/// fan-out that hit the failure keeps iterating). Runs between dispatch
+/// rounds, never inside one, and repeats because a disconnect fans out
+/// events of its own that can fail further clients.
+pub(super) fn disconnect_failed_writers(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+) {
+    loop {
+        let failed = client_io::failed_writers(&state.clients);
+        if failed.is_empty() {
+            return;
+        }
+        for client in failed {
+            // Why (the peer gone, or the cap) was said where the write
+            // failed (`client_io`).
+            warn!(
+                "client {}: output could not be written; disconnecting",
+                client.0
+            );
+            disconnect_with_pending_cleanup(
+                state,
+                backend,
+                pending,
+                xi_config_lane,
+                reset_trigger,
+                client,
+            );
+        }
+    }
+}
+
+/// Disconnect every client whose output failed (RECORD data connections
+/// and flagged writers), then drain and reconcile WRITABLE interest for
+/// the rest. Repeats until a pass disconnects nobody: a disconnect's own
+/// notifications can buffer output for, or fail, other clients.
+fn settle_client_output(
+    registry: &mio::Registry,
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+) {
+    loop {
+        // RECORD failures are queued, since that write can happen inside
+        // another client's disconnect.
+        let recorders = crate::core_loop::record::take_failed_recorders(state);
+        let failed = if recorders.is_empty() && client_io::failed_writers(&state.clients).is_empty()
+        {
+            let failed = reconcile_client_writable_interest(registry, state);
+            if failed.is_empty() {
+                return;
+            }
+            failed
+        } else {
+            recorders
+        };
+        for disc_id in failed {
+            disconnect_with_pending_cleanup(
+                state,
+                backend,
+                pending,
+                xi_config_lane,
+                reset_trigger,
+                disc_id,
+            );
+        }
+        disconnect_failed_writers(state, backend, pending, xi_config_lane, reset_trigger);
+    }
+}
+
+pub(super) fn cancel_unsubmitted_xi_configs(
+    lane: &mut XiConfigLane,
+    pending: &mut PendingBackendRequests,
+) {
+    lane.queued.clear();
+    pending.xi_config_clients.clear();
+    if let Some(in_flight) = lane.in_flight.as_mut() {
+        in_flight.protocol = None;
+    }
+}
+
+fn xi_error_for_config(
+    request: &XiConfigRequest,
+    error: crate::xinput::libinput_props::DeviceConfigError,
+) -> PropertyDispatchError {
+    use crate::xinput::libinput_props::DeviceConfigError as ConfigError;
+    match error {
+        ConfigError::Unsupported => PropertyDispatchError::BadMatch,
+        ConfigError::Invalid => PropertyDispatchError::BadValue {
+            error_value: u32::from(request.format),
+        },
+        ConfigError::Cancelled => PropertyDispatchError::BadMatch,
+        // xf86-input-libinput returns BadMatch when its shared handle is
+        // absent (`xf86libinput.c:4392-4409, 4579-4607`).
+        ConfigError::SourceGone => PropertyDispatchError::BadMatch,
+    }
+}
+
+fn emit_xi_config_error(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    request: &XiConfigRequest,
+    error: PropertyDispatchError,
+    generation: Generation,
+    request_wire_bytes: usize,
+    current_generation: Generation,
+) {
+    if generation == current_generation && state.clients.contains_key(&request.client.0) {
+        match crate::core_loop::process_request::emit_property_dispatch_error(
+            state,
+            request.client,
+            request.sequence,
+            error,
+            request.minor_opcode,
+        ) {
+            Ok(RequestOutcome::Disconnect(client)) => disconnect_with_pending_cleanup(
+                state,
+                backend,
+                pending,
+                lane,
+                reset_trigger,
+                client,
+            ),
+            Ok(RequestOutcome::Handled) => {}
+            Ok(
+                RequestOutcome::PendingCrtcConfig(_)
+                | RequestOutcome::PendingDri3Export(_)
+                | RequestOutcome::PendingXiConfig(_),
+            ) => {
+                unreachable!("error emission cannot start backend work")
+            }
+            Err(err) => warn!("XI config error reply failed: {err}"),
+        }
+        grant_request_credit(state, request.client, request_wire_bytes);
+    }
+    pending.unblock_xi_config(request.client);
+}
+
+fn apply_confirmed_xi_config(
+    state: &mut ServerState,
+    input_inventory: &mut InputInventory,
+    source: crate::xinput::InputSourceId,
+    change: crate::xinput::libinput_props::DeviceConfigChange,
+    validated: Option<&ValidatedXiChange>,
+) -> Result<(u16, yserver_protocol::x11::AtomId, crate::xinput::PropWhat), PropertyDispatchError> {
+    if let Some(info) = state.xi_devices.source_mut(source) {
+        info.config.apply_confirmed(change);
+    }
+    input_inventory.update_config(source, change);
+    crate::core_loop::process_request::commit_confirmed_xi_change(state, source, change, validated)
+}
+
+fn drive_xi_config_lane(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
+) {
+    while lane.in_flight.is_none() {
+        let Some(queued) = lane.queued.pop_front() else {
+            break;
+        };
+        let client = queued.request.client;
+        if queued.generation != current_generation || !state.clients.contains_key(&client.0) {
+            pending.unblock_xi_config(client);
+            continue;
+        }
+        let validated =
+            match crate::core_loop::process_request::validate_xi_change(state, &queued.request) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    emit_xi_config_error(
+                        state,
+                        backend,
+                        pending,
+                        lane,
+                        reset_trigger,
+                        &queued.request,
+                        error,
+                        queued.generation,
+                        queued.request_wire_bytes,
+                        current_generation,
+                    );
+                    continue;
+                }
+            };
+        let cancel = crate::xinput::libinput_props::DeviceConfigCancelToken::new();
+        match backend.start_device_config(validated.source_id, validated.change, cancel.clone()) {
+            Ok(crate::xinput::libinput_props::DeviceConfigStart::Applied) => {
+                match apply_confirmed_xi_config(
+                    state,
+                    input_inventory,
+                    validated.source_id,
+                    validated.change,
+                    Some(&validated),
+                ) {
+                    Ok((facet_id, property, what)) => {
+                        let _ = crate::core_loop::process_request::emit_property_change(
+                            state, facet_id, property, what,
+                        );
+                        pending.unblock_xi_config(client);
+                        grant_request_credit(state, client, queued.request_wire_bytes);
+                    }
+                    Err(error) => emit_xi_config_error(
+                        state,
+                        backend,
+                        pending,
+                        lane,
+                        reset_trigger,
+                        &queued.request,
+                        error,
+                        queued.generation,
+                        queued.request_wire_bytes,
+                        current_generation,
+                    ),
+                }
+            }
+            Ok(crate::xinput::libinput_props::DeviceConfigStart::Pending(token)) => {
+                lane.in_flight = Some(XiConfigInFlight {
+                    token,
+                    source: validated.source_id,
+                    change: validated.change,
+                    cancel,
+                    protocol: Some(XiConfigCompletion {
+                        validated,
+                        generation: queued.generation,
+                        request_wire_bytes: queued.request_wire_bytes,
+                    }),
+                });
+                break;
+            }
+            Err(error) => {
+                let error = xi_error_for_config(&queued.request, error);
+                emit_xi_config_error(
+                    state,
+                    backend,
+                    pending,
+                    lane,
+                    reset_trigger,
+                    &queued.request,
+                    error,
+                    queued.generation,
+                    queued.request_wire_bytes,
+                    current_generation,
+                );
+            }
+        }
+    }
+}
+
+/// Accept the owned request outcome produced by XI1/XI2 request parsing.
+/// This is shared by the main request dispatcher and focused tests so the
+/// production lane performs generation stamping, disabled-source rejection,
+/// client blocking, dequeue-time validation, backend start, and commit.
+pub(super) fn route_pending_xi_config(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    request: XiConfigRequest,
+    request_wire_bytes: usize,
+    current_generation: Generation,
+) {
+    let client = request.client;
+    let source_disabled = !state
+        .xi_devices
+        .source_has_enabled_facet(request.expected_source);
+    if lane.reject_unsubmitted_for_vt_release || source_disabled {
+        let error = crate::core_loop::process_request::validate_xi_change(state, &request)
+            .err()
+            .unwrap_or(PropertyDispatchError::BadMatch);
+        emit_xi_config_error(
+            state,
+            backend,
+            pending,
+            lane,
+            reset_trigger,
+            &request,
+            error,
+            current_generation,
+            request_wire_bytes,
+            current_generation,
+        );
+    } else if !pending.block_xi_config(client) {
+        log::error!(
+            "client {} entered XI config lane while already blocked",
+            client.0
+        );
+        disconnect_with_pending_cleanup(state, backend, pending, lane, reset_trigger, client);
+    } else {
+        lane.queued.push_back(QueuedXiConfig {
+            request,
+            generation: current_generation,
+            request_wire_bytes,
+        });
+        drive_xi_config_lane(
+            state,
+            backend,
+            input_inventory,
+            pending,
+            lane,
+            reset_trigger,
+            current_generation,
+        );
+    }
+}
+
+pub(super) fn cancel_queued_xi_configs_for_source(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    source: crate::xinput::InputSourceId,
+    current_generation: Generation,
+) {
+    let mut retained = VecDeque::new();
+    while let Some(queued) = lane.queued.pop_front() {
+        if queued.request.expected_source != source {
+            retained.push_back(queued);
+            continue;
+        }
+        let error = crate::core_loop::process_request::validate_xi_change(state, &queued.request)
+            .err()
+            .unwrap_or_else(|| {
+                if state.xi_devices.source(source).is_some() {
+                    PropertyDispatchError::BadMatch
+                } else {
+                    PropertyDispatchError::BadDevice {
+                        deviceid: queued.request.deviceid,
+                    }
+                }
+            });
+        emit_xi_config_error(
+            state,
+            backend,
+            pending,
+            lane,
+            reset_trigger,
+            &queued.request,
+            error,
+            queued.generation,
+            queued.request_wire_bytes,
+            current_generation,
+        );
+    }
+    lane.queued = retained;
+}
+
+/// Fail config requests still queued in the core lane when VT release starts.
+/// They have not reached an input-thread handle, so they cannot be committed;
+/// the in-flight operation is completed by the input pause barrier instead.
+fn fail_unsubmitted_xi_configs_for_vt_release(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
+) {
+    while let Some(queued) = lane.queued.pop_front() {
+        let error = crate::core_loop::process_request::validate_xi_change(state, &queued.request)
+            .err()
+            .unwrap_or(PropertyDispatchError::BadMatch);
+        emit_xi_config_error(
+            state,
+            backend,
+            pending,
+            lane,
+            reset_trigger,
+            &queued.request,
+            error,
+            queued.generation,
+            queued.request_wire_bytes,
+            current_generation,
+        );
+    }
+    lane.reject_unsubmitted_for_vt_release = true;
+}
+
+/// Cancel the one submitted XI config write if the input thread cannot
+/// confirm it before VT release finishes. A later Applied result is retained
+/// for reconciliation, while the client's BadMatch remains final.
+fn fail_in_flight_xi_config_for_vt_release(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    pending: &mut PendingBackendRequests,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
+) {
+    let Some(in_flight) = lane.in_flight.take() else {
+        return;
+    };
+    in_flight.cancel.cancel();
+    let protocol = in_flight.protocol;
+    lane.timed_out.insert(
+        (in_flight.token, in_flight.source),
+        TimedOutXiConfig {
+            change: in_flight.change,
+        },
+    );
+    if let Some(protocol) = protocol {
+        emit_xi_config_error(
+            state,
+            backend,
+            pending,
+            lane,
+            reset_trigger,
+            &protocol.validated.request,
+            PropertyDispatchError::BadMatch,
+            protocol.generation,
+            protocol.request_wire_bytes,
+            current_generation,
+        );
+    }
+}
+
+/// Dispatch the production `Message::VtRelease` lifecycle callback. Keep the
+/// process-lifetime source inventory and backend device facets in the same
+/// unavailable boundary before the backend releases DRM master. The callback
+/// drains already-submitted config results after the input thread's FIFO pause
+/// and before KMS performs the yielding operations.
+/// Xorg's `ProcXIChangeProperty` runs `change_property` before returning
+/// (`Xi/xiproperty.c:1156-1158`), and its VT handler calls `DisableDevice`
+/// after processing held keys (`xf86Events.c:302-313`).
+pub fn dispatch_vt_release(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    before_yield: impl FnOnce(&mut ServerState, &mut dyn Backend, &mut InputInventory, bool),
+) {
+    if backend.vt_switching_armed() {
+        input_inventory.suspend_all();
+        let pause_barrier_queued = backend.begin_vt_release();
+        before_yield(state, backend, input_inventory, pause_barrier_queued);
+        backend.finish_vt_release(state, input_inventory);
+    }
+}
+
+/// Dispatch the production `Message::VtAcquire` lifecycle callback.
+pub fn dispatch_vt_acquire(state: &mut ServerState, backend: &mut dyn Backend) {
+    if backend.vt_switching_armed() {
+        backend.on_vt_acquire(state);
+    }
+}
+
+/// Dispatch one host input event through the same lifecycle and XI-config
+/// cancellation path used by `run_core`.
+pub(super) fn dispatch_host_input(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    ev: HostInputEvent,
+    current_generation: Generation,
+) {
+    // Process-lifetime bookkeeping: maintain `InputInventory` regardless of
+    // generation (it always dispatches, see above) so a device lifecycle
+    // transition is never missed, even mid-reset once resets exist. Nothing
+    // consumes the inventory yet — purely additive.
+    let config_source_lifecycle = match &ev {
+        HostInputEvent::DeviceAdded(info) => {
+            input_inventory.add(info.clone());
+            None
+        }
+        HostInputEvent::DeviceSuspended { source_id, .. } => {
+            input_inventory.suspend(*source_id);
+            Some(*source_id)
+        }
+        HostInputEvent::DeviceResumed(info) => {
+            input_inventory.resume(info.clone());
+            None
+        }
+        HostInputEvent::DeviceRemoved { source_id, .. } => {
+            input_inventory.remove(*source_id);
+            Some(*source_id)
+        }
+        _ => None,
+    };
+    handle_host_input(state, backend, ev);
+    if let Some(source_id) = config_source_lifecycle {
+        cancel_queued_xi_configs_for_source(
+            state,
+            backend,
+            pending,
+            xi_config_lane,
+            reset_trigger,
+            source_id,
+            current_generation,
+        );
+    }
+}
+
+fn finish_xi_config_result(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    token: crate::xinput::libinput_props::DeviceConfigToken,
+    source: crate::xinput::InputSourceId,
+    result: Result<(), crate::xinput::libinput_props::DeviceConfigError>,
+    current_generation: Generation,
+) {
+    let matches_submitted = lane
+        .in_flight
+        .as_ref()
+        .is_some_and(|in_flight| in_flight.token == token && in_flight.source == source);
+    if !matches_submitted {
+        if let Some(timed_out) = lane.timed_out.remove(&(token, source)) {
+            if result.is_ok() {
+                match apply_confirmed_xi_config(
+                    state,
+                    input_inventory,
+                    source,
+                    timed_out.change,
+                    None,
+                ) {
+                    Ok((facet_id, property, what)) => {
+                        let _ = crate::core_loop::process_request::emit_property_change(
+                            state, facet_id, property, what,
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            "late applied input config could not be reconciled token={} source={}: {error:?}",
+                            token.0, source.0
+                        );
+                    }
+                }
+            }
+            drive_xi_config_lane(
+                state,
+                backend,
+                input_inventory,
+                pending,
+                lane,
+                reset_trigger,
+                current_generation,
+            );
+            return;
+        }
+        warn!(
+            "discarding stale input config result token={} source={}",
+            token.0, source.0
+        );
+        return;
+    }
+    let in_flight = lane
+        .in_flight
+        .take()
+        .expect("matching submitted config exists");
+    let protocol = in_flight.protocol.filter(|protocol| {
+        protocol.generation == current_generation
+            && state
+                .clients
+                .contains_key(&protocol.validated.request.client.0)
+    });
+    match result {
+        Ok(()) => {
+            // Xorg stores the property only after all check-only handlers
+            // succeed (`Xi/xiproperty.c:759-801`); commit only the confirmed
+            // libinput result here.
+            let validated = protocol.as_ref().map(|protocol| &protocol.validated);
+            match apply_confirmed_xi_config(
+                state,
+                input_inventory,
+                in_flight.source,
+                in_flight.change,
+                validated,
+            ) {
+                Ok((facet_id, property, what)) => {
+                    let _ = crate::core_loop::process_request::emit_property_change(
+                        state, facet_id, property, what,
+                    );
+                    if let Some(protocol) = protocol.as_ref() {
+                        let client = protocol.validated.request.client;
+                        pending.unblock_xi_config(client);
+                        grant_request_credit(state, client, protocol.request_wire_bytes);
+                    }
+                }
+                Err(error) => {
+                    if let Some(protocol) = protocol.as_ref() {
+                        let request = &protocol.validated.request;
+                        emit_xi_config_error(
+                            state,
+                            backend,
+                            pending,
+                            lane,
+                            reset_trigger,
+                            request,
+                            error,
+                            protocol.generation,
+                            protocol.request_wire_bytes,
+                            current_generation,
+                        );
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            if let Some(protocol) = protocol.as_ref() {
+                let request = &protocol.validated.request;
+                emit_xi_config_error(
+                    state,
+                    backend,
+                    pending,
+                    lane,
+                    reset_trigger,
+                    request,
+                    xi_error_for_config(request, error),
+                    protocol.generation,
+                    protocol.request_wire_bytes,
+                    current_generation,
+                );
+            }
+        }
+    }
+    drive_xi_config_lane(
+        state,
+        backend,
+        input_inventory,
+        pending,
+        lane,
+        reset_trigger,
+        current_generation,
+    );
+}
+
+/// Dispatch the process-lifetime completion message through the same runner
+/// path used by `run_core`. Keeping the `Message` boundary here lets tests
+/// exercise token/source matching and late-generation commits without
+/// substituting a completion-only test helper.
+pub(super) fn dispatch_device_config_result(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    pending: &mut PendingBackendRequests,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    message: Message,
+    current_generation: Generation,
+) {
+    let Message::DeviceConfigResult {
+        token,
+        source,
+        result,
+    } = message
+    else {
+        unreachable!("device config dispatcher received a different message")
+    };
+    finish_xi_config_result(
+        state,
+        backend,
+        input_inventory,
+        pending,
+        lane,
+        reset_trigger,
+        token,
+        source,
+        result,
+        current_generation,
+    );
 }
 
 pub(crate) fn cancel_all_pending_backend_requests(
@@ -888,14 +1699,20 @@ pub(crate) fn cancel_all_pending_backend_requests(
     for token in pending.take_all_crtc_tokens() {
         backend.cancel_crtc_config(token);
     }
+    for token in pending.take_all_dri3_tokens() {
+        backend.release_dri3_export(token);
+    }
 }
 
 fn process_one_request(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
     reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
     requests_this_iter: &mut u32,
     request_budget: &mut usize,
     req: DeferredRequest,
@@ -936,7 +1753,8 @@ fn process_one_request(
     // in the handler guarantees that, and an unreported departure is a
     // trigger that silently never fires again.
     if state.clients.len() < clients_before {
-        reset_trigger.note_client_departed(state.clients.len());
+        reset_trigger.note_client_departed(state.counted_clients());
+        backend.note_client_count(state.counted_clients());
     }
     if let Some(start) = req_start {
         telemetry.record_request(
@@ -952,7 +1770,14 @@ fn process_one_request(
     match outcome {
         RequestOutcome::Handled => grant_request_credit(state, req_client, req_wire_bytes),
         RequestOutcome::Disconnect(disc_id) => {
-            disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, disc_id);
+            disconnect_with_pending_cleanup(
+                state,
+                backend,
+                pending,
+                xi_config_lane,
+                reset_trigger,
+                disc_id,
+            );
         }
         RequestOutcome::PendingCrtcConfig(continuation) => {
             let token = continuation.token;
@@ -976,8 +1801,55 @@ fn process_one_request(
                 // An ordering/token contract violation cannot be replied to
                 // safely without overtaking an earlier request from this
                 // client. Disconnect it and cancel any older parked work.
-                disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, req_client);
+                disconnect_with_pending_cleanup(
+                    state,
+                    backend,
+                    pending,
+                    xi_config_lane,
+                    reset_trigger,
+                    req_client,
+                );
             }
+        }
+        RequestOutcome::PendingDri3Export(continuation) => {
+            let token = continuation.token;
+            let parked = ParkedDri3Export {
+                client_id: req_client,
+                sequence: req.sequence,
+                continuation,
+                request_wire_bytes: req_wire_bytes,
+            };
+            if let Err(reason) = pending.park_dri3(parked) {
+                log::error!(
+                    "cannot park deferred DRI3 export for client {} token {}: {reason}",
+                    req_client.0,
+                    token.0,
+                );
+                if !pending.dri3_by_token.contains_key(&token) {
+                    backend.release_dri3_export(token);
+                }
+                disconnect_with_pending_cleanup(
+                    state,
+                    backend,
+                    pending,
+                    xi_config_lane,
+                    reset_trigger,
+                    req_client,
+                );
+            }
+        }
+        RequestOutcome::PendingXiConfig(request) => {
+            route_pending_xi_config(
+                state,
+                backend,
+                input_inventory,
+                pending,
+                xi_config_lane,
+                reset_trigger,
+                request,
+                req_wire_bytes,
+                current_generation,
+            );
         }
     }
 }
@@ -985,9 +1857,12 @@ fn process_one_request(
 fn drain_pending_requests(
     state: &mut ServerState,
     backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
     telemetry: &mut LoopTelemetry,
     pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
     reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
     deferred_requests: &mut FairRequestQueue,
     server_grab_waiters: &mut VecDeque<DeferredRequest>,
     requests_this_iter: &mut u32,
@@ -1006,9 +1881,12 @@ fn drain_pending_requests(
         process_one_request(
             state,
             backend,
+            input_inventory,
             telemetry,
             pending,
+            xi_config_lane,
             reset_trigger,
+            current_generation,
             requests_this_iter,
             request_budget,
             req,
@@ -1019,8 +1897,39 @@ fn drain_pending_requests(
     }
 }
 
+fn drain_vt_release_requests(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    input_inventory: &mut InputInventory,
+    telemetry: &mut LoopTelemetry,
+    pending: &mut PendingBackendRequests,
+    lane: &mut XiConfigLane,
+    reset_trigger: &mut ResetTrigger,
+    current_generation: Generation,
+    deferred_requests: &mut FairRequestQueue,
+    server_grab_waiters: &mut VecDeque<DeferredRequest>,
+) {
+    let mut requests_this_iter = 0;
+    let mut request_budget = usize::MAX;
+    drain_pending_requests(
+        state,
+        backend,
+        input_inventory,
+        telemetry,
+        pending,
+        lane,
+        reset_trigger,
+        current_generation,
+        deferred_requests,
+        server_grab_waiters,
+        &mut requests_this_iter,
+        &mut request_budget,
+        Instant::now(),
+    );
+}
+
 /// Process one X protocol request and run its post-handler bookkeeping
-/// (mark_dirty + disconnect-on-error). Factored so the two drain paths
+/// (damage-notify flush + XFIXES cursor notify). Factored so the two drain paths
 /// in `run_core` (the deferred queue at the top of each iteration and
 /// the channel drain inside `NOTIFY_TOKEN`) share identical semantics.
 ///
@@ -1082,11 +1991,14 @@ fn process_request_inline(
     };
     // Pending work has not committed any visible result yet. Its completion
     // path performs this bookkeeping exactly once when the result is applied.
-    if !matches!(&outcome, RequestOutcome::PendingCrtcConfig(_)) {
-        if std::mem::take(&mut state.damage_notify_flush_pending) {
-            backend.flush_before_damage_notify();
-        }
-        backend.mark_dirty();
+    if !matches!(
+        &outcome,
+        RequestOutcome::PendingCrtcConfig(_)
+            | RequestOutcome::PendingDri3Export(_)
+            | RequestOutcome::PendingXiConfig(_)
+    ) && std::mem::take(&mut state.damage_notify_flush_pending)
+    {
+        backend.flush_before_damage_notify();
     }
     // A request that changed the displayed cursor (DefineCursor, a grab,
     // XFIXES ChangeCursor, a map under the pointer) reports it before the
@@ -1102,6 +2014,7 @@ pub(crate) fn drain_ready_crtc_configs(
     state: &mut ServerState,
     backend: &mut dyn Backend,
     pending: &mut PendingBackendRequests,
+    xi_config_lane: &mut XiConfigLane,
     reset_trigger: &mut ResetTrigger,
 ) {
     for token in backend.drain_ready_crtc_configs() {
@@ -1139,29 +2052,28 @@ pub(crate) fn drain_ready_crtc_configs(
         if std::mem::take(&mut state.damage_notify_flush_pending) {
             backend.flush_before_damage_notify();
         }
-        backend.mark_dirty();
         match outcome {
             RequestOutcome::Disconnect(client) => {
-                disconnect_with_pending_cleanup(state, backend, pending, reset_trigger, client);
+                disconnect_with_pending_cleanup(
+                    state,
+                    backend,
+                    pending,
+                    xi_config_lane,
+                    reset_trigger,
+                    client,
+                );
             }
             RequestOutcome::Handled => {
                 grant_request_credit(state, parked.client_id, parked.request_wire_bytes)
             }
-            RequestOutcome::PendingCrtcConfig(_) => {
+            RequestOutcome::PendingCrtcConfig(_)
+            | RequestOutcome::PendingDri3Export(_)
+            | RequestOutcome::PendingXiConfig(_) => {
                 unreachable!("CRTC completion cannot start a second asynchronous request")
             }
         }
     }
 }
-
-/// X11 default auto-repeat initial delay before the first synthetic
-/// KeyPress fires. Matches xset's `-r` defaults; not yet pulled from
-/// the XKB Controls block.
-const REPEAT_INITIAL_DELAY: Duration = Duration::from_millis(660);
-
-/// X11 default auto-repeat period (25 Hz = 40 ms between synthetic
-/// KeyPress events while a key is held).
-const REPEAT_PERIOD: Duration = Duration::from_millis(40);
 
 /// Run the core loop until `Message::Shutdown` is observed.
 ///
@@ -1174,7 +2086,7 @@ const REPEAT_PERIOD: Duration = Duration::from_millis(40);
 /// of the run — the whole point of the single-threaded refactor is
 /// that only this thread can mutate them.
 pub fn run_core(
-    mut poll: Poll,
+    poll: Poll,
     rx: CoreReceiver,
     sender: CoreSender,
     state: &mut ServerState,
@@ -1185,7 +2097,41 @@ pub fn run_core(
     reset_policy: ResetPolicy,
     xdmcp: Option<XdmcpService>,
 ) -> io::Result<()> {
+    let mut input_inventory = InputInventory::new();
+    run_core_with_inventory(
+        poll,
+        rx,
+        sender,
+        state,
+        backend,
+        listeners,
+        client_id_allocator,
+        auth,
+        reset_policy,
+        xdmcp,
+        &mut input_inventory,
+    )
+}
+
+fn run_core_with_inventory(
+    mut poll: Poll,
+    rx: CoreReceiver,
+    sender: CoreSender,
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    listeners: impl IntoIterator<Item = Listener>,
+    client_id_allocator: &ClientIdAllocator,
+    auth: Arc<AuthState>,
+    reset_policy: ResetPolicy,
+    xdmcp: Option<XdmcpService>,
+    input_inventory: &mut InputInventory,
+) -> io::Result<()> {
     let setup_registry = setup_thread::make_registry();
+    state.host_access = super::auth::HostAccessHandle {
+        auth: Arc::clone(&auth),
+        generation: rx.current_generation(),
+        policies: std::mem::take(&mut state.host_access.policies),
+    };
     // The generation counter is shared with every `CoreSender`; the
     // receiver is the loop's sole handle to it, and the reset boundary
     // is the only thing that bumps it.
@@ -1197,13 +2143,11 @@ pub fn run_core(
     let listeners: Vec<_> = listeners
         .into_iter()
         .enumerate()
-        .map(|(index, listener)| {
+        .map(|(index, mut listener)| {
             listener.set_nonblocking(true)?;
-            let raw = listener.as_raw_fd();
             let token = listener_token(index)
                 .ok_or_else(|| io::Error::other("too many client listeners"))?;
-            poll.registry()
-                .register(&mut SourceFd(&raw), token, Interest::READABLE)?;
+            listener.register(poll.registry(), token)?;
             Ok(listener)
         })
         .collect::<io::Result<_>>()?;
@@ -1232,8 +2176,16 @@ pub fn run_core(
         .into_iter()
         .map(|(fd, kind)| BackendPollSource { fd, kind })
         .collect();
+    // TODO(windows): no backend has a poll source there yet.
+    #[cfg(windows)]
+    if !backend_poll_sources.is_empty() {
+        return Err(io::Error::other(
+            "backend poll fds are unsupported on Windows",
+        ));
+    }
+    #[cfg(unix)]
     for (index, source) in backend_poll_sources.iter().enumerate() {
-        let token = backend_token(index).ok_or_else(|| {
+        let token = super::poll_tokens::backend_token(index).ok_or_else(|| {
             io::Error::other(format!(
                 "backend exposes too many poll fds: {}",
                 backend_poll_sources.len()
@@ -1242,12 +2194,15 @@ pub fn run_core(
         poll.registry()
             .register(&mut SourceFd(&source.fd), token, Interest::READABLE)?;
     }
+    #[cfg(unix)]
+    let mut backend_writable = vec![false; backend_poll_sources.len()];
 
     // Probe input devices at startup, Xorg-style: drain libinput's
     // initial device enumeration and seed `state.xi_devices` BEFORE the
     // serve loop begins, so the first client to connect sees the real
-    // device model (e.g. device 4 = touchpad) immediately. Without this
-    // the registry carries only the static {2,3,4,5} model until
+    // device model (including a physical touchpad facet with its dynamic
+    // ID) immediately. Without this the registry carries only the static
+    // master and XTEST devices until
     // libinput's first `DeviceAdded` burst is dispatched from the loop,
     // which on real hardware can land seconds after the desktop's
     // clients have already enumerated devices and cached a plain
@@ -1285,10 +2240,10 @@ pub fn run_core(
     let mut deferred_requests = FairRequestQueue::default();
     let mut server_grab_waiters: VecDeque<DeferredRequest> = VecDeque::new();
     let mut pending_backend_requests = PendingBackendRequests::default();
+    let mut xi_config_lane = XiConfigLane::default();
     // Process-lifetime, not per-generation — see `input_inventory`'s
     // module docs. Populated below on every `HostInput` device event;
     // nothing consumes it yet (step 1 of the server-reset plan).
-    let mut input_inventory = InputInventory::new();
     loop {
         // The grab can be dropped by paths that have no release check of
         // their own — notably the two disconnect sites outside the message
@@ -1320,7 +2275,11 @@ pub fn run_core(
             // commit retry). `Duration::ZERO` keeps mio returning
             // immediately when a deadline is already due.
             let now = Instant::now();
-            let repeat_deadline = state.repeat_state.as_ref().map(|r| r.next_fire);
+            let repeat_deadline = state
+                .key_repeats
+                .values()
+                .map(|repeat| repeat.next_fire)
+                .min();
             let backend_deadline = backend.next_wakeup();
             let dpms_deadline = state.dpms_transition_deadline();
             let ss_idle_deadline = state.screensaver_idle_deadline();
@@ -1359,6 +2318,15 @@ pub fn run_core(
         // (project_reclamation_starvation_leak). No-op for backends without
         // GPU resources to reap.
         backend.before_block();
+        // A host display connection whose flush left output queued is
+        // watched for writable too, as a client's output is.
+        #[cfg(unix)]
+        watch_backend_writable(
+            poll.registry(),
+            &backend_poll_sources,
+            &mut backend_writable,
+            backend.host_display_wants_writable(),
+        );
         // Retry on EINTR. A signal delivered while we're blocked in poll()
         // surfaces as `ErrorKind::Interrupted` — notably SIGCONT and the
         // VT/seat signals on resume-from-suspend. That is NOT fatal: re-poll.
@@ -1394,9 +2362,12 @@ pub fn run_core(
         drain_pending_requests(
             state,
             backend,
+            input_inventory,
             &mut telemetry,
             &mut pending_backend_requests,
+            &mut xi_config_lane,
             &mut reset_trigger,
+            rx.current_generation(),
             &mut deferred_requests,
             &mut server_grab_waiters,
             &mut requests_this_iter,
@@ -1473,6 +2444,16 @@ pub fn run_core(
                     BackendFdKind::ScanoutRenderCompletion => {
                         backend.on_scanout_render_completion(state);
                     }
+                    BackendFdKind::HostDisplay => {
+                        if !backend.on_host_display_ready(state) {
+                            log::info!("rootless host display closed; shutting down");
+                            cancel_all_pending_backend_requests(
+                                backend,
+                                &mut pending_backend_requests,
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
                 continue;
             }
@@ -1480,7 +2461,8 @@ pub fn run_core(
                 NOTIFY_TOKEN => {
                     let mut channel_requests = 0_usize;
                     let mut channel_requests_by_client = HashMap::new();
-                    for (msg_generation, msg) in rx.try_recv_all_tagged() {
+                    let mut channel_messages: VecDeque<_> = rx.try_recv_all_tagged().collect();
+                    while let Some((msg_generation, msg)) = channel_messages.pop_front() {
                         // Discard stale session-scoped traffic at the top
                         // of dispatch (server-reset plan step 2). Inert
                         // today: the generation never advances yet, so
@@ -1544,6 +2526,26 @@ pub fn run_core(
                                 telemetry.record_deferred_push(req.id);
                                 deferred_requests.push_back(req);
                             }
+                            Message::InternalClient(stream) => {
+                                let id = client_id_allocator.allocate();
+                                // No `SCM_RIGHTS` over the loopback TCP pair.
+                                let fd_passing = !matches!(stream, Transport::Tcp(_));
+                                if let Err(err) = setup_thread::spawn(
+                                    id,
+                                    stream,
+                                    sender.bind(),
+                                    setup_registry.clone(),
+                                    auth.clone(),
+                                    true,
+                                    fd_passing,
+                                    true,
+                                ) {
+                                    error!(
+                                        "setup thread spawn failed for internal client {}: {err}",
+                                        id.0
+                                    );
+                                }
+                            }
                             Message::SetupAllocate { id, response_tx } => {
                                 handle_setup_allocate(state, id, response_tx);
                             }
@@ -1556,9 +2558,12 @@ pub fn run_core(
                                 byte_order,
                                 is_local,
                                 fd_passing,
+                                internal,
+                                peer,
+                                admission,
+                                setup_reply,
                             } => {
                                 if let Err(err) = handle_client_setup_complete(
-                                    poll.registry(),
                                     &sender,
                                     &setup_registry,
                                     state,
@@ -1568,17 +2573,23 @@ pub fn run_core(
                                     resource_id_base,
                                     resource_id_mask,
                                     byte_order,
-                                    is_local,
-                                    fd_passing,
+                                    (is_local, fd_passing, internal),
+                                    peer,
+                                    admission,
+                                    &setup_reply,
                                 ) {
                                     error!("ClientSetupComplete for client {} failed: {err}", id.0);
                                     disconnect_with_pending_cleanup(
                                         state,
                                         backend,
                                         &mut pending_backend_requests,
+                                        &mut xi_config_lane,
                                         &mut reset_trigger,
                                         id,
                                     );
+                                } else if internal {
+                                    // The server's own client: no XDMCP
+                                    // session, and it arms no reset.
                                 } else if let Some(service) = xdmcp.as_mut() {
                                     // `XdmcpOpenDisplay` (`xdmcp.c:632`),
                                     // called from `ClientAuthorized`
@@ -1609,6 +2620,7 @@ pub fn run_core(
                                             state,
                                             backend,
                                             &mut pending_backend_requests,
+                                            &mut xi_config_lane,
                                             &mut reset_trigger,
                                             id,
                                         );
@@ -1618,12 +2630,14 @@ pub fn run_core(
                                 } else {
                                     reset_trigger.note_client_established();
                                 }
+                                backend.note_client_count(state.counted_clients());
                             }
                             Message::ClientDisconnected { id, reason: _ } => {
                                 disconnect_with_pending_cleanup(
                                     state,
                                     backend,
                                     &mut pending_backend_requests,
+                                    &mut xi_config_lane,
                                     &mut reset_trigger,
                                     id,
                                 );
@@ -1632,32 +2646,41 @@ pub fn run_core(
                                 if telemetry.enabled {
                                     telemetry.record_host_input(Instant::now());
                                 }
-                                // Process-lifetime bookkeeping: maintain
-                                // `InputInventory` regardless of
-                                // generation (it always dispatches, see
-                                // above) so a device add/remove is never
-                                // missed, even mid-reset once resets
-                                // exist. Nothing consumes the inventory
-                                // yet — purely additive.
-                                match &ev {
-                                    HostInputEvent::DeviceAdded(info) => {
-                                        input_inventory.add(info.clone());
-                                    }
-                                    HostInputEvent::DeviceRemoved { device_node } => {
-                                        input_inventory.remove(device_node);
-                                    }
-                                    _ => {}
-                                }
-                                handle_host_input(state, backend, ev);
-                                backend.mark_dirty();
+                                dispatch_host_input(
+                                    state,
+                                    backend,
+                                    input_inventory,
+                                    &mut pending_backend_requests,
+                                    &mut xi_config_lane,
+                                    &mut reset_trigger,
+                                    ev,
+                                    rx.current_generation(),
+                                );
                             }
                             Message::CrtcConfigReady => {
                                 drain_ready_crtc_configs(
                                     state,
                                     backend,
                                     &mut pending_backend_requests,
+                                    &mut xi_config_lane,
                                     &mut reset_trigger,
                                 );
+                            }
+                            message @ Message::DeviceConfigResult { .. } => {
+                                dispatch_device_config_result(
+                                    state,
+                                    backend,
+                                    input_inventory,
+                                    &mut pending_backend_requests,
+                                    &mut xi_config_lane,
+                                    &mut reset_trigger,
+                                    message,
+                                    rx.current_generation(),
+                                )
+                            }
+                            Message::InputPaused => {
+                                // Consumed only by the synchronous VT-release
+                                // barrier; ignore any duplicate or stale ack.
                             }
                             Message::VtRelease => {
                                 // When VT switching isn't armed there is no
@@ -1666,13 +2689,184 @@ pub fn run_core(
                                 // DumpDrawables via the Ctrl-Alt-Enter /
                                 // Ctrl-Alt-F12 hotkeys, not this path.)
                                 if backend.vt_switching_armed() {
-                                    backend.on_vt_release(state);
+                                    // Dispatch accepted requests before the
+                                    // pause is queued so their writes can be
+                                    // covered by the input thread's FIFO.
+                                    drain_vt_release_requests(
+                                        state,
+                                        backend,
+                                        input_inventory,
+                                        &mut telemetry,
+                                        &mut pending_backend_requests,
+                                        &mut xi_config_lane,
+                                        &mut reset_trigger,
+                                        rx.current_generation(),
+                                        &mut deferred_requests,
+                                        &mut server_grab_waiters,
+                                    );
+                                    fail_unsubmitted_xi_configs_for_vt_release(
+                                        state,
+                                        backend,
+                                        &mut pending_backend_requests,
+                                        &mut xi_config_lane,
+                                        &mut reset_trigger,
+                                        rx.current_generation(),
+                                    );
                                 }
+                                dispatch_vt_release(
+                                    state,
+                                    backend,
+                                    input_inventory,
+                                    |state, backend, input_inventory, pause_barrier_queued| {
+                                        let mut deferred = VecDeque::new();
+                                        let mut pause_acknowledged = false;
+                                        if pause_barrier_queued {
+                                            let deadline = Instant::now() + VT_INPUT_PAUSE_TIMEOUT;
+                                            loop {
+                                                let remaining = deadline
+                                                    .saturating_duration_since(Instant::now());
+                                                if remaining.is_zero() {
+                                                    break;
+                                                }
+                                                // Messages after VtRelease may already be in
+                                                // this batch: prefer them before receiving, or a
+                                                // pre-drained pause ack could be stranded behind
+                                                // the release.
+                                                let message = if let Some(message) =
+                                                    channel_messages.pop_front()
+                                                {
+                                                    Ok(message)
+                                                } else {
+                                                    rx.recv_tagged_timeout(remaining)
+                                                };
+                                                let Ok((completion_generation, completion)) =
+                                                    message
+                                                else {
+                                                    break;
+                                                };
+                                                if !generation::should_dispatch(
+                                                    rx.current_generation(),
+                                                    completion_generation,
+                                                    &completion,
+                                                ) {
+                                                    continue;
+                                                }
+                                                match completion {
+                                                    message @ Message::DeviceConfigResult {
+                                                        ..
+                                                    } => {
+                                                        dispatch_device_config_result(
+                                                            state,
+                                                            backend,
+                                                            input_inventory,
+                                                            &mut pending_backend_requests,
+                                                            &mut xi_config_lane,
+                                                            &mut reset_trigger,
+                                                            message,
+                                                            rx.current_generation(),
+                                                        );
+                                                        drain_vt_release_requests(
+                                                            state,
+                                                            backend,
+                                                            input_inventory,
+                                                            &mut telemetry,
+                                                            &mut pending_backend_requests,
+                                                            &mut xi_config_lane,
+                                                            &mut reset_trigger,
+                                                            rx.current_generation(),
+                                                            &mut deferred_requests,
+                                                            &mut server_grab_waiters,
+                                                        );
+                                                    }
+                                                    Message::InputPaused => {
+                                                        drain_vt_release_requests(
+                                                            state,
+                                                            backend,
+                                                            input_inventory,
+                                                            &mut telemetry,
+                                                            &mut pending_backend_requests,
+                                                            &mut xi_config_lane,
+                                                            &mut reset_trigger,
+                                                            rx.current_generation(),
+                                                            &mut deferred_requests,
+                                                            &mut server_grab_waiters,
+                                                        );
+                                                        pause_acknowledged = true;
+                                                        break;
+                                                    }
+                                                    Message::Request {
+                                                        id,
+                                                        sequence,
+                                                        accepted_at,
+                                                        header,
+                                                        body,
+                                                        attached_fd,
+                                                    } => {
+                                                        if telemetry.enabled {
+                                                            channel_requests += 1;
+                                                            *channel_requests_by_client
+                                                                .entry(id)
+                                                                .or_insert(0) += 1;
+                                                            telemetry.record_request_accepted(
+                                                                id, sequence,
+                                                            );
+                                                        }
+                                                        telemetry.record_deferred_push(id);
+                                                        deferred_requests.push_back(
+                                                            DeferredRequest {
+                                                                id,
+                                                                sequence,
+                                                                accepted_at,
+                                                                header,
+                                                                body,
+                                                                attached_fd,
+                                                            },
+                                                        );
+                                                        drain_vt_release_requests(
+                                                            state,
+                                                            backend,
+                                                            input_inventory,
+                                                            &mut telemetry,
+                                                            &mut pending_backend_requests,
+                                                            &mut xi_config_lane,
+                                                            &mut reset_trigger,
+                                                            rx.current_generation(),
+                                                            &mut deferred_requests,
+                                                            &mut server_grab_waiters,
+                                                        );
+                                                    }
+                                                    message => deferred.push_back((
+                                                        completion_generation,
+                                                        message,
+                                                    )),
+                                                }
+                                            }
+                                        }
+                                        if pause_barrier_queued && !pause_acknowledged {
+                                            warn!(
+                                                "VT input pause barrier was not acknowledged within {:?}; failing outstanding XI config write",
+                                                VT_INPUT_PAUSE_TIMEOUT,
+                                            );
+                                        }
+                                        // This is normally empty after InputPaused because
+                                        // input-thread config results precede the FIFO ack.
+                                        // Still reject any residue, including when no barrier
+                                        // could be queued, before KMS starts yielding the VT.
+                                        fail_in_flight_xi_config_for_vt_release(
+                                            state,
+                                            backend,
+                                            &mut pending_backend_requests,
+                                            &mut xi_config_lane,
+                                            &mut reset_trigger,
+                                            rx.current_generation(),
+                                        );
+                                        channel_messages.append(&mut deferred);
+                                    },
+                                );
+                                xi_config_lane.reject_unsubmitted_for_vt_release = false;
                             }
                             Message::VtAcquire => {
-                                if backend.vt_switching_armed() {
-                                    backend.on_vt_acquire(state);
-                                }
+                                dispatch_vt_acquire(state, backend);
                             }
                             Message::SwitchVt(vt) => {
                                 if backend.vt_switching_armed() {
@@ -1681,6 +2875,10 @@ pub fn run_core(
                             }
                             Message::DumpScanout => backend.dump_scanout(),
                             Message::DumpDrawables => backend.dump_drawables(),
+                            Message::PlatformEvent => backend.on_platform_event(state),
+                            Message::Rootless(r) => {
+                                crate::rootless::host_request(state, backend, r)
+                            }
                         }
                         if state.server_grab_owner.is_none() {
                             release_server_grab_waiters(
@@ -1694,9 +2892,12 @@ pub fn run_core(
                     drain_pending_requests(
                         state,
                         backend,
+                        input_inventory,
                         &mut telemetry,
                         &mut pending_backend_requests,
+                        &mut xi_config_lane,
                         &mut reset_trigger,
+                        rx.current_generation(),
                         &mut deferred_requests,
                         &mut server_grab_waiters,
                         &mut requests_this_iter,
@@ -1716,10 +2917,9 @@ pub fn run_core(
                     // WRITABLE. If the peer disappeared, mark the
                     // client for disconnect.
                     if !ev.is_writable() {
-                        // mio always reports both READABLE+WRITABLE
-                        // as readiness even when only one was asked
-                        // for; the writer fd's READABLE wakeups are
-                        // ignored — the reader thread owns reads.
+                        // The writer fd is registered WRITABLE only, but
+                        // a hangup or error can still be reported on its
+                        // own; the reader thread sees the disconnect.
                         continue;
                     }
                     let Some(client) = state.clients.get_mut(&client_id.0) else {
@@ -1734,6 +2934,7 @@ pub fn run_core(
                                 state,
                                 backend,
                                 &mut pending_backend_requests,
+                                &mut xi_config_lane,
                                 &mut reset_trigger,
                                 client_id,
                             );
@@ -1753,28 +2954,14 @@ pub fn run_core(
         // this iteration. Fanout runs at the outermost stack frame
         // — no `wait_for_reply` is on the stack here — so handlers
         // that issue further host requests are safe.
-        if dispatch_pending_host_events(state, backend) {
-            // Host events (pointer, expose, configure) can change
-            // visible state; mark dirty so the KMS gate re-arms. No-op
-            // for backends without their own composite loop.
-            backend.mark_dirty();
-        }
+        dispatch_pending_host_events(state, backend);
 
         // Auto-repeat: if a key is held and its `next_fire` has
         // elapsed (either because the poll woke on the timeout, or
         // because an unrelated event arrived after the deadline),
         // fan out a synthetic KeyRelease+KeyPress pair.
-        if state.repeat_state.is_some() {
-            // Only poke the compositor when a repeat actually fired.
-            // `fire_pending_repeats` returns false when the armed key
-            // is merely not-yet-due (the common case every iteration
-            // while a key is held) — an unconditional `mark_dirty()`
-            // here re-dirtied the scene at the loop-iteration rate,
-            // busy-spinning the compositor (and never letting it idle
-            // when a phantom key is stuck armed).
-            if fire_pending_repeats(state, backend) {
-                backend.mark_dirty();
-            }
+        if !state.key_repeats.is_empty() {
+            fire_pending_repeats(state, backend);
         }
 
         // DPMS: evaluate idle-cascade transitions.
@@ -1818,17 +3005,33 @@ pub fn run_core(
         // reregister errors that mean "fd already deregistered" so a
         // disconnect that ran during this iteration doesn't break
         // the next one.
-        for disc_id in reconcile_client_writable_interest(poll.registry(), state) {
-            disconnect_with_pending_cleanup(
-                state,
-                backend,
-                &mut pending_backend_requests,
-                &mut reset_trigger,
-                disc_id,
-            );
-        }
+        settle_client_output(
+            poll.registry(),
+            state,
+            backend,
+            &mut pending_backend_requests,
+            &mut xi_config_lane,
+            &mut reset_trigger,
+        );
 
         run_iteration_tail(state, backend);
+        drain_ready_dri3_exports(
+            state,
+            backend,
+            &mut pending_backend_requests,
+            &mut xi_config_lane,
+            &mut reset_trigger,
+        );
+        // The tail delivers deferred input and Present events too: settle
+        // again so nothing it buffered waits without WRITABLE interest.
+        settle_client_output(
+            poll.registry(),
+            state,
+            backend,
+            &mut pending_backend_requests,
+            &mut xi_config_lane,
+            &mut reset_trigger,
+        );
 
         // Diagnostic: per-iteration accounting + per-second telemetry
         // emit. Both are no-ops when `YSERVER_LOOP_TELEMETRY` is unset.
@@ -1844,6 +3047,16 @@ pub fn run_core(
                 });
                 telemetry.note_export_holders(now, changed);
             }
+        }
+
+        // A client teardown could not complete (`fatal_teardown`): that
+        // client's windows, resources and ID range are still in place, so
+        // the session cannot go on. Shut down as `-terminate` does.
+        if let Some(cause) = state.fatal_teardown.clone() {
+            log::error!("core loop: terminating, {cause}");
+            setup_thread::shutdown_all(&setup_registry);
+            cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
+            return Err(std::io::Error::other(cause));
         }
 
         // The generation boundary. Reached only from an action the
@@ -1901,13 +3114,18 @@ pub fn run_core(
                 return Ok(());
             }
             Some(ResetAction::Reset) => {
+                // Unsubmitted client requests belong to the generation
+                // being retired. Keep an already submitted input command in
+                // the process-lifetime lane, but discard its old protocol
+                // continuation so a late success commits using current atoms.
+                cancel_unsubmitted_xi_configs(&mut xi_config_lane, &mut pending_backend_requests);
                 let outcome = reset_generation(
                     state,
                     backend,
                     poll.registry(),
                     &generations,
                     &setup_registry,
-                    &input_inventory,
+                    input_inventory,
                     GenerationLocals {
                         deferred_requests: &mut deferred_requests,
                         server_grab_waiters: &mut server_grab_waiters,
@@ -1923,7 +3141,10 @@ pub fn run_core(
                 let Some(generation) = outcome else {
                     setup_thread::shutdown_all(&setup_registry);
                     cancel_all_pending_backend_requests(backend, &mut pending_backend_requests);
-                    return Ok(());
+                    return state
+                        .fatal_teardown
+                        .clone()
+                        .map_or(Ok(()), |cause| Err(io::Error::other(cause)));
                 };
                 // Disarm for the generation just installed. Without
                 // this the empty client set the reset leaves behind
@@ -1969,6 +3190,8 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
     // damage exists.
     drain_present_completions(state, backend);
 
+    crate::rootless::reconcile_and_dispatch(state, backend);
+
     // Wake the composite path back up if the backend went dormant
     // after the previous pageflip-complete (because nothing was
     // dirty) and fresh damage has since arrived. No-op for
@@ -1992,7 +3215,7 @@ pub(crate) fn run_iteration_tail(state: &mut ServerState, backend: &mut dyn Back
 /// starve with no fd left to wake `poll`. Running here, once per iteration,
 /// also covers parks made by the epfd-driven drain (`run.rs:1027`, itself
 /// pre-compose) in the same iteration — the backend dedups against its
-/// per-CRTC armed-target map so a second call per iteration is safe.
+/// per-CRTC slots so a second call per iteration is safe.
 pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dyn Backend) {
     // Idle vblank arming: if NotifyMSC requests remain parked, ask the
     // backend to schedule a kernel vblank so the clock keeps advancing even
@@ -2034,6 +3257,18 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
         let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<u64>> =
             std::collections::BTreeMap::new();
         for pending in &state.present_pending_complete {
+            let due_clock = crate::core_loop::process_request::present_completion_due_clock(
+                state,
+                &pending.event,
+            );
+            if due_clock.msc != 0
+                && !crate::present_scheduler::msc_is_after(
+                    pending.effective_target_msc,
+                    due_clock.msc,
+                )
+            {
+                continue;
+            }
             by_domain
                 .entry((pending.event.crtc_id, pending.event.crtc_epoch))
                 .or_default()
@@ -2044,17 +3279,19 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
                 continue;
             }
             // A page flip in flight is not sufficient as the only wake
-            // source: arm the selected CRTC independently.
+            // source: keep one tagged next-vblank wake for future targets.
             let result = if backend.present_absolute_vblank_arm_supported(crtc_id) {
-                backend.arm_present_absolute_vblank(crtc_id, &targets)
+                backend.arm_present_shared_wake(crtc_id)
             } else {
-                backend.arm_present_completion_idle_vblanks(crtc_id, &targets)
+                backend
+                    .arm_present_completion_idle_vblanks(crtc_id, &targets)
+                    .map(|armed| armed > 0)
             };
             match result {
                 Ok(armed) => {
-                    if armed > 0 {
+                    if armed {
                         log::debug!(
-                            "PRESENT-DBG: arm_present_completion_vblanks crtc=0x{crtc_id:x} pending={} -> armed={armed}",
+                            "PRESENT-DBG: arm_present_completion_vblanks crtc=0x{crtc_id:x} pending={} -> armed",
                             targets.len()
                         );
                     }
@@ -2067,28 +3304,19 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
         }
     }
 
-    // Third arming call site (spec §msc-due, future-target fallback rung
-    // 1): parked msc-due entries whose target is more than one vblank out
-    // get an absolute per-target sequence arm here, alongside the other
-    // two idle arms above — placement matches the spec's own wording
-    // ("a third arming call site in run.rs, alongside present_pending_msc
-    // ... and present_pending_complete ...", spec §msc-due future-target
-    // bullet), not folded into the pre-compose due-pass
+    // Parked, source-ready presents also use the shared tagged wake. This
+    // call stays alongside the other arms, after compose, rather than in the
+    // pre-compose due pass. A next-MSC entry behind an in-flight flip needs
+    // the tagged wake too: flips may not advance a frozen CRTC clock.
     // (`drain_due_present_pending_exec`): this call arms a kernel event,
     // it doesn't decide an execution, and every other arming call site in
     // this codebase already lives in this post-compose function. Must
     // NOT route through `arm_present_completion_idle_vblanks` — its
     // idle-only gate would suppress the arm during any activity.
     {
-        // `(present_id, eff - 1)` for every still-parked, source-ready,
-        // genuinely future-target entry. The `-1` is CORE-SIDE: `eff` is
-        // the vblank at which the compose carrying this copy must already
-        // have been submitted, so the copy itself is due one vblank
-        // earlier, at `eff - 1`. `arm_present_absolute_vblank` arms
-        // exactly the values it receives (Task 3) — it does not itself
-        // subtract. `wrapping_sub`: `eff` is a wrapped MSC value (u64
-        // wraparound is a documented, tested case throughout this
-        // module), so a plain `eff - 1` would debug-panic when `eff == 0`.
+        // Group every still-future target by clock domain. `msc == 0`
+        // means no usable clock, so it counts as ahead, matching the
+        // completion sweep's due rule.
         let mut by_domain: std::collections::BTreeMap<(u32, u64), Vec<(u64, u64)>> =
             std::collections::BTreeMap::new();
         for (&pid, entry) in &state.present_pending_exec {
@@ -2097,77 +3325,75 @@ pub(crate) fn arm_present_idle_vblanks(state: &mut ServerState, backend: &mut dy
             }
             let crtc_id = entry.pending.crtc_id;
             let crtc_epoch = entry.pending.crtc_epoch;
-            if backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch
-                || !backend.present_absolute_vblank_arm_supported(crtc_id)
-            {
+            if backend.present_crtc_clock_epoch(crtc_id) != crtc_epoch {
                 continue;
             }
-            let clock_msc = crate::core_loop::process_request::cached_present_crtc_clock(
-                state, crtc_id, crtc_epoch,
-            )
-            .msc;
+            let due_clock =
+                crate::core_loop::process_request::present_completion_due_clock_for_domain(
+                    state, crtc_id, crtc_epoch, None,
+                );
             if let Some(eff) = entry.pending.effective_target_msc
-                && crate::present_scheduler::msc_is_after(eff, clock_msc.wrapping_add(1))
+                && (due_clock.msc == 0
+                    || crate::present_scheduler::msc_is_after(eff, due_clock.msc))
             {
                 by_domain
                     .entry((crtc_id, crtc_epoch))
                     .or_default()
-                    .push((pid, eff.wrapping_sub(1)));
+                    .push((pid, eff));
             }
         }
-        for ((crtc_id, _crtc_epoch), future_parked) in by_domain {
-            let targets: Vec<u64> = future_parked.iter().map(|&(_, t)| t).collect();
-            // Full coverage required, not just `> 0`: the trait contract
-            // (`arm_present_absolute_vblank`'s doc comment) allows a
-            // partial `Ok(n)` — some targets newly armed or already
-            // covered, others not (e.g. a CRTC set change mid-call).
-            // Treating any partial result as success would leave the
-            // uncovered subset parked with no wake source at all.
-            // Unreachable against today's KMS impl (Task 3): it arms
-            // every target on every connected CRTC or trips the
-            // EOPNOTSUPP latch and returns `Err`, so it's all-or-`Err`
-            // in practice — this guard is a contract-level guarantee,
-            // not a dead branch removal candidate.
-            match backend.arm_present_absolute_vblank(crtc_id, &targets) {
-                Ok(covered) if covered == targets.len() => {
+        for ((crtc_id, crtc_epoch), future_parked) in by_domain {
+            if !backend.present_absolute_vblank_arm_supported(crtc_id) {
+                // Unsupported clocks keep the due-pass's flip pacing; its
+                // separate idle-display rung handles an actually idle CRTC.
+                continue;
+            }
+            let result = backend.arm_present_shared_wake(crtc_id);
+            let covered = match result {
+                Ok(true) => {
                     log::debug!(
-                        "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> armed={covered}",
-                        targets.len()
+                        "PRESENT-DBG: arm_present_shared_wake crtc=0x{crtc_id:x} pending={} -> armed",
+                        future_parked.len()
                     );
+                    true
                 }
-                other => {
-                    // `Ok(0)` (nothing covered — including the iteration
-                    // where an EOPNOTSUPP latch first trips), a partial
-                    // `Ok(n < targets.len())`, or `Err`: the caller must
-                    // not park the uncovered entries on this mechanism.
-                    // Execute ALL of them immediately in this same pass
-                    // (trigger=idle_fallback) rather than leave any
-                    // subset parked with no wake source. This runs
-                    // post-compose (this function, per the call-site
-                    // placement above), so a latch-trip execution here
-                    // misses THIS iteration's compose and lands in the
-                    // next one instead — `mark_dirty` still guarantees
-                    // the wake for it; accepted as a rare, one-iteration-
-                    // latency path.
-                    match other {
-                        Ok(covered) => log::debug!(
-                            "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> covered={covered}, \
-                             executing immediately",
-                            targets.len()
-                        ),
-                        Err(e) => log::warn!(
-                            "PRESENT-DBG: arm_present_absolute_vblank crtc=0x{crtc_id:x} pending={} -> ERR {e}",
-                            targets.len()
-                        ),
-                    }
-                    let ids: Vec<u64> = future_parked.iter().map(|&(pid, _)| pid).collect();
-                    crate::core_loop::process_request::execute_parked_present_ids(
-                        state,
-                        backend,
-                        &ids,
-                        "idle_fallback",
+                Ok(false) => {
+                    log::debug!(
+                        "PRESENT-DBG: arm_present_shared_wake crtc=0x{crtc_id:x} pending={} -> unavailable",
+                        future_parked.len()
                     );
+                    false
                 }
+                Err(error) => {
+                    log::warn!(
+                        "PRESENT-DBG: arm_present_shared_wake crtc=0x{crtc_id:x} pending={} -> ERR {error}",
+                        future_parked.len()
+                    );
+                    false
+                }
+            };
+            if !covered {
+                // Preserve the old fallback's general-clock eligibility.
+                // The completion clock above decides whether a wake is
+                // needed; it must not make an in-flight-flip next-MSC entry
+                // look distant (or hide a distant entry) when arming fails.
+                let general_msc = crate::core_loop::process_request::cached_present_crtc_clock(
+                    state, crtc_id, crtc_epoch,
+                )
+                .msc;
+                let ids: Vec<u64> = future_parked
+                    .iter()
+                    .filter_map(|&(pid, target)| {
+                        crate::present_scheduler::msc_is_after(target, general_msc.wrapping_add(1))
+                            .then_some(pid)
+                    })
+                    .collect();
+                crate::core_loop::process_request::execute_parked_present_ids(
+                    state,
+                    backend,
+                    &ids,
+                    "idle_fallback",
+                );
             }
         }
     }
@@ -2182,7 +3408,7 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
     // msc-due-pass (spec §msc-due; Task 7): re-classify every msc-parked
     // source-ready entry against the fresh general clock and execute
     // whatever is now due, plus the idle-display and blackout fallback
-    // rungs (the absolute-vblank-arm rung is a call-site match for the
+    // rungs (the shared-wake arm is a call-site match for the
     // other two arms below and lives in `arm_present_idle_vblanks`,
     // post-compose). Runs here, at the top of this pre-compose drain
     // (Task 4), so an entry executed here is visible to THIS iteration's
@@ -2369,7 +3595,10 @@ fn drain_present_completions(state: &mut ServerState, backend: &mut dyn Backend)
 /// SetClipRectangles, etc.) cannot recursively re-dispatch — the new
 /// request's reply lands in `pending_replies` and the next
 /// outer-loop iteration drains anything `wait_for_reply` re-enqueued.
-fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
+pub(crate) fn dispatch_pending_host_events(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+) -> bool {
     let mut any = false;
     while let Some(event) = backend.pop_pending_host_event() {
         any = true;
@@ -2391,6 +3620,18 @@ fn dispatch_pending_host_events(state: &mut ServerState, backend: &mut dyn Backe
             }
             HostEvent::Key(ev) => {
                 use crate::core_loop::key_fanout::key_event_fanout_to_state;
+                crate::core_loop::record::record_device_event(
+                    state,
+                    crate::core_loop::record::RecordedDeviceEvent {
+                        event_type: if ev.pressed { 2 } else { 3 },
+                        detail: ev.keycode,
+                        repeat: false,
+                        time: ev.time,
+                        root_x: ev.root_x,
+                        root_y: ev.root_y,
+                        state: ev.state,
+                    },
+                );
                 let _dropped = key_event_fanout_to_state(state, backend, ev);
             }
             HostEvent::Configure(ev) => {
@@ -2414,25 +3655,58 @@ pub(crate) fn handle_host_container_resize(
     backend: &mut dyn Backend,
     ev: crate::host_x11::HostConfigureEvent,
 ) {
-    if ev.width == 0
-        || ev.height == 0
-        || (state.randr.screen_width == ev.width && state.randr.screen_height == ev.height)
-    {
+    host_screen_resized(state, backend, ev.width, ev.height);
+}
+
+/// The host resized the window that shows the screen: the single output
+/// and the screen become `width`x`height`, and clients hear of what
+/// changed: root and COW ConfigureNotify only for a new screen size,
+/// Crtc/OutputChangeNotify only for a new output mode, ScreenChangeNotify
+/// for either (Xorg `TellChanged`). The backend has already resized its
+/// storage and re-derives its RandR outputs through
+/// `refresh_randr_state_set_time`. Zero or unchanged sizes are ignored.
+pub fn host_screen_resized(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    width: u16,
+    height: u16,
+) {
+    if width == 0 || height == 0 {
         return;
     }
+    let screen_changed = (state.randr.screen_width, state.randr.screen_height) != (width, height);
+    let output_changed = state
+        .randr
+        .outputs
+        .first()
+        .is_some_and(|o| (o.width, o.height) != (width, height));
+    if !screen_changed && !output_changed {
+        return;
+    }
+    let mm = (state.randr.width_mm, state.randr.height_mm);
     let timestamp = state.timestamp_now();
-    state.randr.resize(timestamp, ev.width, ev.height);
+    state.randr.resize(timestamp, width, height);
+    if !screen_changed {
+        // A client's RRSetScreenSize millimetres stay with its size.
+        (state.randr.width_mm, state.randr.height_mm) = mm;
+    }
+    backend.refresh_randr_state_set_time(state, timestamp);
 
-    // The nested path resizes the single output, so it genuinely changes
-    // CRTC geometry — pass the output as changed so CrtcChangeNotify fires.
+    // The single output follows the host window, so its CRTC geometry
+    // genuinely changes — pass it as changed so CrtcChangeNotify fires.
     let changed: Vec<(u32, u32, u32)> = state
         .randr
         .outputs
         .first()
+        .filter(|_| output_changed)
         .map(|o| (o.output_id, o.crtc_id, o.mode_id))
         .into_iter()
         .collect();
-    apply_screen_size_side_effects(state, backend, ev.width, ev.height, &changed);
+    if screen_changed {
+        apply_screen_size_side_effects(state, backend, width, height, &changed);
+    } else {
+        emit_randr_change_notifications(state, &changed);
+    }
 }
 
 /// Tell RANDR subscribers the layout changed without the screen resizing.
@@ -2455,12 +3729,9 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
 
     let timestamp = state.randr.timestamp;
     let config_timestamp = state.randr.config_timestamp;
-    let width = state.randr.screen_width;
-    let height = state.randr.screen_height;
-    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
-    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+    let (screen_rotation, width, height, width_mm, height_mm) = state.randr.screen_change_fields();
     // Resolve each changed output's current crtc/mode for the notify payload.
-    let changed: Vec<(u32, u32, u32, u8)> = changed_outputs
+    let changed: Vec<(u32, u32, u32, u8, u16)> = changed_outputs
         .iter()
         .filter_map(|id| {
             state
@@ -2477,6 +3748,11 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                             x11randr::CONNECTION_CONNECTED
                         } else {
                             x11randr::CONNECTION_DISCONNECTED
+                        },
+                        if o.mode_id != 0 {
+                            o.rotation
+                        } else {
+                            crate::randr::RR_ROTATE_0
                         },
                     )
                 })
@@ -2499,6 +3775,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                 RANDR_FIRST_EVENT,
                 sequence,
                 x11randr::ScreenChangeNotify {
+                    rotation: screen_rotation,
                     timestamp,
                     config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
@@ -2517,7 +3794,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
             let _ = client_io::write_or_buffer(client, &event);
         }
         if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
-            for &(output, crtc, mode, connection) in &changed {
+            for &(output, crtc, mode, connection, rotation) in &changed {
                 let event = x11randr::encode_output_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -2529,6 +3806,7 @@ pub(crate) fn notify_randr_layout_changed(state: &mut ServerState, changed_outpu
                         output,
                         crtc,
                         mode,
+                        rotation,
                         connection,
                     },
                 );
@@ -2602,7 +3880,11 @@ pub(crate) fn notify_randr_output_property_changed(
 
     const RANDR_FIRST_EVENT: u8 = 89;
 
-    let timestamp = state.randr.timestamp;
+    // Xorg stamps property notifies with the current time and leaves
+    // lastSetTime alone (`rrproperty.c:75`): mutter/muffin compare
+    // lastSetTime with their own SetCrtcConfig reply to tell their
+    // configuration from an external one.
+    let timestamp = state.timestamp_now();
     let subscribers: Vec<(u32, yserver_protocol::x11::ResourceId, u16)> = state
         .randr_select_masks
         .iter()
@@ -2817,8 +4099,9 @@ pub(crate) fn enabled_output_bbox(state: &ServerState) -> Option<(u16, u16)> {
     let mut max_y = 0i32;
     for output in state.randr.outputs.iter().filter(|o| o.mode_id != 0) {
         any = true;
-        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(output.width)));
-        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(output.height)));
+        let (width, height) = output.footprint();
+        max_x = max_x.max(i32::from(output.x).saturating_add(i32::from(width)));
+        max_y = max_y.max(i32::from(output.y).saturating_add(i32::from(height)));
     }
     any.then(|| {
         (
@@ -2858,21 +4141,18 @@ fn emit_randr_change_notifications_split(
 
     let timestamp = state.randr.timestamp;
     let config_timestamp = state.randr.config_timestamp;
-    let width = state.randr.screen_width;
-    let height = state.randr.screen_height;
-    let width_mm = u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX);
-    let height_mm = u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX);
+    let (screen_rotation, width, height, width_mm, height_mm) = state.randr.screen_change_fields();
     // Per-CRTC geometry (position AND mode size). CrtcChangeNotify must
     // report each CRTC's own mode dimensions — NOT the logical screen
     // size — or a multi-monitor client sees every CRTC as e.g. 5120×1440
     // instead of its real 2560×1440. An off CRTC (no mode) reports 0×0.
-    let crtc_geom: std::collections::HashMap<u32, (i16, i16, u16, u16)> = state
+    let crtc_geom: std::collections::HashMap<u32, (i16, i16, u16, u16, u16)> = state
         .randr
         .outputs
         .iter()
-        .map(|o| (o.crtc_id, (o.x, o.y, o.width, o.height)))
+        .map(|o| (o.crtc_id, (o.x, o.y, o.width, o.height, o.rotation)))
         .collect();
-    let output_states: std::collections::HashMap<u32, (u8, u32)> = state
+    let output_states: std::collections::HashMap<u32, (u8, u32, u16)> = state
         .randr
         .outputs
         .iter()
@@ -2889,6 +4169,11 @@ fn emit_randr_change_notifications_split(
                         output.crtc_id
                     } else {
                         0
+                    },
+                    if output.mode_id != 0 {
+                        output.rotation
+                    } else {
+                        crate::randr::RR_ROTATE_0
                     },
                 ),
             )
@@ -2911,6 +4196,7 @@ fn emit_randr_change_notifications_split(
                 RANDR_FIRST_EVENT,
                 sequence,
                 x11randr::ScreenChangeNotify {
+                    rotation: screen_rotation,
                     timestamp,
                     config_timestamp,
                     root: crate::resources::ROOT_WINDOW.0,
@@ -2932,7 +4218,13 @@ fn emit_randr_change_notifications_split(
         // subscriber; do not interleave the two event classes per output.
         if mask & x11randr::NOTIFY_MASK_CRTC_CHANGE != 0 {
             for &(_output, crtc, mode) in crtc_changed {
-                let (x, y, crtc_w, crtc_h) = crtc_geom.get(&crtc).copied().unwrap_or((0, 0, 0, 0));
+                let (x, y, crtc_w, crtc_h, rotation) = crtc_geom.get(&crtc).copied().unwrap_or((
+                    0,
+                    0,
+                    0,
+                    0,
+                    crate::randr::RR_ROTATE_0,
+                ));
                 let event = x11randr::encode_crtc_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -2942,6 +4234,7 @@ fn emit_randr_change_notifications_split(
                         request_window: request_window.0,
                         crtc,
                         mode,
+                        rotation,
                         x,
                         y,
                         width: crtc_w,
@@ -2958,10 +4251,12 @@ fn emit_randr_change_notifications_split(
         }
         if mask & x11randr::NOTIFY_MASK_OUTPUT_CHANGE != 0 {
             for &(output, projected_crtc, projected_mode) in output_changed {
-                let (connection, current_crtc) = output_states
-                    .get(&output)
-                    .copied()
-                    .unwrap_or((x11randr::CONNECTION_CONNECTED, projected_crtc));
+                let (connection, current_crtc, rotation) =
+                    output_states.get(&output).copied().unwrap_or((
+                        x11randr::CONNECTION_CONNECTED,
+                        projected_crtc,
+                        crate::randr::RR_ROTATE_0,
+                    ));
                 let event = x11randr::encode_output_change_notify_event(
                     client.byte_order,
                     RANDR_FIRST_EVENT,
@@ -2973,6 +4268,7 @@ fn emit_randr_change_notifications_split(
                         output,
                         crtc: current_crtc,
                         mode: projected_mode,
+                        rotation,
                         connection,
                     },
                 );
@@ -3018,20 +4314,20 @@ fn reconcile_client_writable_interest(
             }
         }
         let needs_writable = !client.outbound.is_empty();
-        if needs_writable == client.watching_writable {
+        // mio's Windows readiness is one-shot until I/O through the source
+        // would block, and the writes go through the writer: re-arm on
+        // every pass.
+        if needs_writable == client.watching_writable && !(cfg!(windows) && needs_writable) {
             continue;
         }
-        let raw = std::os::fd::AsRawFd::as_raw_fd(&*client.writer.lock().unwrap());
-        let interest = if needs_writable {
-            Interest::READABLE | Interest::WRITABLE
-        } else {
-            Interest::READABLE
-        };
-        match registry.reregister(
-            &mut SourceFd(&raw),
-            client_token(yserver_protocol::x11::ClientId(*id)),
-            interest,
-        ) {
+        // The writer fd is in the poller only while output waits for room:
+        // the reader thread owns reads, so a READABLE registration would
+        // only wake this loop for every byte the client sends -- and on a
+        // kernel whose edge-triggered readiness also counts the other
+        // direction's traffic, for every byte the server sends too.
+        let token = client_token(yserver_protocol::x11::ClientId(*id));
+        let changed = watch_writable(registry, client, token, needs_writable);
+        match changed {
             Ok(()) => client.watching_writable = needs_writable,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 // fd already deregistered (disconnect path); nothing
@@ -3043,6 +4339,92 @@ fn reconcile_client_writable_interest(
         }
     }
     to_disconnect
+}
+
+/// Watch the host display sources for WRITABLE as well as READABLE while
+/// `host_display` (`Backend::host_display_wants_writable`), and for
+/// READABLE alone otherwise. `watching` is what each source is watched for
+/// now. A source made writable that already is reports at once: the poller
+/// is edge-triggered, and re-registering raises the edge again.
+#[cfg(unix)]
+fn watch_backend_writable(
+    registry: &mio::Registry,
+    sources: &[BackendPollSource],
+    watching: &mut [bool],
+    host_display: bool,
+) {
+    for (index, (source, watched)) in sources.iter().zip(watching.iter_mut()).enumerate() {
+        let want = host_display && source.kind == BackendFdKind::HostDisplay;
+        if want == *watched {
+            continue;
+        }
+        let Some(token) = super::poll_tokens::backend_token(index) else {
+            continue;
+        };
+        let interest = if want {
+            Interest::READABLE | Interest::WRITABLE
+        } else {
+            Interest::READABLE
+        };
+        match registry.reregister(&mut SourceFd(&source.fd), token, interest) {
+            Ok(()) => *watched = want,
+            Err(err) => warn!(
+                "reregister backend fd {} writable interest: {err}",
+                source.fd
+            ),
+        }
+    }
+}
+
+/// Add the client's writer to the poller for WRITABLE, or take it out.
+#[cfg(unix)]
+fn watch_writable(
+    registry: &mio::Registry,
+    client: &mut crate::server::ClientState,
+    token: mio::Token,
+    watch: bool,
+) -> io::Result<()> {
+    let raw = crate::fd::AsRawFd::as_raw_fd(&*client.writer.lock().unwrap());
+    if watch {
+        match registry.register(&mut SourceFd(&raw), token, Interest::WRITABLE) {
+            // Registered by somebody else meanwhile: take it over.
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                registry.reregister(&mut SourceFd(&raw), token, Interest::WRITABLE)
+            }
+            other => other,
+        }
+    } else {
+        registry.deregister(&mut SourceFd(&raw))
+    }
+}
+
+/// Add the client's writer to the poller for WRITABLE, or take it out.
+/// mio cannot watch a borrowed socket on Windows, so it watches a
+/// duplicate of the writer's.
+// TODO(windows): unverified at runtime.
+#[cfg(windows)]
+fn watch_writable(
+    registry: &mio::Registry,
+    client: &mut crate::server::ClientState,
+    token: mio::Token,
+    watch: bool,
+) -> io::Result<()> {
+    if !watch {
+        return match client.writable_source.take() {
+            Some(mut source) => registry.deregister(&mut source),
+            None => Err(io::ErrorKind::NotFound.into()),
+        };
+    }
+    if let Some(source) = client.writable_source.as_mut() {
+        return registry.reregister(source, token, Interest::WRITABLE);
+    }
+    let duplicate = match &*client.writer.lock().unwrap() {
+        Transport::Tcp(stream) => stream.try_clone()?,
+    };
+    let mut source = mio::net::TcpStream::from_std(duplicate);
+    registry.register(&mut source, token, Interest::WRITABLE)?;
+    client.writable_source = Some(source);
+    Ok(())
 }
 
 fn handle_setup_allocate(
@@ -3057,6 +4439,8 @@ fn handle_setup_allocate(
             resource_id_mask: mask,
             screen_width_px: state.randr.screen_width,
             screen_height_px: state.randr.screen_height,
+            screen_width_mm: u16::try_from(state.randr.width_mm).unwrap_or(u16::MAX),
+            screen_height_mm: u16::try_from(state.randr.height_mm).unwrap_or(u16::MAX),
             current_input_masks: state
                 .clients
                 .values()
@@ -3068,6 +4452,8 @@ fn handle_setup_allocate(
             resource_id_mask: 0,
             screen_width_px: 0,
             screen_height_px: 0,
+            screen_width_mm: 0,
+            screen_height_mm: 0,
             current_input_masks: 0,
         },
     };
@@ -3088,47 +4474,68 @@ fn handle_setup_allocate(
 /// repeat-state wrapper instead of calling `backend.on_host_input`
 /// directly.
 pub fn handle_host_input(state: &mut ServerState, backend: &mut dyn Backend, ev: HostInputEvent) {
+    if let HostInputEvent::Rootless(input) = ev {
+        return crate::rootless::map_input(state, backend, input);
+    }
     update_repeat_state(state, &ev);
     backend.on_host_input(state, ev);
 }
 
-/// Arm / refresh / clear `state.repeat_state` from an incoming host
-/// input event. X11 spec: only the most recently pressed key
-/// repeats — pressing a different key replaces the armed key;
-/// releasing the armed key clears it; releases of other keys are
-/// ignored. Non-key events don't affect repeat state.
+/// Arm / refresh / clear repeat state for the origin of an incoming host
+/// input event. Each keyboard view has one current repeat key, matching
+/// Xorg's per-device XKB repeat state: a key press from another keyboard
+/// cannot replace it. A matching release clears that origin's timer.
 fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
-    use crate::core_loop::message::HostInputEvent::Key;
+    update_repeat_state_at(state, ev, Instant::now());
+}
+
+/// [`update_repeat_state`] at `now`; a press arms its first repeat the XKB
+/// RepeatKeys delay later (Xorg `AccessXFilterPressEvent`'s `TimerSet` of
+/// `ctrls->repeat_delay`).
+fn update_repeat_state_at(state: &mut ServerState, ev: &HostInputEvent, now: Instant) {
+    use crate::core_loop::{
+        InputOrigin,
+        message::HostInputEvent::{DeviceRemoved, DeviceSuspended, Key},
+    };
     let Key(key) = ev else {
+        let source_id = match ev {
+            DeviceRemoved { source_id } | DeviceSuspended { source_id } => *source_id,
+            _ => return,
+        };
+        state.key_repeats.remove(&InputOrigin::Physical(source_id));
         return;
     };
+    if !crate::core_loop::key_fanout::keyboard_origin_is_live(state, key.origin) {
+        state.key_repeats.remove(&key.origin);
+        return;
+    }
     if key.pressed {
-        let synthetic = state
-            .repeat_state
-            .as_ref()
-            .is_some_and(|r| r.event.keycode == key.keycode && r.event.pressed);
-        if synthetic {
-            // This is a repeat we just fired; don't reset the timer.
+        if crate::core_loop::key_fanout::keyboard_key_is_down(state, key.origin, key.keycode) {
+            // A duplicate press is not a new XKB press and does not restart
+            // this origin's repeat delay.
             return;
         }
-        // ChangeKeyboardControl gate: global auto-repeat off disables
-        // all repeat; otherwise the per-key bitmap decides. A
-        // non-repeating press still replaces (disarms) the armed key —
-        // only the most recently pressed key may repeat.
+        // ChangeKeyboardControl gate: global auto-repeat off disables all
+        // repeat; otherwise the per-key bitmap decides. A non-repeating key
+        // replaces the current repeat key for this origin only.
         if !state.keyboard_control.key_auto_repeats(key.keycode) {
-            state.repeat_state = None;
+            state.key_repeats.remove(&key.origin);
             return;
         }
-        state.repeat_state = Some(KeyRepeatState {
-            event: *key,
-            next_fire: Instant::now() + REPEAT_INITIAL_DELAY,
-        });
+        state.key_repeats.insert(
+            key.origin,
+            KeyRepeatState {
+                event: *key,
+                next_fire: now
+                    + Duration::from_millis(u64::from(state.keyboard_control.repeat_delay)),
+            },
+        );
     } else if state
-        .repeat_state
-        .as_ref()
-        .is_some_and(|r| r.event.keycode == key.keycode)
+        .key_repeats
+        .get(&key.origin)
+        .is_some_and(|repeat| repeat.event.keycode == key.keycode)
     {
-        state.repeat_state = None;
+        state.key_repeats.remove(&key.origin);
     }
 }
 
@@ -3139,43 +4546,82 @@ fn update_repeat_state(state: &mut ServerState, ev: &HostInputEvent) {
 /// path the original press took, matching classic X11 auto-repeat
 /// (every client handles it without opting into XKB
 /// DetectableAutoRepeat).
-/// Returns `true` iff a repeat was actually fanned out this call. The
-/// caller uses this to decide whether to poke the compositor: a call
-/// that merely observes an armed-but-not-yet-due key (or disarms a
-/// no-longer-repeating one) produces no events and must NOT re-dirty
-/// the scene — doing so unconditionally every loop iteration while a
-/// key is held (or while a phantom key is stuck armed) busy-spins the
-/// compositor at the iteration rate instead of the repeat rate
-/// (idle free-run, [[project_idle_compositor_redraw_loop]] cut 2a).
-fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
-    let Some(armed) = state.repeat_state else {
+/// Returns `true` iff a repeat was actually fanned out this call.
+pub fn fire_pending_repeats(state: &mut ServerState, backend: &mut dyn Backend) -> bool {
+    fire_pending_repeats_at(state, backend, Instant::now())
+}
+
+/// [`fire_pending_repeats`] at `now`. Each fire re-arms the XKB RepeatKeys
+/// interval later, read at fire time like Xorg's `AccessXRepeatKeyExpire`.
+pub(crate) fn fire_pending_repeats_at(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    now: Instant,
+) -> bool {
+    let mut origins: Vec<_> = state.key_repeats.keys().copied().collect();
+    origins.sort_by_key(|origin| match origin {
+        crate::core_loop::InputOrigin::Physical(source) => (0, source.0),
+        crate::core_loop::InputOrigin::XTest(device_id) => (1, u64::from(*device_id)),
+        crate::core_loop::InputOrigin::NestedHost => (2, 0),
+    });
+
+    // A drained source may lose its held key before its timer fires. Do not
+    // synthesize a new press for that key; the origin's held set is the
+    // authority for whether repeat remains active.
+    let stale_origins: Vec<_> = origins
+        .iter()
+        .copied()
+        .filter(|origin| {
+            let Some(armed) = state.key_repeats.get(origin) else {
+                return true;
+            };
+            !crate::core_loop::key_fanout::keyboard_origin_is_live(state, *origin)
+                || !crate::core_loop::key_fanout::keyboard_key_is_down(
+                    state,
+                    *origin,
+                    armed.event.keycode,
+                )
+                || !state.keyboard_control.key_auto_repeats(armed.event.keycode)
+        })
+        .collect();
+    for origin in stale_origins {
+        state.key_repeats.remove(&origin);
+    }
+
+    let due: Vec<_> = origins
+        .into_iter()
+        .filter_map(|origin| {
+            state
+                .key_repeats
+                .get(&origin)
+                .filter(|armed| armed.next_fire <= now)
+                .copied()
+                .map(|armed| (origin, armed))
+        })
+        .collect();
+    if due.is_empty() {
         return false;
-    };
-    // Repeat may have been disabled (ChangeKeyboardControl) after the
-    // key was armed — disarm instead of firing.
-    if !state.keyboard_control.key_auto_repeats(armed.event.keycode) {
-        state.repeat_state = None;
-        return false;
     }
-    let now = Instant::now();
-    if now < armed.next_fire {
-        return false;
+
+    // SetControls refuses 0; never spin on it.
+    let interval = Duration::from_millis(u64::from(state.keyboard_control.repeat_interval.max(1)));
+    for (origin, armed) in due {
+        let mut next_fire = armed.next_fire;
+        while now >= next_fire {
+            next_fire += interval;
+        }
+        // Update the timer first so any reentrant arming during fan-out
+        // doesn't double-fire.
+        if let Some(repeat) = state.key_repeats.get_mut(&origin) {
+            repeat.next_fire = next_fire;
+        }
+        let mut release = armed.event;
+        release.pressed = false;
+        let mut press = armed.event;
+        press.pressed = true;
+        backend.on_host_input(state, HostInputEvent::KeyRepeat(release));
+        backend.on_host_input(state, HostInputEvent::KeyRepeat(press));
     }
-    let mut next_fire = armed.next_fire;
-    while now >= next_fire {
-        next_fire += REPEAT_PERIOD;
-    }
-    // Update the timer first so any reentrant arming during fan-out
-    // doesn't double-fire.
-    if let Some(s) = state.repeat_state.as_mut() {
-        s.next_fire = next_fire;
-    }
-    let mut release = armed.event;
-    release.pressed = false;
-    let mut press = armed.event;
-    press.pressed = true;
-    backend.on_host_input(state, HostInputEvent::KeyRepeat(release));
-    backend.on_host_input(state, HostInputEvent::KeyRepeat(press));
     true
 }
 
@@ -3279,13 +4725,13 @@ pub(crate) fn evaluate_idletime_alarms_post_poll(
 ///   - install a `ClientState` for `id`
 ///   - drop the entry from the setup-thread teardown registry (the
 ///     setup thread is exiting)
-///   - register the writer fd with the poller (no interest yet — I2
-///     re-registers `WRITABLE` only when there's pending outbound)
+///   - leave the writer fd out of the poller: the reader thread owns
+///     reads, and I2 registers it `WRITABLE` only while outbound waits
+///     for room, deregistering it once that drains
 ///   - spawn the reader thread (the only path that produces
 ///     `Message::Request` for this client)
 #[allow(clippy::too_many_arguments)]
 fn handle_client_setup_complete(
-    registry: &mio::Registry,
     sender: &CoreSender,
     setup_registry: &SetupRegistry,
     state: &mut ServerState,
@@ -3295,13 +4741,14 @@ fn handle_client_setup_complete(
     resource_id_base: u32,
     resource_id_mask: u32,
     byte_order: yserver_protocol::x11::ClientByteOrder,
-    is_local: bool,
-    fd_passing: bool,
+    (is_local, fd_passing, internal): (bool, bool, bool),
+    peer: crate::peer::PeerIdentity,
+    admission: crate::access::Admission,
+    setup_reply: &[u8],
 ) -> io::Result<()> {
     use std::sync::{Arc, Mutex, atomic::AtomicU16};
     let writer = stream.try_clone()?;
     writer.set_nonblocking(true)?;
-    let writer_fd = writer.as_raw_fd();
 
     let (reader_control_tx, reader_control_rx) = crossbeam_channel::unbounded();
 
@@ -3320,28 +4767,30 @@ fn handle_client_setup_complete(
             xi1_event_classes: std::collections::HashSet::new(),
             xi1_window_event_classes: std::collections::HashMap::new(),
             outbound: std::collections::VecDeque::new(),
+            outbound_fds: Default::default(),
             watching_writable: false,
+            #[cfg(windows)]
+            writable_source: None,
+            write_failed: false,
+            gone: false,
             focused_window: crate::resources::ROOT_WINDOW,
             reader_control: Some(reader_control_tx),
             is_local,
             fd_passing,
+            internal,
+            peer,
+            admission,
         },
     );
+    state.notify_policies(|policy, context| {
+        if let (Some(peer), Some(admission)) = (context.peer(id), context.admission(id)) {
+            policy.client_connected(context, id, peer, admission);
+        }
+    });
     setup_registry
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&id);
-
-    // Initial interest is READABLE — mio doesn't accept empty interest.
-    // I2 reregisters WRITABLE-only when `client.outbound` becomes
-    // non-empty and back to READABLE when it drains. The reader thread
-    // already polls the peer fd directly, so this registration's only
-    // wake-up role today is the eventual WRITABLE-on-drain edge.
-    registry.register(
-        &mut SourceFd(&writer_fd),
-        crate::core_loop::poll_tokens::client_token(id),
-        Interest::READABLE,
-    )?;
 
     const BIG_REQUESTS_MAJOR_OPCODE: u8 = 135;
     // Read the transport off the stream before it is moved into the
@@ -3352,8 +4801,11 @@ fn handle_client_setup_complete(
     // being debugged. The branch already had to learn this distinction
     // once, for authorization.
     let transport_label = match &stream {
+        #[cfg(unix)]
         Transport::Unix(_) => "unix",
         Transport::Tcp(_) => "TCP",
+        #[cfg(test)]
+        Transport::Capture(_) => "test capture",
     };
     // The reader inherits the setup thread's binding rather than
     // re-reading the counter, so the connection keeps ONE generation
@@ -3378,6 +4830,9 @@ fn handle_client_setup_complete(
         transport_label,
         if fd_passing { "on" } else { "off" },
     );
+    // Xorg's ClientStateRunning callback: FutureClients contexts take the
+    // client on, and enabled ones record its setup reply.
+    crate::core_loop::record::client_started(state, id, setup_reply);
 
     // Reaching here is what "ESTABLISHED" means: the poller registration
     // and the reader spawn have both succeeded, so the client can
@@ -3409,56 +4864,6 @@ fn handle_client_setup_complete(
     // a RETAINED client may arm, so the decision has to sit after
     // XDMCP admission.
     Ok(())
-}
-
-/// Is `peer` one of this machine's own addresses?
-///
-/// Xorg's `xtransLocalClient` (`os/access.c`) treats an AF_UNIX peer as
-/// local, and otherwise compares the peer against `selfhosts` — the
-/// addresses `DefineSelf` collected from the interfaces. So a TCP
-/// connection from the machine's own address is a LOCAL client there, and
-/// keeps the locality-gated extensions.
-///
-/// Queried per accept rather than snapshotted at startup: accepts are
-/// rare, `getifaddrs` is cheap, and a cached set goes stale across a
-/// hotplug or a DHCP renewal. Xorg snapshots and then patches with
-/// `AugmentSelf`; asking each time is simpler and cannot drift.
-///
-/// Not implemented: Xorg additionally treats a client whose command name
-/// is `ssh` as non-local, to catch a forwarded connection. That is a
-/// heuristic on `/proc`, and `ssh -X` reaches us over a UNIX socket
-/// anyway.
-fn address_is_ours(peer: std::net::IpAddr) -> bool {
-    if peer.is_loopback() {
-        return true;
-    }
-    let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: `getifaddrs` fills `ifap` with an owned list on success; we
-    // walk it without retaining anything and free it before returning.
-    if unsafe { libc::getifaddrs(&raw mut ifap) } != 0 {
-        return false;
-    }
-    let mut found = false;
-    let mut cur = ifap;
-    while !cur.is_null() {
-        // SAFETY: `cur` is a node of the list `getifaddrs` just built, and
-        // `ifa_addr` is either null or a valid `sockaddr` for its family.
-        let addr = unsafe { (*cur).ifa_addr };
-        if !addr.is_null() && unsafe { (*addr).sa_family } == libc::AF_INET as libc::sa_family_t {
-            let sin = addr.cast::<libc::sockaddr_in>();
-            // SAFETY: family said AF_INET, so the node is a sockaddr_in.
-            let raw = unsafe { (*sin).sin_addr.s_addr };
-            if std::net::IpAddr::V4(std::net::Ipv4Addr::from(u32::from_be(raw))) == peer {
-                found = true;
-                break;
-            }
-        }
-        // SAFETY: as above; `ifa_next` is null at the end of the list.
-        cur = unsafe { (*cur).ifa_next };
-    }
-    // SAFETY: `ifap` is exactly what `getifaddrs` returned and is freed once.
-    unsafe { libc::freeifaddrs(ifap) };
-    found
 }
 
 /// Accept at most this many connections per listener and core iteration.
@@ -3523,24 +4928,31 @@ fn accept_pending(
     auth: &Arc<AuthState>,
 ) -> bool {
     for _ in 0..ACCEPT_BUDGET {
-        let accepted = match listener {
-            Listener::Unix(listener) => listener
-                .accept()
-                .map(|(stream, _)| (Transport::Unix(stream), true, true)),
-            Listener::Tcp(listener) => listener.accept().map(|(stream, peer)| {
-                // `is_local` is an ADDRESS property, `fd_passing` is a
-                // TRANSPORT one, and this is the site that must not
-                // conflate them. `SCM_RIGHTS` is impossible over TCP
-                // whoever the peer is, so fd passing is always off here.
-                // Locality is not: Xorg's `xtransLocalClient`
-                // (`os/access.c`) answers TRUE for a TCP peer whose
-                // address is one of the server's own, which is why a
-                // same-machine client keeps MIT-SHM — its `Attach` passes
-                // a SysV shmid, an integer on the wire, so shared memory
-                // works fine without a descriptor.
-                (Transport::Tcp(stream), address_is_ours(peer.ip()), false)
-            }),
-        };
+        let accepted = listener
+            .accept()
+            .map(|(stream, peer)| match (stream, peer) {
+                (Transport::Tcp(stream), Some(peer)) => {
+                    // `is_local` is an ADDRESS property, `fd_passing` is a
+                    // TRANSPORT one, and this is the site that must not
+                    // conflate them. `SCM_RIGHTS` is impossible over TCP
+                    // whoever the peer is, so fd passing is always off here.
+                    // Locality is not: Xorg's `xtransLocalClient`
+                    // (`os/access.c`) answers TRUE for a TCP peer whose
+                    // address is one of the server's own, which is why a
+                    // same-machine client keeps MIT-SHM — its `Attach` passes
+                    // a SysV shmid, an integer on the wire, so shared memory
+                    // works fine without a descriptor.
+                    //
+                    // Nagle off, as xtrans `SocketINETAccept` does: a small
+                    // reply held back behind an unacked write costs the
+                    // client a delayed-ACK round trip.
+                    if let Err(err) = stream.set_nodelay(true) {
+                        warn!("TCP_NODELAY on {peer}: {err}");
+                    }
+                    (Transport::Tcp(stream), address_is_ours(peer.ip()), false)
+                }
+                (stream, _) => (stream, true, true),
+            });
         match accepted {
             Ok((stream, is_local, fd_passing)) => {
                 let id = client_id_allocator.allocate();
@@ -3559,6 +4971,7 @@ fn accept_pending(
                     auth.clone(),
                     is_local,
                     fd_passing,
+                    false,
                 ) {
                     error!("setup thread spawn failed for client {}: {err}", id.0);
                 }
@@ -3584,3197 +4997,3 @@ fn accept_pending(
 // indirectly. Concrete uses below.
 #[allow(dead_code)]
 fn _hint(_: Transport) {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::os::unix::net::UnixStream;
-
-    #[test]
-    fn listener_accept_budget_leaves_flood_backlog_for_next_turn() {
-        let path =
-            std::env::temp_dir().join(format!("yserver-accept-budget-{}", std::process::id()));
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let peers: Vec<_> = (0..33)
-            .map(|_| UnixStream::connect(&path).unwrap())
-            .collect();
-        std::fs::remove_file(path).unwrap();
-        let listener = Listener::Unix(listener);
-        let alloc = ClientIdAllocator::new();
-        let (_poll, sender, _rx) = channel().unwrap();
-        let registry = setup_thread::make_registry();
-
-        accept_pending(&listener, &alloc, &sender, &registry, &AuthState::new(None));
-        let accepted = alloc.peek().0 - 1;
-        setup_thread::shutdown_all(&registry);
-        drop(peers);
-        assert_eq!(
-            accepted, 16,
-            "one listener must yield after its accept budget"
-        );
-    }
-
-    #[test]
-    fn ready_listeners_round_robin_under_accept_flood() {
-        for tcp_count in [1, 33] {
-            let path = std::env::temp_dir().join(format!(
-                "yserver-accept-fair-{}-{tcp_count}",
-                std::process::id()
-            ));
-            let unix = std::os::unix::net::UnixListener::bind(&path).unwrap();
-            let tcp = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-            let unix_peers: Vec<_> = (0..33)
-                .map(|_| UnixStream::connect(&path).unwrap())
-                .collect();
-            let tcp_peers: Vec<_> = (0..tcp_count)
-                .map(|_| std::net::TcpStream::connect(tcp.local_addr().unwrap()).unwrap())
-                .collect();
-            std::fs::remove_file(path).unwrap();
-            let listeners = [Listener::Unix(unix), Listener::Tcp(tcp)];
-            for listener in &listeners {
-                listener.set_nonblocking(true).unwrap();
-            }
-            let alloc = ClientIdAllocator::new();
-            let (_poll, sender, _rx) = channel().unwrap();
-            let registry = setup_thread::make_registry();
-            let mut readiness = ListenerReadiness::new(2);
-            readiness.mark_ready(0);
-            readiness.mark_ready(1);
-            readiness.accept_ready(
-                &listeners,
-                &alloc,
-                &sender,
-                &registry,
-                &AuthState::new(None),
-            );
-            {
-                let clients = registry.lock().unwrap();
-                assert!(matches!(
-                    clients[&yserver_protocol::x11::ClientId(1)],
-                    Transport::Unix(_)
-                ));
-                assert!(
-                    matches!(
-                        clients[&yserver_protocol::x11::ClientId(17)],
-                        Transport::Tcp(_)
-                    ),
-                    "TCP must be accepted within one Unix accept budget, even during a flood"
-                );
-                assert_eq!(clients.len(), if tcp_count == 1 { 17 } else { 32 });
-            }
-            // No fresh readiness marks. Queued accepts must persist, and the
-            // second round must start at TCP rather than repeat Unix-first.
-            readiness.accept_ready(
-                &listeners,
-                &alloc,
-                &sender,
-                &registry,
-                &AuthState::new(None),
-            );
-            if tcp_count == 33 {
-                let clients = registry.lock().unwrap();
-                assert!(matches!(
-                    clients[&yserver_protocol::x11::ClientId(33)],
-                    Transport::Tcp(_)
-                ));
-                assert!(matches!(
-                    clients[&yserver_protocol::x11::ClientId(49)],
-                    Transport::Unix(_)
-                ));
-            }
-            readiness.accept_ready(
-                &listeners,
-                &alloc,
-                &sender,
-                &registry,
-                &AuthState::new(None),
-            );
-            assert!(
-                !readiness.has_pending(),
-                "WouldBlock clears retained readiness"
-            );
-            assert_eq!(alloc.peek().0 - 1, 33 + tcp_count);
-            setup_thread::shutdown_all(&registry);
-            drop((unix_peers, tcp_peers));
-        }
-    }
-
-    #[test]
-    fn listener_backlog_completes_without_a_fresh_readiness_edge() {
-        use std::io::{Read, Write};
-        let path = std::env::temp_dir().join(format!("yserver-accept-edge-{}", std::process::id()));
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        // Queue more than two accept budgets before the listener is registered:
-        // there is one readiness edge, with no later connection to wake it.
-        let mut peers: Vec<_> = (0..33)
-            .map(|_| {
-                let mut peer = UnixStream::connect(&path).unwrap();
-                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-                    .unwrap();
-                peer
-            })
-            .collect();
-        std::fs::remove_file(path).unwrap();
-        let (poll, sender, rx) = channel().unwrap();
-        let sender_for_core = sender.clone_handle();
-        let handle = std::thread::spawn(move || {
-            let mut state = ServerState::new();
-            let mut backend = RecordingBackend::new();
-            run_core(
-                poll,
-                rx,
-                sender_for_core,
-                &mut state,
-                &mut backend,
-                [Listener::Unix(listener)],
-                &ClientIdAllocator::new(),
-                AuthState::new(None),
-                ResetPolicy::NoReset,
-                None,
-            )
-        });
-        let result: io::Result<()> = (|| {
-            for peer in &mut peers {
-                let mut header = [0; 8];
-                peer.read_exact(&mut header)?;
-                assert_eq!(header[0], 1);
-                let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
-                peer.read_exact(&mut vec![0; len])?;
-            }
-            Ok(())
-        })();
-        sender.send(Message::Shutdown).unwrap();
-        handle.join().unwrap().unwrap();
-        result.expect("all queued connections must finish setup without another accept edge");
-    }
-
-    #[test]
-    fn randr_change_fanout_orders_screen_then_all_crtcs_then_all_outputs() {
-        use crate::server::ClientState;
-        use std::{
-            collections::{HashMap, HashSet, VecDeque},
-            io::Read,
-            os::unix::net::UnixStream,
-            sync::{Arc, Mutex, atomic::AtomicU16},
-        };
-        use yserver_protocol::x11::{ClientByteOrder, randr as x11randr};
-
-        let mut state = ServerState::new();
-        let first = state.randr.outputs[0].clone();
-        let mut second = first.clone();
-        second.name = "HDMI-A-1".into();
-        second.output_id = first.output_id + 10;
-        second.crtc_id = first.crtc_id + 10;
-        state.randr.outputs.push(second.clone());
-
-        let (mut peer, writer) = UnixStream::pair().unwrap();
-        writer.set_nonblocking(true).unwrap();
-        state.clients.insert(
-            7,
-            ClientState {
-                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(9)),
-                resource_id_base: 0,
-                resource_id_mask: 0,
-                event_masks: HashMap::new(),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-        state.randr_select_masks.insert(
-            (7, crate::resources::ROOT_WINDOW),
-            x11randr::NOTIFY_MASK_SCREEN_CHANGE
-                | x11randr::NOTIFY_MASK_CRTC_CHANGE
-                | x11randr::NOTIFY_MASK_OUTPUT_CHANGE,
-        );
-
-        emit_randr_connector_change_notifications(
-            &mut state,
-            &[(first.output_id, first.crtc_id, first.mode_id)],
-            &[(second.output_id, second.crtc_id, second.mode_id)],
-        );
-
-        let mut wire = [0; 96];
-        peer.read_exact(&mut wire).unwrap();
-        const RANDR_FIRST_EVENT: u8 = 89;
-        assert_eq!(wire[0] & 0x7f, RANDR_FIRST_EVENT);
-        assert_eq!(wire[32] & 0x7f, RANDR_FIRST_EVENT + 1);
-        assert_eq!(wire[33], x11randr::NOTIFY_CRTC_CHANGE);
-        assert_eq!(wire[64] & 0x7f, RANDR_FIRST_EVENT + 1);
-        assert_eq!(wire[65], x11randr::NOTIFY_OUTPUT_CHANGE);
-        assert_eq!(
-            u32::from_le_bytes(wire[44..48].try_into().unwrap()),
-            first.crtc_id
-        );
-        assert_eq!(
-            u32::from_le_bytes(wire[80..84].try_into().unwrap()),
-            second.output_id
-        );
-    }
-
-    /// The count cap alone was sized on an assumption of ~0.25 ms per
-    /// request (`MAX_REQUESTS_PER_ITER`'s own doc comment). Measured on
-    /// silence under MATE + adapta-nokto during a window drag, single
-    /// requests reach 44-50 ms (`longest=op70:44.23ms`), so 32 of them
-    /// is ~1.4 s in one iteration — during which host input and backend-fd
-    /// readiness sit undelivered and the cursor visibly stalls (`gap_max`
-    /// 225-360 ms). These pin the deadline half of the budget.
-    #[test]
-    fn budget_not_exhausted_when_both_count_and_time_remain() {
-        assert!(!budget_exhausted(31, Duration::from_millis(1)));
-    }
-
-    #[test]
-    fn budget_exhausted_when_count_runs_out() {
-        assert!(budget_exhausted(0, Duration::from_millis(0)));
-    }
-
-    /// THE FIX: slow requests must stop the drain even with count left.
-    #[test]
-    fn budget_exhausted_when_deadline_passed_despite_count_remaining() {
-        assert!(budget_exhausted(31, REQUEST_TIME_BUDGET));
-        assert!(budget_exhausted(
-            31,
-            REQUEST_TIME_BUDGET + Duration::from_millis(40)
-        ));
-    }
-
-    /// One 44 ms request must not authorise 31 more. This is the
-    /// 1.4 s-iteration case the count-only cap allowed.
-    #[test]
-    fn budget_stops_after_a_single_overrunning_request() {
-        let elapsed_after_one_slow_request = Duration::from_millis(44);
-        assert!(budget_exhausted(
-            MAX_REQUESTS_PER_ITER - 1,
-            elapsed_after_one_slow_request
-        ));
-    }
-
-    /// Forward progress: the budget is checked before each request with
-    /// elapsed measured from the top of the iteration, so the first
-    /// request of an iteration always runs. Without this the loop could
-    /// livelock without draining anything.
-    #[test]
-    fn budget_permits_the_first_request_of_an_iteration() {
-        assert!(!budget_exhausted(MAX_REQUESTS_PER_ITER, Duration::ZERO));
-    }
-
-    /// The fast path must be unchanged: 32 × 0.25 ms = 8 ms, so a
-    /// well-behaved burst still exhausts on count, not on time.
-    #[test]
-    fn typical_fast_requests_still_exhaust_on_count_first() {
-        let typical = Duration::from_micros(250);
-        let elapsed_at_cap = typical * u32::try_from(MAX_REQUESTS_PER_ITER).unwrap();
-        assert!(
-            elapsed_at_cap <= REQUEST_TIME_BUDGET,
-            "time budget must not bind before the count cap for ~0.25ms requests \
-             (elapsed_at_cap={elapsed_at_cap:?}, budget={REQUEST_TIME_BUDGET:?})"
-        );
-    }
-
-    #[test]
-    fn export_holders_report_is_gated_paced_and_rechecks_after_change() {
-        let t0 = Instant::now();
-        let off = LoopTelemetry::default();
-        assert!(!off.export_holders_due(t0));
-        let mut on = LoopTelemetry {
-            enabled: true,
-            ..LoopTelemetry::default()
-        };
-        assert!(on.export_holders_due(t0));
-        on.note_export_holders(t0, true);
-        assert!(!on.export_holders_due(t0 + Duration::from_millis(999)));
-        assert!(on.export_holders_due(t0 + TELEMETRY_EMIT_INTERVAL));
-        assert_eq!(
-            on.export_holders_deadline(),
-            Some(t0 + TELEMETRY_EMIT_INTERVAL)
-        );
-        on.note_export_holders(t0 + TELEMETRY_EMIT_INTERVAL, false);
-        assert_eq!(on.export_holders_deadline(), None);
-    }
-
-    #[test]
-    fn loop_telemetry_attributes_burst_depth_age_and_sequence_boundary() {
-        let client = yserver_protocol::x11::ClientId(17);
-        let other = yserver_protocol::x11::ClientId(23);
-        let mut telemetry = LoopTelemetry {
-            enabled: true,
-            ..LoopTelemetry::default()
-        };
-
-        telemetry.record_channel_drain(65_541, &HashMap::from([(client, 65_536), (other, 5)]));
-        telemetry.record_request_accepted(client, yserver_protocol::x11::SequenceNumber(0xffff));
-        telemetry.record_request_accepted(client, yserver_protocol::x11::SequenceNumber(0x0000));
-        telemetry.record_deferred_push(client);
-        telemetry.record_deferred_push(client);
-        telemetry.record_deferred_push(other);
-        telemetry.record_deferred_pop(client);
-        telemetry.record_request(
-            client,
-            133,
-            26,
-            Duration::from_micros(20),
-            Duration::from_millis(1_750),
-        );
-
-        assert_eq!(telemetry.channel_request_batch_max, 65_541);
-        assert_eq!(telemetry.channel_client_batch_max, (17, 65_536));
-        assert_eq!(telemetry.deferred_current, 2);
-        assert_eq!(telemetry.max_deferred_depth, 3);
-        let client_stats = &telemetry.clients[&client];
-        assert_eq!(client_stats.deferred_current, 1);
-        assert_eq!(client_stats.deferred_max, 2);
-        assert_eq!(client_stats.accepted, 2);
-        assert_eq!(client_stats.request_age_max, Duration::from_millis(1_750));
-        assert_eq!(client_stats.requests_by_opcode[&(133, Some(26))], 1);
-        assert_eq!(client_stats.sequence_ffff, 1);
-        assert_eq!(client_stats.sequence_zero, 1);
-    }
-
-    fn deferred_request(id: u32, opcode: u8) -> DeferredRequest {
-        DeferredRequest {
-            id: yserver_protocol::x11::ClientId(id),
-            sequence: yserver_protocol::x11::SequenceNumber(1),
-            accepted_at: None,
-            header: yserver_protocol::x11::RequestHeader {
-                opcode,
-                data: 0,
-                length_units: 1,
-            },
-            body: Vec::new(),
-            attached_fd: None,
-        }
-    }
-
-    #[test]
-    fn server_grab_blocks_only_non_owner_requests() {
-        let mut state = ServerState::new();
-        state.server_grab_owner = Some(yserver_protocol::x11::ClientId(7));
-
-        assert!(!blocked_by_server_grab(&state, &deferred_request(7, 127)));
-        assert!(blocked_by_server_grab(&state, &deferred_request(8, 127)));
-        state.server_grab_owner = None;
-        assert!(!blocked_by_server_grab(&state, &deferred_request(8, 127)));
-    }
-
-    #[test]
-    fn released_server_grab_waiters_join_round_robin_in_waiter_order() {
-        let mut deferred = FairRequestQueue::default();
-        deferred.push_back(deferred_request(9, 90));
-        let mut waiters = VecDeque::from([deferred_request(2, 20), deferred_request(3, 30)]);
-
-        release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
-
-        let mut order = Vec::new();
-        while let Some(req) = deferred.pop_front() {
-            order.push((req.id.0, req.header.opcode));
-        }
-        assert_eq!(order, [(9, 90), (2, 20), (3, 30)]);
-        assert!(waiters.is_empty());
-    }
-
-    #[test]
-    fn released_server_grab_prefix_stays_ahead_of_same_client_suffix() {
-        let mut deferred = FairRequestQueue::default();
-        // Requests 16 and 17 were popped and parked while another client held
-        // GrabServer. Requests 18 and 19 were already the remaining suffix in
-        // the fair queue. The old release path appended the parked prefix and
-        // dispatched 18,19,16,17, corrupting Xlib/XCB sequence tracking.
-        deferred.push_back(deferred_request(66, 18));
-        deferred.push_back(deferred_request(66, 19));
-        deferred.push_back(deferred_request(12, 90));
-        let mut waiters = VecDeque::from([deferred_request(66, 16), deferred_request(66, 17)]);
-
-        release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
-
-        let mut client_66_order = Vec::new();
-        while let Some(req) = deferred.pop_front() {
-            if req.id.0 == 66 {
-                client_66_order.push(req.header.opcode);
-            }
-        }
-        assert_eq!(client_66_order, [16, 17, 18, 19]);
-        assert!(waiters.is_empty());
-    }
-
-    #[test]
-    fn fair_queue_round_robins_clients_and_preserves_each_clients_order() {
-        let mut queue = FairRequestQueue::default();
-        queue.push_back(deferred_request(57, 1));
-        queue.push_back(deferred_request(57, 2));
-        queue.push_back(deferred_request(12, 10));
-        queue.push_back(deferred_request(57, 3));
-        queue.push_back(deferred_request(12, 11));
-
-        let mut order = Vec::new();
-        while let Some(req) = queue.pop_front() {
-            order.push((req.id.0, req.header.opcode));
-        }
-        assert_eq!(order, [(57, 1), (12, 10), (57, 2), (12, 11), (57, 3)]);
-        assert!(queue.is_empty());
-    }
-
-    #[test]
-    fn pending_backend_request_blocks_only_its_clients_fifo() {
-        use yserver_protocol::x11::ClientByteOrder;
-
-        let blocked = yserver_protocol::x11::ClientId(57);
-        let other = yserver_protocol::x11::ClientId(12);
-        let token = CrtcConfigToken(91);
-        let mut pending = PendingBackendRequests::default();
-        pending
-            .park_crtc(ParkedCrtcConfig {
-                client_id: blocked,
-                sequence: yserver_protocol::x11::SequenceNumber(1),
-                continuation: PendingCrtcConfig {
-                    token,
-                    completion: crate::core_loop::process_request::CrtcConfigCompletion {
-                        output_id: 1,
-                        set_time: 0,
-                        output_bbox_before: None,
-                        byte_order: ClientByteOrder::LittleEndian,
-                    },
-                },
-                request_wire_bytes: 28,
-            })
-            .unwrap();
-
-        let state = ServerState::new();
-        let mut queue = FairRequestQueue::default();
-        queue.push_back(deferred_request(blocked.0, 2));
-        queue.push_back(deferred_request(other.0, 10));
-        queue.push_back(deferred_request(blocked.0, 3));
-
-        let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
-        assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
-        assert!(
-            queue.pop_front_unblocked(&pending, &state).is_none(),
-            "later requests from the pending client must stay parked"
-        );
-        assert!(
-            !queue.has_runnable(&pending, &state),
-            "a blocked-only queue must not force a zero-timeout poll spin"
-        );
-
-        pending.take_crtc(token).unwrap();
-        let first = queue.pop_front_unblocked(&pending, &state).unwrap();
-        let second = queue.pop_front_unblocked(&pending, &state).unwrap();
-        assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
-    }
-
-    /// A client suspended by SYNC Await (Xorg `IgnoreClient`) keeps its
-    /// later requests queued in order while other clients run, the queue
-    /// does not spin the poll on it, and resuming releases them in order.
-    #[test]
-    fn sync_await_suspends_only_the_awaiting_client() {
-        let awaiting = yserver_protocol::x11::ClientId(57);
-        let other = yserver_protocol::x11::ClientId(12);
-        let pending = PendingBackendRequests::default();
-        let mut state = ServerState::new();
-        state
-            .sync_awaits
-            .insert(awaiting.0, crate::server::SyncAwait::default());
-
-        let mut queue = FairRequestQueue::default();
-        queue.push_back(deferred_request(awaiting.0, 2));
-        queue.push_back(deferred_request(other.0, 10));
-        queue.push_back(deferred_request(awaiting.0, 3));
-
-        let runnable = queue.pop_front_unblocked(&pending, &state).unwrap();
-        assert_eq!((runnable.id, runnable.header.opcode), (other, 10));
-        assert!(queue.pop_front_unblocked(&pending, &state).is_none());
-        assert!(!queue.has_runnable(&pending, &state));
-
-        state.sync_awaits.remove(&awaiting.0);
-        assert!(queue.has_runnable(&pending, &state));
-        let first = queue.pop_front_unblocked(&pending, &state).unwrap();
-        let second = queue.pop_front_unblocked(&pending, &state).unwrap();
-        assert_eq!((first.header.opcode, second.header.opcode), (2, 3));
-    }
-
-    #[test]
-    fn ready_crtc_completion_replies_unblocks_and_returns_reader_credit() {
-        use crate::{backend::recording::RecordingBackend, server::ClientState};
-        use std::{
-            collections::{HashMap, HashSet, VecDeque},
-            io::Read,
-            os::unix::net::UnixStream,
-            sync::{Arc, Mutex, atomic::AtomicU16},
-        };
-        use yserver_protocol::x11::{ClientByteOrder, ClientId, SequenceNumber};
-
-        let client_id = ClientId(57);
-        let token = CrtcConfigToken(92);
-        let (mut peer, writer) = UnixStream::pair().unwrap();
-        writer.set_nonblocking(true).unwrap();
-        let (control_tx, control_rx) = crossbeam_channel::unbounded();
-        let mut state = ServerState::new();
-        state.clients.insert(
-            client_id.0,
-            ClientState {
-                writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer))),
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0,
-                resource_id_mask: u32::MAX,
-                event_masks: HashMap::new(),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: Some(control_tx),
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-
-        let completion = crate::core_loop::process_request::CrtcConfigCompletion {
-            output_id: state.randr.outputs[0].output_id,
-            set_time: 123,
-            output_bbox_before: enabled_output_bbox(&state),
-            byte_order: ClientByteOrder::LittleEndian,
-        };
-        let continuation = PendingCrtcConfig { token, completion };
-        let mut pending = PendingBackendRequests::default();
-        pending
-            .park_crtc(ParkedCrtcConfig {
-                client_id,
-                sequence: SequenceNumber(9),
-                continuation,
-                request_wire_bytes: 28,
-            })
-            .unwrap();
-        let mut backend = RecordingBackend::new();
-        backend.ready_crtc_configs.push(token);
-        backend.crtc_config_results.insert(token, Ok(false));
-
-        drain_ready_crtc_configs(
-            &mut state,
-            &mut backend,
-            &mut pending,
-            &mut ResetTrigger::new(ResetPolicy::NoReset),
-        );
-
-        let mut reply = [0_u8; 32];
-        peer.read_exact(&mut reply).unwrap();
-        assert_eq!((reply[0], reply[1]), (1, 0), "success reply, status=0");
-        assert!(!pending.client_is_blocked(client_id));
-        assert_eq!(backend.finished_crtc_configs, [token]);
-        assert!(backend.cancelled_crtc_configs.is_empty());
-        assert!(matches!(
-            control_rx.try_recv(),
-            Ok(crate::server::ReaderControl::GrantRequestBytes(28))
-        ));
-
-        // Disconnecting a still-pending client cancels its backend token and
-        // never waits for the worker to finish.
-        let cancel_token = CrtcConfigToken(93);
-        pending
-            .park_crtc(ParkedCrtcConfig {
-                client_id,
-                sequence: SequenceNumber(10),
-                continuation: PendingCrtcConfig {
-                    token: cancel_token,
-                    completion,
-                },
-                request_wire_bytes: 28,
-            })
-            .unwrap();
-        disconnect_with_pending_cleanup(
-            &mut state,
-            &mut backend,
-            &mut pending,
-            &mut ResetTrigger::new(ResetPolicy::NoReset),
-            client_id,
-        );
-        assert_eq!(backend.cancelled_crtc_configs, [cancel_token]);
-        assert!(!state.clients.contains_key(&client_id.0));
-    }
-
-    /// The grab owner can be dropped by paths that carry no release check of
-    /// their own — `process_disconnect` runs at two sites outside the message
-    /// loop (a failed outbound write, and the writable-interest reconcile).
-    /// The loop therefore re-checks once per iteration. This pins the state
-    /// that made that necessary: waiters parked while `deferred_requests` is
-    /// EMPTY, because the poll timeout keys off `deferred_requests` alone, so
-    /// a waiter left in the side queue would strand its client until
-    /// unrelated traffic happened to wake the loop.
-    #[test]
-    fn owner_disconnect_outside_the_message_loop_still_frees_waiters() {
-        let mut state = ServerState::new();
-        state.server_grab_owner = Some(yserver_protocol::x11::ClientId(1));
-        let mut deferred = FairRequestQueue::default();
-        let mut waiters = VecDeque::from([deferred_request(2, 20)]);
-
-        // While the grab is held, a waiter must stay parked.
-        if state.server_grab_owner.is_none() {
-            release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
-        }
-        assert_eq!(waiters.len(), 1, "grab still held: waiter stays parked");
-        assert!(deferred.is_empty(), "nothing runnable while grabbed");
-
-        // Owner reaped by a path with no release check of its own (this is
-        // what process_disconnect does at run.rs' two non-message sites).
-        state.server_grab_owner = None;
-
-        // The per-iteration re-check must pick it up on its own.
-        if state.server_grab_owner.is_none() {
-            release_server_grab_waiters(&mut deferred, &mut waiters, &mut LoopTelemetry::default());
-        }
-        assert!(waiters.is_empty(), "released grab must free its waiters");
-        assert_eq!(deferred.pop_front().map(|r| r.id.0), Some(2));
-        assert!(deferred.is_empty());
-    }
-    use crate::{
-        backend::recording::RecordingBackend,
-        core_loop::sender::channel,
-        server::{ScreenSaverActive, ServerState},
-    };
-    use std::time::Duration;
-
-    /// I5 test: `reconcile_client_writable_interest` toggles a client's
-    /// `watching_writable` flag in lock-step with `outbound`'s emptiness,
-    /// and is a no-op when nothing changed. Tests against a real
-    /// `mio::Registry` so the reregister error path is also exercised.
-    #[test]
-    fn reconcile_writable_interest_tracks_outbound_state() {
-        use crate::server::ClientState;
-        use mio::{Interest, Poll, unix::SourceFd};
-        use std::{
-            collections::{HashMap, HashSet, VecDeque},
-            io::{Read, Write},
-            os::{fd::AsRawFd, unix::net::UnixStream},
-            sync::{Arc, Mutex, atomic::AtomicU16},
-        };
-        use yserver_protocol::x11::{ClientByteOrder, ClientId as Cid};
-
-        let poll = Poll::new().unwrap();
-        // We just need a real fd registered with the poller.
-        let (mut peer, writer) = UnixStream::pair().unwrap();
-        writer.set_nonblocking(true).unwrap();
-        let writer_arc = Arc::new(Mutex::new(crate::transport::Transport::Unix(writer)));
-        let raw = writer_arc.lock().unwrap().as_raw_fd();
-        let token = client_token(Cid(7));
-        poll.registry()
-            .register(&mut SourceFd(&raw), token, Interest::READABLE)
-            .unwrap();
-
-        let mut state = ServerState::new();
-        state.clients.insert(
-            7,
-            ClientState {
-                writer: writer_arc,
-                byte_order: ClientByteOrder::LittleEndian,
-                last_sequence: Arc::new(AtomicU16::new(0)),
-                resource_id_base: 0,
-                resource_id_mask: 0,
-                event_masks: HashMap::new(),
-                save_set: HashSet::new(),
-                big_requests_enabled: false,
-                xi2_masks: HashMap::new(),
-                xi1_event_classes: HashSet::new(),
-                xi1_window_event_classes: HashMap::new(),
-                outbound: VecDeque::new(),
-                watching_writable: false,
-                focused_window: crate::resources::ROOT_WINDOW,
-                reader_control: None,
-                is_local: true,
-                fd_passing: true,
-            },
-        );
-
-        // outbound is empty, watching_writable is false → no-op.
-        let disc = reconcile_client_writable_interest(poll.registry(), &mut state);
-        assert!(disc.is_empty());
-        assert!(!state.clients[&7].watching_writable);
-
-        // Outbound becomes non-empty AND the peer doesn't read → reconcile's
-        // proactive drain attempt cannot empty it, so watching_writable
-        // flips on.
-        //
-        // Fill the kernel buffer first so any drain attempt returns
-        // WouldBlock instead of writing through to `peer`.
-        //
-        // Fill until the kernel actually reports WouldBlock rather than
-        // writing one fixed-size buffer: the capacity is a tunable the
-        // test cannot assume. On the Linux box this was reported from,
-        // `net.core.wmem_default` was the stock 212992 (~228 KiB
-        // absorbed), so a single 256 KiB write cleared it by only ~11%
-        // and was swallowed whole where that sysctl had been raised;
-        // other platforms size it differently again. The drain
-        // inside reconcile then succeeded, `outbound` emptied, and
-        // `watching_writable` never flipped on — #107.
-        //
-        // SO_SNDBUF is also raised, best-effort, so a machine with the
-        // stock sysctl still exercises the large-buffer case. It is only
-        // an amplifier: the kernel may clamp it (Linux) or refuse it
-        // (FreeBSD ENOBUFS), and the loop below is correct either way,
-        // so the result is deliberately not asserted on.
-        unsafe {
-            let sz: libc::c_int = 512 * 1024;
-            libc::setsockopt(
-                raw,
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                std::ptr::addr_of!(sz).cast(),
-                u32::try_from(std::mem::size_of::<libc::c_int>()).unwrap(),
-            );
-        }
-        let chunk = vec![0xABu8; 64 * 1024];
-        let mut filled = false;
-        // Bounded so a kernel that never reports WouldBlock fails the
-        // assertion below instead of spinning.
-        for _ in 0..1024 {
-            match state.clients[&7].writer.lock().unwrap().write(&chunk) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                    filled = true;
-                    break;
-                }
-                // Anything else (EPIPE, EINTR…) is a broken fixture, not
-                // a full buffer — surface it rather than folding it into
-                // the generic "never reported WouldBlock" failure.
-                Err(err) => panic!("unexpected error filling the send buffer: {err}"),
-            }
-        }
-        assert!(filled, "kernel send buffer never reported WouldBlock");
-        state
-            .clients
-            .get_mut(&7)
-            .unwrap()
-            .outbound
-            .extend([1u8, 2, 3]);
-        let disc = reconcile_client_writable_interest(poll.registry(), &mut state);
-        assert!(disc.is_empty());
-        assert!(state.clients[&7].watching_writable);
-
-        // Peer drains → kernel buffer empties → drain succeeds inside reconcile,
-        // outbound goes empty, watching_writable flips off.
-        //
-        // Read until WouldBlock for the same reason the fill loops: one
-        // read of a fixed size is not guaranteed to empty the queue, and
-        // leftover bytes would make reconcile's drain block again and
-        // leave `outbound` non-empty.
-        let mut sink = vec![0u8; 64 * 1024];
-        peer.set_nonblocking(true).unwrap();
-        loop {
-            match peer.read(&mut sink) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(err) => panic!("unexpected error draining the peer: {err}"),
-            }
-        }
-        let disc = reconcile_client_writable_interest(poll.registry(), &mut state);
-        assert!(disc.is_empty());
-        assert!(state.clients[&7].outbound.is_empty());
-        assert!(!state.clients[&7].watching_writable);
-
-        drop(peer);
-    }
-
-    /// Multi-device regression: two DRM fds of the same kind must get
-    /// distinct poll tokens, and readiness on the second fd must carry
-    /// that exact fd through `Backend::on_page_flip_ready`.
-    #[test]
-    fn drm_readiness_routes_to_the_exact_backend_fd() {
-        use crate::backend::{BackendFdKind, recording::RecordingBackend};
-        use std::{io::Write, os::fd::AsRawFd};
-
-        let (poll, sender, rx) = channel().unwrap();
-        let sender_for_core = sender.clone_handle();
-        let (drm_reader_a, _drm_writer_a) = UnixStream::pair().unwrap();
-        let (drm_reader_b, mut drm_writer_b) = UnixStream::pair().unwrap();
-        let drm_fd_a = drm_reader_a.as_raw_fd();
-        let drm_fd_b = drm_reader_b.as_raw_fd();
-        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
-        let mut backend = RecordingBackend::new().with_poll_sources(
-            vec![
-                (drm_fd_a, BackendFdKind::Drm),
-                (drm_fd_b, BackendFdKind::Drm),
-            ],
-            ready_tx,
-        );
-        let handle = std::thread::spawn(move || {
-            // `RecordingBackend` intentionally stores only raw fds; keep
-            // their owners alive for the duration of the core loop.
-            let _drm_readers = (drm_reader_a, drm_reader_b);
-            let mut state = ServerState::new();
-            let alloc = ClientIdAllocator::new();
-            let result = run_core(
-                poll,
-                rx,
-                sender_for_core,
-                &mut state,
-                &mut backend,
-                None,
-                &alloc,
-                AuthState::new(None),
-                ResetPolicy::NoReset,
-                None,
-            );
-            (result, backend)
-        });
-
-        drm_writer_b.write_all(&[1]).unwrap();
-        assert_eq!(
-            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap(),
-            drm_fd_b,
-            "readiness from the second DRM source must retain its fd identity"
-        );
-        sender.send(Message::Shutdown).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(handle.is_finished(), "run_core did not return");
-        let (result, backend) = handle.join().unwrap();
-        result.unwrap();
-        let dispatched_fds = backend.page_flip_fds.lock().unwrap();
-        assert!(
-            !dispatched_fds.is_empty(),
-            "the readable DRM source must be dispatched"
-        );
-        assert!(
-            dispatched_fds.iter().all(|fd| *fd == drm_fd_b),
-            "idle DRM fd {drm_fd_a} was dispatched: {dispatched_fds:?}",
-        );
-    }
-
-    /// A fake XDMCP manager on loopback, for the two loop-level tests
-    /// below. The service-level behaviour is covered in `core_loop::xdmcp`;
-    /// what these prove is the *plumbing* — the UDP socket really is in
-    /// this poll set, its readiness really is dispatched, and the reset
-    /// hook really runs after the new generation is installed.
-    #[cfg(feature = "xdmcp")]
-    struct XdmcpManagerFixture {
-        socket: std::net::UdpSocket,
-    }
-
-    #[cfg(feature = "xdmcp")]
-    impl XdmcpManagerFixture {
-        fn new() -> Self {
-            let socket = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
-            socket
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .unwrap();
-            Self { socket }
-        }
-
-        fn service(&self, once: bool) -> XdmcpService {
-            use crate::core_loop::xdmcp::{XdmcpMode, XdmcpSetup};
-            XdmcpService::bind(&XdmcpSetup {
-                mode: XdmcpMode::Query("127.0.0.1".into()),
-                port: self.socket.local_addr().unwrap().port(),
-                from: Some("127.0.0.1".into()),
-                class: None,
-                display_id: None,
-                once,
-                display_number: 7,
-            })
-            .unwrap()
-        }
-
-        fn expect(
-            &self,
-            what: &str,
-        ) -> (yserver_protocol::xdmcp::XdmcpMessage, std::net::SocketAddr) {
-            let mut buf = [0_u8; 8192];
-            let (len, from) = self
-                .socket
-                .recv_from(&mut buf)
-                .unwrap_or_else(|e| panic!("no {what} from the display: {e}"));
-            (
-                yserver_protocol::xdmcp::decode_message(&buf[..len]).unwrap(),
-                from,
-            )
-        }
-
-        fn send(&self, to: std::net::SocketAddr, message: &yserver_protocol::xdmcp::XdmcpMessage) {
-            let packet = yserver_protocol::xdmcp::encode_message(message).unwrap();
-            self.socket.send_to(&packet, to).unwrap();
-        }
-    }
-
-    /// The socket is registered with the core poller, its readiness is
-    /// dispatched, and a reset re-queries — from the loop, not from a
-    /// hand-driven service.
-    #[cfg(feature = "xdmcp")]
-    #[test]
-    fn the_xdmcp_socket_is_polled_and_a_reset_re_queries() {
-        use crate::backend::recording::RecordingBackend;
-        use yserver_protocol::xdmcp::XdmcpMessage;
-
-        let manager = XdmcpManagerFixture::new();
-        let service = manager.service(false);
-        let (poll, sender, rx) = channel().unwrap();
-        let sender_for_core = sender.clone_handle();
-        let handle = std::thread::spawn(move || {
-            let mut state = ServerState::new();
-            let mut backend = RecordingBackend::new();
-            let alloc = ClientIdAllocator::new();
-            run_core(
-                poll,
-                rx,
-                sender_for_core,
-                &mut state,
-                &mut backend,
-                None,
-                &alloc,
-                AuthState::new_with_xdmcp(None, true),
-                ResetPolicy::Reset,
-                Some(service),
-            )
-        });
-
-        let (query, display) = manager.expect("the startup Query");
-        assert!(matches!(query, XdmcpMessage::Query { .. }), "{query:?}");
-
-        manager.send(
-            display,
-            &XdmcpMessage::Willing {
-                authentication_name: Vec::new(),
-                hostname: b"fake-dm".to_vec(),
-                status: b"willing".to_vec(),
-            },
-        );
-        let (request, _) = manager.expect("a Request");
-        assert!(
-            matches!(request, XdmcpMessage::Request { .. }),
-            "the loop did not dispatch the socket's readiness: {request:?}"
-        );
-
-        // A forced reset (the SIGHUP path) crosses the boundary; the XDMCP
-        // hook then re-queries on the NEW generation.
-        sender.send(Message::ResetRequested).unwrap();
-        let (requery, _) = manager.expect("a re-query after the reset");
-        assert!(matches!(requery, XdmcpMessage::Query { .. }), "{requery:?}");
-
-        sender.send(Message::Shutdown).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(handle.is_finished(), "run_core did not return");
-        handle.join().unwrap().unwrap();
-    }
-
-    /// A `Terminate` from the machine ends the loop cleanly — the other
-    /// half of the outcome wiring. `Failed` gets there in three packets
-    /// instead of the 126 seconds a retransmission timeout would take.
-    #[cfg(feature = "xdmcp")]
-    #[test]
-    fn an_xdmcp_terminate_ends_the_core_loop() {
-        use crate::backend::recording::RecordingBackend;
-        use yserver_protocol::xdmcp::{MIT_MAGIC_COOKIE_1, XdmcpMessage};
-
-        let manager = XdmcpManagerFixture::new();
-        let service = manager.service(false);
-        let (poll, sender, rx) = channel().unwrap();
-        let sender_for_core = sender.clone_handle();
-        let handle = std::thread::spawn(move || {
-            let mut state = ServerState::new();
-            let mut backend = RecordingBackend::new();
-            let alloc = ClientIdAllocator::new();
-            run_core(
-                poll,
-                rx,
-                sender_for_core,
-                &mut state,
-                &mut backend,
-                None,
-                &alloc,
-                AuthState::new_with_xdmcp(None, true),
-                ResetPolicy::Reset,
-                Some(service),
-            )
-        });
-
-        let (_, display) = manager.expect("the startup Query");
-        manager.send(
-            display,
-            &XdmcpMessage::Willing {
-                authentication_name: Vec::new(),
-                hostname: b"fake-dm".to_vec(),
-                status: b"willing".to_vec(),
-            },
-        );
-        let _ = manager.expect("a Request");
-        manager.send(
-            display,
-            &XdmcpMessage::Accept {
-                session_id: 0x1234,
-                authentication_name: Vec::new(),
-                authentication_data: Vec::new(),
-                authorization_name: MIT_MAGIC_COOKIE_1.to_vec(),
-                authorization_data: b"cookie".to_vec(),
-            },
-        );
-        let _ = manager.expect("a Manage");
-        manager.send(
-            display,
-            &XdmcpMessage::Failed {
-                session_id: 0x1234,
-                status: b"no session for you".to_vec(),
-            },
-        );
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            handle.is_finished(),
-            "a fatal XDMCP packet did not stop the loop"
-        );
-        handle.join().unwrap().unwrap();
-        drop(sender);
-    }
-    /// A setup that lost the `Refuse` race is dropped as orphaned — and
-    /// that drop must not start a generation.
-    ///
-    /// `AuthState` is atomic per call, but a setup thread that already
-    /// passed `check` is past that point: a `Refuse` can clear the
-    /// session cookie while the thread is one instruction from sending
-    /// its `ClientSetupComplete`. `XdmcpService::note_client_established`
-    /// reports that loser and the loop disconnects it. Under XDMCP the
-    /// policy is an implied `-reset`, so if the completion had armed the
-    /// reset trigger, the orphan's *own* disconnect would drain an armed
-    /// client set and cross the generation boundary — tearing down the
-    /// negotiation that is at that very moment retrying its `Request`.
-    ///
-    /// Arming therefore belongs to the caller, after XDMCP admission has
-    /// decided. What this pins is that decision order: the orphan goes
-    /// away, the generation does not move, and the manager's outstanding
-    /// offer is undisturbed. The injected message stands in for the
-    /// racing setup thread exactly as it reaches the loop — a **remote**
-    /// client, because the orphan rule deliberately spares local ones
-    /// (Xorg's `XdmcpOpenDisplay` ignores a unix client, which the XDMCP
-    /// cookie never authorized).
-    /// `is_local` is an ADDRESS property. A TCP peer on this machine is a
-    /// local client — Xorg's `xtransLocalClient` says so — and therefore
-    /// keeps MIT-SHM, whose legacy `Attach` passes a SysV shmid rather
-    /// than a descriptor and so works fine without fd passing.
-    ///
-    /// Deriving it from the transport instead, as this did until
-    /// 2026-09-10, refused shared memory to a same-machine XDMCP session
-    /// (`DISPLAY=127.0.0.1:1`) and pushed every image over the wire.
-    #[test]
-    fn a_tcp_peer_on_this_machine_is_a_local_client() {
-        use std::net::{IpAddr, Ipv4Addr};
-
-        assert!(
-            address_is_ours(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-            "127.0.0.1 is ours"
-        );
-        assert!(
-            address_is_ours(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))),
-            "the whole loopback range is ours, not just 127.0.0.1"
-        );
-        // TEST-NET-3 (RFC 5737): reserved for documentation, so it cannot
-        // be a real interface address on the machine running this test.
-        assert!(
-            !address_is_ours(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))),
-            "a documentation-range address is not ours"
-        );
-    }
-
-    #[cfg(feature = "xdmcp")]
-    #[test]
-    fn an_orphaned_xdmcp_client_does_not_reset_the_generation() {
-        use crate::backend::recording::RecordingBackend;
-        use std::io::Read;
-        use yserver_protocol::{
-            x11::ClientByteOrder,
-            xdmcp::{MIT_MAGIC_COOKIE_1, XdmcpMessage, decode_message},
-        };
-
-        /// How long the "no reset happened" assertions watch for. The
-        /// XDMCP retransmit floor is `XDM_MIN_RTX` = 2 s, so nothing the
-        /// healthy machine does can land inside this window; a reset's
-        /// re-query would land immediately.
-        const QUIET: Duration = Duration::from_millis(400);
-        const SESSION: u32 = 0x1234;
-
-        let manager = XdmcpManagerFixture::new();
-        let service = manager.service(false);
-        let (poll, sender, rx) = channel().unwrap();
-        // The generation is read from the counter, not inferred from
-        // timing: the boundary bumps it and nothing else in the loop
-        // does.
-        let generations = rx.generation_counter();
-        let sender_for_core = sender.clone_handle();
-        let client_ids = std::sync::Arc::new(ClientIdAllocator::new());
-        let client_ids_for_core = client_ids.clone();
-        let handle = std::thread::spawn(move || {
-            let mut state = ServerState::new();
-            let mut backend = RecordingBackend::new();
-            run_core(
-                poll,
-                rx,
-                sender_for_core,
-                &mut state,
-                &mut backend,
-                None,
-                &client_ids_for_core,
-                AuthState::new_with_xdmcp(None, true),
-                ResetPolicy::Reset,
-                Some(service),
-            )
-        });
-
-        let start_generation = generations.current();
-
-        // Query -> Willing -> Request -> Accept installs the session
-        // cookie, and the machine answers with Manage.
-        let (query, display) = manager.expect("the startup Query");
-        assert!(matches!(query, XdmcpMessage::Query { .. }), "{query:?}");
-        manager.send(
-            display,
-            &XdmcpMessage::Willing {
-                authentication_name: Vec::new(),
-                hostname: b"fake-dm".to_vec(),
-                status: b"willing".to_vec(),
-            },
-        );
-        let (request, _) = manager.expect("a Request");
-        assert!(
-            matches!(request, XdmcpMessage::Request { .. }),
-            "{request:?}"
-        );
-        manager.send(
-            display,
-            &XdmcpMessage::Accept {
-                session_id: SESSION,
-                authentication_name: Vec::new(),
-                authentication_data: Vec::new(),
-                authorization_name: MIT_MAGIC_COOKIE_1.to_vec(),
-                authorization_data: b"cookie".to_vec(),
-            },
-        );
-        let (manage, _) = manager.expect("a Manage");
-        assert!(matches!(manage, XdmcpMessage::Manage { .. }), "{manage:?}");
-
-        // The Refuse clears the cookie and sends the machine back round
-        // to Request. Reading that retry is the synchronisation point:
-        // it cannot be on the wire until the Refuse has been fully
-        // applied, so the injection below is unambiguously *after* the
-        // clear. No generation change — the offer is being retried, not
-        // abandoned.
-        manager.send(
-            display,
-            &XdmcpMessage::Refuse {
-                session_id: SESSION,
-            },
-        );
-        let (retry, _) = manager.expect("the Request retry after the Refuse");
-        assert!(
-            matches!(retry, XdmcpMessage::Request { .. }),
-            "a Refuse must resend the Request, got {retry:?}"
-        );
-        assert_eq!(
-            generations.current(),
-            start_generation,
-            "a Refuse retries the offer; it does not cross a boundary"
-        );
-
-        // The racing setup thread's completion, arriving now.
-        let orphan = client_ids.allocate();
-        let (core_side, mut peer) = UnixStream::pair().expect("socketpair");
-        peer.set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("read timeout");
-        let stale = sender.bind();
-        stale
-            .send(Message::ClientSetupComplete {
-                id: orphan,
-                generation: stale.generation(),
-                stream: Transport::Unix(core_side),
-                resource_id_base: 0x0020_0000,
-                resource_id_mask: 0x000F_FFFF,
-                byte_order: ClientByteOrder::LittleEndian,
-                // Remote: only a TCP client can have been authorized by
-                // the session credential the Refuse just revoked.
-                is_local: false,
-                fd_passing: false,
-            })
-            .expect("send the racing completion");
-
-        // 1. The orphan is dropped. `process_disconnect` shuts the
-        //    socket down on both sides, so this is EOF, not a timeout.
-        let mut sink = [0_u8; 1];
-        match peer.read(&mut sink) {
-            Ok(0) => {}
-            other => panic!("a client with no session must be disconnected; read {other:?}"),
-        }
-
-        // Watch the manager socket for a while before judging anything.
-        // The boundary is crossed at the *end* of the iteration the
-        // disconnect ran in, so EOF above races the bump by microseconds
-        // — this window is what makes the two assertions below decisive
-        // rather than a coin flip. Collect only; asserting inside the
-        // loop would let the re-query fire first and hide which of the
-        // two actually broke.
-        manager
-            .socket
-            .set_read_timeout(Some(QUIET))
-            .expect("quiet-window timeout");
-        let mut buf = [0_u8; 8192];
-        let mut seen = Vec::new();
-        let deadline = Instant::now() + QUIET;
-        while Instant::now() < deadline {
-            let len = match manager.socket.recv_from(&mut buf) {
-                Ok((len, _)) => len,
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    break;
-                }
-                Err(err) => panic!("unexpected error reading the manager socket: {err}"),
-            };
-            seen.push(decode_message(&buf[..len]).expect("decode"));
-        }
-
-        // 2. The regression itself.
-        assert_eq!(
-            generations.current(),
-            start_generation,
-            "an orphaned client never became established; its disconnect must not \
-             drain an armed session and start a new generation"
-        );
-
-        // 3. And the negotiation carried on untouched: the retry read
-        //    above is the manager's Request, and no Query followed it —
-        //    a Query is what a reset's re-query looks like.
-        assert!(
-            !seen
-                .iter()
-                .any(|message| matches!(message, XdmcpMessage::Query { .. })),
-            "the display re-queried mid-negotiation: {seen:?}"
-        );
-
-        sender.send(Message::Shutdown).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(handle.is_finished(), "run_core did not return");
-        handle.join().unwrap().unwrap();
-    }
-
-    #[test]
-    fn copied_scanout_completion_fd_dispatches_dedicated_hook() {
-        use crate::backend::{BackendFdKind, recording::RecordingBackend};
-        use std::{io::Write, os::fd::AsRawFd, sync::atomic::Ordering};
-
-        let (poll, sender, rx) = channel().unwrap();
-        let sender_for_core = sender.clone_handle();
-        let (completion_reader, mut completion_writer) = UnixStream::pair().unwrap();
-        let completion_fd = completion_reader.as_raw_fd();
-        let (unused_page_tx, _unused_page_rx) = crossbeam_channel::unbounded();
-        let (ready_tx, ready_rx) = crossbeam_channel::unbounded();
-        let mut backend = RecordingBackend::new()
-            .with_poll_sources(
-                vec![(completion_fd, BackendFdKind::ScanoutRenderCompletion)],
-                unused_page_tx,
-            )
-            .with_scanout_render_completion_notification(ready_tx);
-        let handle = std::thread::spawn(move || {
-            // `RecordingBackend` stores only the raw fd, so retain its owner
-            // until `run_core` has unregistered every backend source.
-            let _completion_reader = completion_reader;
-            let mut state = ServerState::new();
-            let alloc = ClientIdAllocator::new();
-            let result = run_core(
-                poll,
-                rx,
-                sender_for_core,
-                &mut state,
-                &mut backend,
-                None,
-                &alloc,
-                AuthState::new(None),
-                ResetPolicy::NoReset,
-                None,
-            );
-            (result, backend)
-        });
-
-        completion_writer.write_all(&[1]).unwrap();
-        ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        sender.send(Message::Shutdown).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(handle.is_finished(), "run_core did not return");
-        let (result, backend) = handle.join().unwrap();
-        result.unwrap();
-        assert!(
-            backend
-                .scanout_render_completion_count
-                .load(Ordering::Relaxed)
-                >= 1,
-            "readiness must dispatch the copied-scanout completion hook"
-        );
-        assert_eq!(
-            backend.page_flip_count.load(Ordering::Relaxed),
-            0,
-            "copied-scanout readiness must not be misrouted as a DRM page flip"
-        );
-    }
-
-    /// Regression (project_reclamation_starvation_leak): the core loop
-    /// must drive backend GPU-resource reclamation (`before_block`) every
-    /// iteration, INDEPENDENT of page-flips. The KMS v2 backend reaped
-    /// per-op command buffers only from `on_page_flip_ready`; while the
-    /// display was dark (DPMS-off / standby / VT-away) no flips occurred,
-    /// so a client that kept drawing grew the engine `submitted` queue
-    /// without bound until the GPU lost its device. Here we run the loop
-    /// with ZERO DRM readiness events and assert `before_block` still
-    /// fired — i.e. reclamation rides the dispatch loop, not scanout.
-    #[test]
-    fn before_block_runs_without_any_page_flip() {
-        use crate::backend::recording::RecordingBackend;
-        use std::sync::atomic::Ordering;
-
-        let (poll, sender, rx) = channel().unwrap();
-        let sender_for_core = sender.clone_handle();
-        let mut backend = RecordingBackend::new();
-        let handle = std::thread::spawn(move || {
-            let mut state = ServerState::new();
-            let alloc = ClientIdAllocator::new();
-            let result = run_core(
-                poll,
-                rx,
-                sender_for_core,
-                &mut state,
-                &mut backend,
-                None,
-                &alloc,
-                AuthState::new(None),
-                ResetPolicy::NoReset,
-                None,
-            );
-            (result, backend)
-        });
-        // No DRM readiness — only a Shutdown. The loop must still run at
-        // least one iteration, calling before_block before it blocks.
-        sender.send(Message::Shutdown).unwrap();
-        // Generous deadline so a slow/loaded CI box can't spuriously fail:
-        // the loop breaks the instant the thread finishes, so this only
-        // bounds the pathological-hang case.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !handle.is_finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(handle.is_finished(), "run_core did not return");
-        let (result, backend) = handle.join().unwrap();
-        result.unwrap();
-        assert_eq!(
-            backend.page_flip_count.load(Ordering::Relaxed),
-            0,
-            "test must exercise the no-page-flip path",
-        );
-        assert!(
-            backend.before_block_count.load(Ordering::Relaxed) >= 1,
-            "before_block must run each iteration even with no page-flips \
-             (reclamation must not be gated on scanout)",
-        );
-    }
-
-    /// `handle_host_input` arms the auto-repeat timer on a real
-    /// KeyPress, replaces it on a different KeyPress, and clears it
-    /// on the matching KeyRelease. Regression coverage for backend-owned input
-    /// dispatch paths that must not call `backend.on_host_input` directly,
-    /// bypassing this wrapper.
-    #[test]
-    fn handle_host_input_arms_repeat_state() {
-        use crate::{backend::recording::RecordingBackend, host_x11::HostKeyEvent};
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-
-        let key = |keycode: u8, pressed: bool| {
-            HostInputEvent::Key(HostKeyEvent {
-                pressed,
-                keycode,
-                time: 0,
-                root_x: 0,
-                root_y: 0,
-                event_x: 0,
-                event_y: 0,
-                state: 0,
-            })
-        };
-
-        // Press A → armed on A.
-        handle_host_input(&mut state, &mut backend, key(38, true));
-        let armed = state.repeat_state.expect("press should arm repeat_state");
-        assert_eq!(armed.event.keycode, 38);
-        assert!(armed.event.pressed);
-
-        // Press B (different keycode) → replaces armed key.
-        handle_host_input(&mut state, &mut backend, key(39, true));
-        let armed = state.repeat_state.expect("second press should re-arm");
-        assert_eq!(armed.event.keycode, 39);
-
-        // Release A while B is armed → ignored (only the armed key's
-        // release clears).
-        handle_host_input(&mut state, &mut backend, key(38, false));
-        assert!(
-            state.repeat_state.is_some(),
-            "release of non-armed key must not clear",
-        );
-
-        // Release B → clears.
-        handle_host_input(&mut state, &mut backend, key(39, false));
-        assert!(state.repeat_state.is_none());
-    }
-
-    /// Regression guard for the idle free-run fix (cut 2a): the caller
-    /// pokes the compositor (`mark_dirty`) only when a repeat actually
-    /// fires. `fire_pending_repeats` must return `false` on the
-    /// every-iteration "armed but not yet due" path (else a held/stuck
-    /// key busy-spins the compositor at the loop rate) and `true` only
-    /// when it fans out.
-    #[test]
-    fn fire_pending_repeats_reports_whether_it_fired() {
-        use std::time::{Duration, Instant};
-
-        use crate::{backend::recording::RecordingBackend, host_x11::HostKeyEvent};
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-
-        // Nothing armed → no fire.
-        assert!(!fire_pending_repeats(&mut state, &mut backend));
-
-        // Arm a repeatable key (keycode 38 auto-repeats by default —
-        // the sibling test relies on this too).
-        handle_host_input(
-            &mut state,
-            &mut backend,
-            HostInputEvent::Key(HostKeyEvent {
-                pressed: true,
-                keycode: 38,
-                time: 0,
-                root_x: 0,
-                root_y: 0,
-                event_x: 0,
-                event_y: 0,
-                state: 0,
-            }),
-        );
-        assert!(state.repeat_state.is_some());
-
-        // Freshly armed → `next_fire` is INITIAL_DELAY in the future →
-        // NOT due → must return false (the idle busy-spin case).
-        assert!(
-            !fire_pending_repeats(&mut state, &mut backend),
-            "armed-but-not-due must not report a fire",
-        );
-
-        // Force the deadline into the past → must fire.
-        if let Some(s) = state.repeat_state.as_mut() {
-            s.next_fire = Instant::now() - Duration::from_millis(1);
-        }
-        assert!(
-            fire_pending_repeats(&mut state, &mut backend),
-            "a due repeat must report a fire",
-        );
-    }
-
-    /// A fired repeat reaches the backend as `KeyRepeat`, not device `Key`:
-    /// it models Xorg's XKB soft repeat, which bypasses GetKeyboardEvents
-    /// and so generates no XI2 raw key event (issue #173).
-    #[test]
-    fn fire_pending_repeats_sends_key_repeat_not_device_key() {
-        use std::time::{Duration, Instant};
-
-        use crate::{
-            backend::recording::{RecordedCall, RecordingBackend},
-            host_x11::HostKeyEvent,
-        };
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        handle_host_input(
-            &mut state,
-            &mut backend,
-            HostInputEvent::Key(HostKeyEvent {
-                pressed: true,
-                keycode: 38,
-                time: 0,
-                root_x: 0,
-                root_y: 0,
-                event_x: 0,
-                event_y: 0,
-                state: 0,
-            }),
-        );
-        if let Some(s) = state.repeat_state.as_mut() {
-            s.next_fire = Instant::now() - Duration::from_millis(1);
-        }
-        assert!(fire_pending_repeats(&mut state, &mut backend));
-
-        let keys: Vec<RecordedCall> = backend
-            .calls()
-            .into_iter()
-            .filter(|c| matches!(c, RecordedCall::HostKey { .. }))
-            .collect();
-        assert_eq!(
-            keys,
-            vec![
-                RecordedCall::HostKey {
-                    keycode: 38,
-                    pressed: true,
-                    repeat: false,
-                },
-                RecordedCall::HostKey {
-                    keycode: 38,
-                    pressed: false,
-                    repeat: true,
-                },
-                RecordedCall::HostKey {
-                    keycode: 38,
-                    pressed: true,
-                    repeat: true,
-                },
-            ]
-        );
-    }
-
-    /// Helper: a touchpad `DeviceInfo` mirroring libinput's enumeration
-    /// of a Synaptics pad (matches xinput.rs's `touchpad_info`).
-    #[cfg(test)]
-    fn probe_touchpad_info() -> crate::core_loop::DeviceInfo {
-        use crate::core_loop::message::{BoolSetting, LibinputConfigSnapshot};
-        crate::core_loop::DeviceInfo {
-            name: "SynPS/2 Synaptics TouchPad".into(),
-            device_node: "/dev/input/event4".into(),
-            sysname: "event4".into(),
-            vendor_id: 0x046d,
-            product_id: 0xc52f,
-            is_touchpad: true,
-            config: LibinputConfigSnapshot {
-                tap: BoolSetting {
-                    available: true,
-                    current: true,
-                    default: false,
-                },
-                natural_scroll: BoolSetting {
-                    available: true,
-                    current: false,
-                    default: true,
-                },
-                dwt: BoolSetting {
-                    available: true,
-                    current: true,
-                    default: true,
-                },
-                ..Default::default()
-            },
-        }
-    }
-
-    #[cfg(test)]
-    fn slave_pointer_name(state: &ServerState) -> String {
-        state
-            .xi_devices
-            .iter()
-            .find(|d| d.id == crate::xinput::DEVICEID_SLAVE_POINTER)
-            .expect("slave pointer (id 4) always present")
-            .name
-            .clone()
-    }
-
-    /// A backend with no on-core libinput (the trait default, and what
-    /// Direct-mode / host-X11 / ynest present) is a clean no-op probe:
-    /// returns 0 and leaves the static device model untouched.
-    #[test]
-    fn probe_input_devices_default_is_noop() {
-        use crate::backend::recording::RecordingBackend;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new(); // no probe_rounds configured
-        let before = slave_pointer_name(&state);
-
-        let seeded = backend.probe_input_devices(&mut state);
-
-        assert_eq!(seeded, 0, "no-op probe seeds nothing");
-        assert_eq!(
-            slave_pointer_name(&state),
-            before,
-            "device 4 unchanged when nothing to probe",
-        );
-    }
-
-    /// A backend whose startup probe enumerates a touchpad seeds the
-    /// XI2 registry: device 4 becomes the real touchpad BEFORE the
-    /// serve loop — the whole point of the Xorg-style startup probe.
-    #[test]
-    fn probe_input_devices_seeds_touchpad_before_loop() {
-        use crate::backend::recording::RecordingBackend;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        // One non-empty round (the touchpad), then libinput goes quiet.
-        backend.probe_rounds.push_back(vec![probe_touchpad_info()]);
-
-        assert_ne!(
-            slave_pointer_name(&state),
-            "SynPS/2 Synaptics TouchPad",
-            "precondition: device 4 starts as the generic slave pointer",
-        );
-
-        let seeded = backend.probe_input_devices(&mut state);
-
-        assert_eq!(seeded, 1, "exactly one device seeded");
-        assert_eq!(
-            slave_pointer_name(&state),
-            "SynPS/2 Synaptics TouchPad",
-            "device 4 is the touchpad after the startup probe",
-        );
-    }
-
-    /// The bounded drain TERMINATES: with libinput perpetually empty it
-    /// stops after two consecutive empty rounds (not the MAX_ROUNDS
-    /// ceiling), and even an adversarial always-non-empty source is
-    /// capped at the ceiling rather than spinning forever.
-    #[test]
-    fn probe_input_devices_bounded_drain_terminates() {
-        use crate::backend::recording::RecordingBackend;
-
-        // Empty source → stops after the 2 empty rounds, well under the
-        // 8-round ceiling.
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        let seeded = backend.probe_input_devices(&mut state);
-        assert_eq!(seeded, 0);
-        assert_eq!(
-            backend.probe_rounds_run.get(),
-            2,
-            "two consecutive empty rounds end the drain",
-        );
-
-        // Adversarial source that never goes empty → capped at the
-        // MAX_ROUNDS ceiling, never unbounded.
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        for _ in 0..100 {
-            backend.probe_rounds.push_back(vec![probe_touchpad_info()]);
-        }
-        let seeded = backend.probe_input_devices(&mut state);
-        assert_eq!(
-            backend.probe_rounds_run.get(),
-            8,
-            "drain is capped at the MAX_ROUNDS ceiling",
-        );
-        assert_eq!(seeded, 8, "one device seeded per capped round");
-    }
-
-    #[test]
-    fn shutdown_returns() {
-        use crate::{
-            backend::recording::RecordingBackend, core_loop::poll_tokens::ClientIdAllocator,
-        };
-
-        let (poll, sender, rx) = channel().unwrap();
-        let sender_for_core = sender.clone_handle();
-        let handle = std::thread::spawn(move || {
-            let mut state = ServerState::new();
-            let mut backend = RecordingBackend::new();
-            let alloc = ClientIdAllocator::new();
-            run_core(
-                poll,
-                rx,
-                sender_for_core,
-                &mut state,
-                &mut backend,
-                None,
-                &alloc,
-                AuthState::new(None),
-                ResetPolicy::NoReset,
-                None,
-            )
-        });
-        sender.send(Message::Shutdown).unwrap();
-        // Bound the wait so a regression that fails to return does not
-        // hang the test runner.
-        for _ in 0..50 {
-            if handle.is_finished() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(handle.is_finished(), "run_core did not return on Shutdown");
-        handle.join().unwrap().unwrap();
-    }
-
-    #[test]
-    fn evaluator_fires_idle_activation_when_deadline_elapsed() {
-        let mut state = ServerState::new();
-        state.screensaver.timeout_ms = 60_000;
-        state.dpms.last_activity = Instant::now() - Duration::from_secs(61);
-        // No client installed — emit_screen_saver_notify short-circuits
-        // on empty selected_by; we're asserting state transition only.
-        let mut backend = RecordingBackend::default();
-
-        super::evaluate_screen_saver_post_poll(&mut state, &mut backend);
-
-        assert_eq!(
-            state.screensaver.active,
-            ScreenSaverActive::On,
-            "elapsed idle deadline must drive SS On"
-        );
-    }
-
-    #[test]
-    fn evaluator_fires_cycle_and_advances_next_cycle() {
-        let mut state = ServerState::new();
-        state.screensaver.active = ScreenSaverActive::On;
-        state.screensaver.interval_ms = 60_000;
-        let past = Instant::now() - Duration::from_millis(10);
-        state.screensaver.next_cycle = Some(past);
-        let mut backend = RecordingBackend::default();
-
-        super::evaluate_screen_saver_post_poll(&mut state, &mut backend);
-
-        let next = state.screensaver.next_cycle.expect("re-armed by evaluator");
-        assert!(
-            next > past,
-            "next_cycle must advance past the prior deadline"
-        );
-    }
-
-    #[test]
-    fn evaluator_idle_path_skipped_while_dpms_blanked() {
-        // Xorg WaitFor.c:457 — when DPMS is non-On the SS idle timer
-        // is suppressed; the DPMS→SS coupling already handled it.
-        let mut state = ServerState::new();
-        state.screensaver.timeout_ms = 60_000;
-        state.dpms.last_activity = Instant::now() - Duration::from_secs(120);
-        state.dpms.power_level = 3; // Off
-        let mut backend = RecordingBackend::default();
-
-        super::evaluate_screen_saver_post_poll(&mut state, &mut backend);
-
-        assert_eq!(
-            state.screensaver.active,
-            ScreenSaverActive::Off,
-            "evaluator must not fire SS when DPMS is blanked"
-        );
-    }
-
-    #[test]
-    fn idletime_evaluator_fires_pos_transition_when_deadline_elapsed() {
-        use std::time::Duration;
-        use yserver_protocol::x11::{ClientId, sync as x11sync};
-        let mut state = ServerState::new();
-        // Pre-arm: a PositiveTransition alarm at 60_000ms, last_activity 61s ago.
-        state.dpms.last_activity = std::time::Instant::now() - Duration::from_secs(61);
-        let alarm_id = 0x2000;
-        state.sync_alarms.insert(
-            alarm_id,
-            crate::server::SyncAlarm {
-                owner: ClientId(1),
-                counter: x11sync::IDLETIME_COUNTER,
-                wait_value: 60_000,
-                delta: 0,
-                test_type: x11sync::TEST_POSITIVE_TRANSITION,
-                events: false, // skip wire delivery; assert state mutation only
-                state: x11sync::ALARM_STATE_ACTIVE,
-                event_clients: Vec::new(),
-                value_type: 0,
-                raw_wait: 60_000,
-                check_type: x11sync::TEST_POSITIVE_TRANSITION,
-            },
-        );
-        let mut backend = RecordingBackend::default();
-
-        super::evaluate_idletime_alarms_post_poll(&mut state, &mut backend);
-
-        // PositiveTransition + delta=0 stays Active (Task 2 fix).
-        let after = &state.sync_alarms[&alarm_id];
-        assert_eq!(after.state, x11sync::ALARM_STATE_ACTIVE);
-        // last_evaluated cache updated for global IDLETIME.
-        assert!(
-            state
-                .idletime_last_evaluated
-                .get(&x11sync::IDLETIME_COUNTER)
-                .copied()
-                .unwrap_or(0)
-                >= 60_000,
-            "last_evaluated cache should advance past the trigger value"
-        );
-    }
-
-    #[test]
-    fn idletime_evaluator_skips_when_no_idletime_alarms() {
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::default();
-        // No alarms at all — must not panic, must not insert spurious cache entries.
-        super::evaluate_idletime_alarms_post_poll(&mut state, &mut backend);
-        assert!(state.idletime_last_evaluated.is_empty());
-    }
-
-    /// Task 4/7 completion pacing: a completion whose gate targets a future
-    /// vblank parks on drain (its wake is NOT signalled yet), and only fires —
-    /// signalling `signal_present_wake` — once `fire_due_present_completions`
-    /// runs at an MSC that has reached the target. Sibling to the NotifyMSC
-    /// `parks_then_fires_on_vblank_advance` test.
-    #[test]
-    fn gated_present_completion_parks_then_fires_on_vblank_advance() {
-        use crate::{
-            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
-            server::PresentCompleteGate,
-        };
-        use yserver_protocol::x11::ClientId;
-
-        const PRESENT_ID: u64 = 0x42;
-        const TARGET_MSC: u64 = 200;
-        const WINDOW_XID: u32 = 0x0000_0101;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-
-        // A standalone sequence has advanced the general clock beyond the
-        // target, but the completion-eligible clock is still zero. The gate
-        // must park rather than taking the old already-due immediate path.
-        state.present_crtc_clocks.insert(
-            (0, 0),
-            crate::server::PresentCrtcClock {
-                epoch: 0,
-                msc: 250,
-                ust: 0,
-                completion: crate::backend::PresentClockSample {
-                    msc: 0,
-                    ust: 0,
-                    source: crate::backend::PresentClockSource::Immediate,
-                },
-            },
-        );
-        state.present_complete_gate.insert(
-            PRESENT_ID,
-            PresentCompleteGate {
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                effective_target_msc: TARGET_MSC,
-                owner: ClientId(1),
-                dst_window_xid: WINDOW_XID,
-            },
-        );
-        // Backend reports the copy's GPU completion this iteration.
-        backend
-            .completed_present_events_to_drain
-            .push(CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 7,
-                host_xid: WINDOW_XID,
-                dst_host_xid: WINDOW_XID,
-                options: 0,
-                present_id: PRESENT_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: Some(crate::backend::PresentClockSample {
-                    msc: 0,
-                    ust: 0,
-                    source: crate::backend::PresentClockSource::Immediate,
-                }),
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            });
-
-        // Drain: the future-target gate parks the completion — no wake yet.
-        // (RecordingBackend's completion clock is (0,0), so the drain's own
-        // `fire_due_present_completions` is skipped and the park holds.)
-        drain_present_completions(&mut state, &mut backend);
-        assert_eq!(
-            state.present_pending_complete.len(),
-            1,
-            "future-target completion parks on drain"
-        );
-        assert!(
-            state.present_complete_gate.is_empty(),
-            "gate consumed when the copy completes"
-        );
-        assert!(
-            backend.signalled_present_wakes.is_empty(),
-            "parked completion's wake is NOT signalled before the vblank"
-        );
-
-        // Vblank advances to the target: the parked completion fires + signals.
-        // The zero sample above is a fixture-only stand-in for the initial
-        // copy-completion clock. Real copy completions carry `None`, allowing
-        // the later selected-domain vblank sample to stamp the paced event.
-        state.present_pending_complete[0].event.completion_clock = None;
-        crate::core_loop::process_request::fire_due_present_completions(
-            &mut state,
-            &mut backend,
-            crate::backend::PresentClockSample {
-                msc: TARGET_MSC,
-                ust: 0x1234,
-                source: crate::backend::PresentClockSource::PageFlip,
-            },
-        );
-        assert!(
-            state.present_pending_complete.is_empty(),
-            "parked completion released once its target MSC is reached"
-        );
-        assert_eq!(
-            backend.signalled_present_wakes,
-            vec![PRESENT_ID],
-            "signal_present_wake fires exactly once at the target vblank"
-        );
-    }
-
-    /// The gate-absent / already-reached path must NOT park: the completion
-    /// fires immediately on drain and signals its wake once.
-    #[test]
-    fn ungated_present_completion_fires_immediately_without_parking() {
-        use crate::backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend};
-        use yserver_protocol::x11::ClientId;
-
-        const PRESENT_ID: u64 = 0x43;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        // No gate recorded for this present_id → complete-now arm.
-        backend
-            .completed_present_events_to_drain
-            .push(CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 8,
-                host_xid: 0x0000_0202,
-                dst_host_xid: 0x0000_0202,
-                options: 0,
-                present_id: PRESENT_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: None,
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            });
-
-        drain_present_completions(&mut state, &mut backend);
-        assert!(
-            state.present_pending_complete.is_empty(),
-            "gate-absent completion does not park"
-        );
-        assert_eq!(
-            backend.signalled_present_wakes,
-            vec![PRESENT_ID],
-            "gate-absent completion signals its wake immediately"
-        );
-    }
-
-    /// Spec §"Ordered completion delivery" item 2: the due arm of the
-    /// drain (a completion whose gate is already satisfied when its GPU
-    /// fence retires) must route through `present_pending_complete`
-    /// instead of firing inline via `complete_present_with_clock` — so
-    /// that the per-window sweep in `fire_due_present_completions`, not
-    /// raw arrival order, decides delivery order against anything else
-    /// already parked for the same window. Pre-fix this fired here
-    /// directly and never touched the queue at all.
-    #[test]
-    fn due_gate_arm_pushes_into_queue_instead_of_firing_inline() {
-        use crate::{
-            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
-            server::PresentCompleteGate,
-        };
-        use yserver_protocol::x11::ClientId;
-
-        const PRESENT_ID: u64 = 0x44;
-        const WINDOW_XID: u32 = 0x0000_0303;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        // effective_target_msc 0 is already satisfied against
-        // RecordingBackend's default (0, 0) completion clock — the "due"
-        // arm, not the "still future" park arm.
-        state.present_complete_gate.insert(
-            PRESENT_ID,
-            PresentCompleteGate {
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                effective_target_msc: 0,
-                owner: ClientId(1),
-                dst_window_xid: WINDOW_XID,
-            },
-        );
-        backend
-            .completed_present_events_to_drain
-            .push(CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 9,
-                host_xid: WINDOW_XID,
-                dst_host_xid: WINDOW_XID,
-                options: 0,
-                present_id: PRESENT_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: None,
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            });
-
-        drain_present_completions(&mut state, &mut backend);
-        assert!(
-            state.present_complete_gate.is_empty(),
-            "gate consumed when the copy completes"
-        );
-        assert_eq!(
-            state.present_pending_complete.len(),
-            1,
-            "the due arm pushes into the ordered queue rather than firing \
-             inline (RecordingBackend's zero completion clock means the \
-             same-pass sweep can't drain it yet, which is fine — this test \
-             only pins that it did NOT fire inline)"
-        );
-        assert!(
-            backend.signalled_present_wakes.is_empty(),
-            "must not signal the wake inline — delivery is the sweep's job"
-        );
-    }
-
-    /// Spec round-4 F6: presents without a usable clock
-    /// (`effective_target_msc == None`, no gate entry — the drain's
-    /// gate-absent arm) sit outside the
-    /// per-window hold-back entirely and complete immediately, even ahead
-    /// of an earlier-arrived, still-unresolved synced present parked for
-    /// the same window. This is Xorg-parity and pre-existing; documented
-    /// so it isn't mistaken for a hold-back bug.
-    #[test]
-    fn no_clock_present_completion_bypasses_per_window_hold_back() {
-        use crate::{
-            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
-            server::PendingPresentComplete,
-        };
-        use yserver_protocol::x11::{ClientId, present as x11present};
-
-        const WINDOW_XID: u32 = 0x0000_0606;
-        const PARKED_SMALLER_ID: u64 = 5;
-        const ASYNC_ID: u64 = 6;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-
-        // An earlier, smaller-id synced present is still parked/unresolved
-        // for this window.
-        state.present_pending_complete.push(PendingPresentComplete {
-            event: CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 1,
-                host_xid: WINDOW_XID,
-                dst_host_xid: WINDOW_XID,
-                options: 0,
-                present_id: PARKED_SMALLER_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: None,
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            },
-            effective_target_msc: 0,
-            mode: x11present::COMPLETE_MODE_COPY,
-            emit_idle: true,
-        });
-
-        // A later async completion for the same window: no gate entry at all.
-        backend
-            .completed_present_events_to_drain
-            .push(CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 2,
-                host_xid: WINDOW_XID,
-                dst_host_xid: WINDOW_XID,
-                options: 0,
-                present_id: ASYNC_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: None,
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            });
-
-        drain_present_completions(&mut state, &mut backend);
-        assert_eq!(
-            backend.signalled_present_wakes,
-            vec![ASYNC_ID],
-            "the async completion fires immediately, bypassing hold-back"
-        );
-        assert_eq!(
-            state.present_pending_complete.len(),
-            1,
-            "the earlier parked synced present is untouched by the async path"
-        );
-    }
-
-    /// Review fix (post-Task-6): the async exemption above covers async
-    /// firing ahead of a still-HELD entry — it must NOT cover an async
-    /// completion overtaking a gated Copy that is already due and simply
-    /// hasn't been swept yet. In one `drain_present_completions` pass,
-    /// `completed = [X(gated, due, id=5), Y(async, id=7)]` for the SAME
-    /// window: X's due-arm pushes into the queue (per Task 6 Step 3), then
-    /// Y's gate-absent arm used to fire straight through, landing before
-    /// X's post-loop sweep — id=7 then id=5, a backward serial that
-    /// didn't exist pre-Task-6 (eager firing kept them in arrival order).
-    /// Fixed by flushing due-and-unblocked entries from the queue before
-    /// the async arm fires inline, so id=5 goes out first.
-    #[test]
-    fn gated_due_copy_delivers_before_same_drain_async_completion() {
-        use crate::{
-            backend::{CompletedPresentEvent, PresentWake, recording::RecordingBackend},
-            server::PresentCompleteGate,
-        };
-        use yserver_protocol::x11::ClientId;
-
-        const WINDOW_XID: u32 = 0x0000_0808;
-        const GATED_ID: u64 = 5;
-        const ASYNC_ID: u64 = 7;
-        const TARGET_MSC: u64 = 300;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        // A real, nonzero completion clock this time (RecordingBackend
-        // defaults to (0,0), which would make fire_due_present_completions
-        // bail before ever reaching the ordering bug this test pins).
-        backend.present_ust_msc = (TARGET_MSC, 0xABCD);
-
-        state.present_complete_gate.insert(
-            GATED_ID,
-            PresentCompleteGate {
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                effective_target_msc: TARGET_MSC,
-                owner: ClientId(1),
-                dst_window_xid: WINDOW_XID,
-            },
-        );
-        // Arrival order within one drain: the gated-due entry first, the
-        // async one second — matching the reviewer's vector.
-        backend
-            .completed_present_events_to_drain
-            .push(CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 1,
-                host_xid: WINDOW_XID,
-                dst_host_xid: WINDOW_XID,
-                options: 0,
-                present_id: GATED_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: Some(crate::backend::PresentClockSample {
-                    msc: TARGET_MSC,
-                    ust: 0xABCD,
-                    source: crate::backend::PresentClockSource::PageFlip,
-                }),
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            });
-        backend
-            .completed_present_events_to_drain
-            .push(CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 2,
-                host_xid: WINDOW_XID,
-                dst_host_xid: WINDOW_XID,
-                options: 0,
-                present_id: ASYNC_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: None,
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            });
-
-        drain_present_completions(&mut state, &mut backend);
-        assert_eq!(
-            backend.signalled_present_wakes,
-            vec![GATED_ID, ASYNC_ID],
-            "Copy(5) must deliver before async(7) in the same drain pass — \
-             pre-fix this reads [7, 5]"
-        );
-    }
-
-    /// Task 4 (spec "Loop-order and clock contract" item 1): the tail's
-    /// drain must run BEFORE `maybe_composite`, so a present executed in
-    /// this iteration's drain is visible to this iteration's compose
-    /// instead of slipping a full period behind unrelated damage. Drives
-    /// both halves of the drain — a source-ready `PresentPixmap` copy
-    /// (whose execution marks dirty, `process_request.rs:8714`) and a
-    /// canned GPU-completion event (`drain_completed_present_events`) —
-    /// and asserts both are recorded before `maybe_composite` in
-    /// `RecordingBackend`'s call log. Fails against the pre-Task-4 order
-    /// (`maybe_composite` before the drain).
-    #[test]
-    fn run_iteration_tail_drains_present_work_before_compositing() {
-        use crate::{
-            backend::{
-                CompletedPresentEvent, PresentWake,
-                recording::{RecordedCall, RecordingBackend},
-            },
-            server::{PendingPresentEntry, PendingPresentPixmap, PendingPresentRequest},
-        };
-        use yserver_protocol::x11::{ClientId, present::PixmapRequest};
-
-        const WAIT_ID: u64 = 7;
-        const DEFERRED_PRESENT_ID: u64 = 0x77;
-        const PRESENT_ID: u64 = 0x99;
-        const WINDOW_XID: u32 = 0x0000_0303;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-
-        // A source-ready PresentPixmap copy: draining it runs
-        // `execute_present_pixmap_copy` then `mark_dirty` — the real
-        // production link between "the drain executed something" and
-        // "compose must see it this iteration".
-        state
-            .present_wait_to_id
-            .insert(WAIT_ID, DEFERRED_PRESENT_ID);
-        state.present_pending_exec.insert(
-            DEFERRED_PRESENT_ID,
-            PendingPresentEntry {
-                pending: PendingPresentPixmap {
-                    origin: None,
-                    client_id: ClientId(1),
-                    request: PendingPresentRequest::Pixmap(PixmapRequest {
-                        window: WINDOW_XID,
-                        pixmap: 0x304,
-                        serial: 9,
-                        valid: 0,
-                        update: 0,
-                        x_off: 0,
-                        y_off: 0,
-                        target_crtc: 0,
-                        wait_fence: 0,
-                        idle_fence: 0,
-                        options: 0,
-                        target_msc: 0,
-                        divisor: 0,
-                        remainder: 0,
-                        notifies: Vec::new(),
-                    }),
-                    wake: crate::backend::PresentWake::Pixmap { idle_fence_xid: 0 },
-                    masked_options: 0,
-                    src_host_xid: 0x0040_0304,
-                    paint_dst_host_xid: 0x0040_0303,
-                    completion_dst_host_xid: 0x0040_0303,
-                    src_width: 10,
-                    src_height: 10,
-                    update_rects: None,
-                    present_id: DEFERRED_PRESENT_ID,
-                    window_generation: 0,
-                    crtc_id: 0,
-                    crtc_epoch: 0,
-                    msc_offset: 0,
-                    effective_target_msc: None,
-                },
-                source_ready: false,
-                wait_id: Some(WAIT_ID),
-                pin: None,
-            },
-        );
-        backend.ready_present_source_waits.push(WAIT_ID);
-
-        // A canned GPU-completion event: exercises the second drain half.
-        backend
-            .completed_present_events_to_drain
-            .push(CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 9,
-                host_xid: WINDOW_XID,
-                dst_host_xid: WINDOW_XID,
-                options: 0,
-                present_id: PRESENT_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: None,
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            });
-
-        run_iteration_tail(&mut state, &mut backend);
-
-        let calls = backend.calls();
-        let mark_dirty_idx = calls
-            .iter()
-            .position(|c| matches!(c, RecordedCall::MarkDirty))
-            .expect("source-ready copy executed and marked dirty");
-        let drain_completed_idx = calls
-            .iter()
-            .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
-            .expect("completed present events drained");
-        let composite_idx = calls
-            .iter()
-            .position(|c| matches!(c, RecordedCall::MaybeComposite))
-            .expect("maybe_composite invoked");
-
-        assert!(
-            mark_dirty_idx < composite_idx,
-            "drain's mark_dirty ({mark_dirty_idx}) must precede maybe_composite ({composite_idx})"
-        );
-        assert!(
-            drain_completed_idx < composite_idx,
-            "drain_completed_present_events ({drain_completed_idx}) must precede maybe_composite ({composite_idx})"
-        );
-    }
-
-    /// Fix-forward: idle-vblank arming for a parked Present completion must
-    /// run AFTER `maybe_composite`, not inside the pre-compose drain.
-    /// `mark_dirty()` alone (no output damage) makes a real KMS compose
-    /// return `Skipped(EmptyDamage)`, which still clears
-    /// `scene_wants_compose()` — so `present_completion_is_idle()` only
-    /// reports idle post-compose. Arming pre-compose would see a dirty
-    /// scene and arm nothing, stranding the parked `CompleteNotify` with no
-    /// fd left to wake `poll`. Fails against the arm folded into
-    /// `drain_present_completions` (landing before `MaybeComposite`).
-    #[test]
-    fn run_iteration_tail_arms_present_completion_idle_vblanks_after_compositing() {
-        use crate::{
-            backend::{
-                CompletedPresentEvent, PresentWake,
-                recording::{RecordedCall, RecordingBackend},
-            },
-            server::PendingPresentComplete,
-        };
-        use yserver_protocol::x11::ClientId;
-
-        const PARKED_PRESENT_ID: u64 = 0x55;
-        const DRAINED_PRESENT_ID: u64 = 0x56;
-        const WINDOW_XID: u32 = 0x0000_0505;
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-
-        // Something for the arm to arm: a completion already parked on a
-        // future target MSC.
-        state.present_pending_complete.push(PendingPresentComplete {
-            event: CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 10,
-                host_xid: WINDOW_XID,
-                dst_host_xid: WINDOW_XID,
-                options: 0,
-                present_id: PARKED_PRESENT_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: None,
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            },
-            effective_target_msc: 500,
-            mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-            emit_idle: true,
-        });
-
-        // A canned GPU-completion event so the drain half also runs.
-        backend
-            .completed_present_events_to_drain
-            .push(CompletedPresentEvent {
-                client_id: ClientId(1),
-                serial: 11,
-                host_xid: WINDOW_XID,
-                dst_host_xid: WINDOW_XID,
-                options: 0,
-                present_id: DRAINED_PRESENT_ID,
-                window_generation: 0,
-                crtc_id: 0,
-                crtc_epoch: 0,
-                msc_offset: 0,
-                completion_clock: None,
-                wake: PresentWake::Pixmap { idle_fence_xid: 0 },
-                completion_mode: yserver_protocol::x11::present::COMPLETE_MODE_COPY,
-                emit_idle: true,
-            });
-
-        run_iteration_tail(&mut state, &mut backend);
-
-        let calls = backend.calls();
-        let drain_completed_idx = calls
-            .iter()
-            .position(|c| matches!(c, RecordedCall::DrainCompletedPresentEvents))
-            .expect("completed present events drained");
-        let composite_idx = calls
-            .iter()
-            .position(|c| matches!(c, RecordedCall::MaybeComposite))
-            .expect("maybe_composite invoked");
-        let arm_idx = calls
-            .iter()
-            .position(|c| matches!(c, RecordedCall::ArmPresentCompletionIdleVblanks))
-            .expect("parked completion armed an idle vblank");
-
-        assert!(
-            drain_completed_idx < composite_idx,
-            "drain ({drain_completed_idx}) must still precede compose ({composite_idx})"
-        );
-        assert!(
-            composite_idx < arm_idx,
-            "arm ({arm_idx}) must run after compose ({composite_idx}), not inside the pre-compose drain"
-        );
-    }
-
-    #[test]
-    fn run_iteration_tail_flushes_damage_before_compositing() {
-        use crate::backend::recording::{RecordedCall, RecordingBackend};
-
-        let mut state = ServerState::new();
-        let mut backend = RecordingBackend::new();
-        state.damage_notify_flush_pending = true;
-
-        run_iteration_tail(&mut state, &mut backend);
-
-        let calls = backend.calls();
-        let flush = calls
-            .iter()
-            .position(|call| matches!(call, RecordedCall::FlushBeforeDamageNotify))
-            .expect("damage boundary flushed");
-        let compose = calls
-            .iter()
-            .position(|call| matches!(call, RecordedCall::MaybeComposite))
-            .expect("compose attempted");
-        assert!(flush < compose);
-        assert!(!state.damage_notify_flush_pending);
-    }
-}
-
-/// The armed reset trigger, driven through a live `run_core` rather than
-/// against `ResetTrigger` directly (that state machine is unit-tested in
-/// `core_loop::reset`). What these pin is the *wiring*: which loop events
-/// arm it, which fire it, and what the boundary does afterwards.
-///
-/// A reset is observed through the generation counter — the boundary
-/// bumps it, and nothing else in the loop does — read from the clone the
-/// test keeps before handing `CoreReceiver` to the loop.
-#[cfg(test)]
-mod server_reset {
-    use std::{
-        io::{Read, Write},
-        os::unix::net::{UnixListener, UnixStream},
-        path::PathBuf,
-        sync::atomic::{AtomicU32, Ordering},
-        thread::JoinHandle,
-        time::{Duration, Instant},
-    };
-
-    use super::{Listener, ResetPolicy, ServerState, run_core};
-    use crate::{
-        backend::recording::RecordingBackend,
-        core_loop::{
-            Generation, GenerationCounter, Message,
-            auth::AuthState,
-            poll_tokens::ClientIdAllocator,
-            sender::{CoreSender, channel},
-        },
-        transport::Transport,
-    };
-    use yserver_protocol::x11::{ClientByteOrder, ClientId, RequestHeader, SequenceNumber};
-
-    /// Generous: these wait on real threads (setup, reader, core) under a
-    /// loaded test binary, and every use is a wait-for-success.
-    const TIMEOUT: Duration = Duration::from_secs(10);
-    /// How long a "must NOT happen" assertion watches for. The positive
-    /// cases below complete in single-digit milliseconds.
-    const QUIET: Duration = Duration::from_millis(400);
-
-    /// The value a `GenerationCounter` holds after `n` resets.
-    fn generation_after(n: u64) -> Generation {
-        let counter = GenerationCounter::new();
-        for _ in 0..n {
-            counter.bump();
-        }
-        counter.current()
-    }
-
-    fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
-        let start = Instant::now();
-        while start.elapsed() < TIMEOUT {
-            if cond() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        panic!("timed out waiting for {what}");
-    }
-
-    /// A `run_core` running on its own thread over a private unix socket.
-    struct Server {
-        path: PathBuf,
-        sender: CoreSender,
-        generations: GenerationCounter,
-        /// The loop's own id allocator, shared so a test can learn the
-        /// `ClientId` the next connection will be given. Monotonic, so a
-        /// peek before `establish()` names that client exactly.
-        client_ids: std::sync::Arc<ClientIdAllocator>,
-        handle: Option<JoinHandle<std::io::Result<()>>>,
-    }
-
-    impl Server {
-        fn start(policy: ResetPolicy, auth: std::sync::Arc<AuthState>) -> Self {
-            static SEQ: AtomicU32 = AtomicU32::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "yserver-reset-{}-{}",
-                std::process::id(),
-                SEQ.fetch_add(1, Ordering::Relaxed)
-            ));
-            let _ = std::fs::remove_file(&path);
-            let listener = UnixListener::bind(&path).expect("bind");
-            let (poll, sender, rx) = channel().expect("channel");
-            let generations = rx.generation_counter();
-            let sender_for_core = sender.clone_handle();
-            let client_ids = std::sync::Arc::new(ClientIdAllocator::new());
-            let client_ids_for_core = client_ids.clone();
-            let handle = std::thread::spawn(move || {
-                let mut state = ServerState::new();
-                let mut backend = RecordingBackend::new();
-                run_core(
-                    poll,
-                    rx,
-                    sender_for_core,
-                    &mut state,
-                    &mut backend,
-                    [Listener::Unix(listener)],
-                    &client_ids_for_core,
-                    auth,
-                    policy,
-                    None,
-                )
-            });
-            Self {
-                path,
-                sender,
-                generations,
-                client_ids,
-                handle: Some(handle),
-            }
-        }
-
-        /// The id the next accepted connection will get.
-        fn next_client_id(&self) -> ClientId {
-            self.client_ids.peek()
-        }
-
-        fn with_policy(policy: ResetPolicy) -> Self {
-            Self::start(policy, AuthState::new(None))
-        }
-
-        fn generation(&self) -> Generation {
-            self.generations.current()
-        }
-
-        fn connect(&self) -> UnixStream {
-            let peer = UnixStream::connect(&self.path).expect("connect");
-            peer.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
-            peer
-        }
-
-        /// Connect and take the connection all the way to *established*:
-        /// setup handshake, then a `GetInputFocus` round-trip. The reply
-        /// is what proves the core reached `handle_client_setup_complete`
-        /// — the setup reply alone is written by the setup thread and
-        /// says nothing about `state.clients`.
-        fn establish(&self) -> UnixStream {
-            let mut peer = self.connect();
-            peer.write_all(&[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0])
-                .expect("setup request");
-            let mut header = [0_u8; 8];
-            peer.read_exact(&mut header).expect("setup reply header");
-            assert_eq!(header[0], 1, "setup must succeed");
-            let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
-            peer.read_exact(&mut vec![0; len])
-                .expect("setup reply body");
-            round_trip(&mut peer);
-            peer
-        }
-
-        fn shutdown(mut self) -> std::io::Result<()> {
-            let _ = self.sender.send(Message::Shutdown);
-            let result = self.handle.take().expect("handle").join().expect("join");
-            let _ = std::fs::remove_file(&self.path);
-            result
-        }
-    }
-
-    impl Drop for Server {
-        fn drop(&mut self) {
-            if let Some(handle) = self.handle.take() {
-                let _ = self.sender.send(Message::Shutdown);
-                let _ = handle.join();
-            }
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-
-    /// `GetInputFocus` — the classic X11 round-trip probe. Always replies,
-    /// changes nothing.
-    fn round_trip(peer: &mut UnixStream) {
-        peer.write_all(&[43, 0, 1, 0]).expect("GetInputFocus");
-        let mut reply = [0_u8; 32];
-        peer.read_exact(&mut reply).expect("GetInputFocus reply");
-        assert_eq!(reply[0], 1, "reply, not an error");
-    }
-
-    /// `SetCloseDownMode(RetainPermanent)` — opcode 112, mode in the data
-    /// byte. Followed by a round-trip so the request is known to have been
-    /// processed before the caller drops the socket.
-    fn set_retain_permanent(peer: &mut UnixStream) {
-        peer.write_all(&[112, 1, 1, 0]).expect("SetCloseDownMode");
-        round_trip(peer);
-    }
-
-    // -- the trigger table: last client leaves x each policy ----------
-
-    #[test]
-    fn the_last_client_leaving_resets_under_reset() {
-        let server = Server::with_policy(ResetPolicy::Reset);
-        let peer = server.establish();
-        assert_eq!(server.generation(), generation_after(0));
-        drop(peer);
-        wait_until("the drained session to reset", || {
-            server.generation() == generation_after(1)
-        });
-        server.shutdown().expect("clean shutdown");
-    }
-
-    #[test]
-    fn the_last_client_leaving_does_nothing_under_noreset() {
-        let server = Server::with_policy(ResetPolicy::NoReset);
-        let peer = server.establish();
-        drop(peer);
-        std::thread::sleep(QUIET);
-        // Non-vacuous: the server is still serving, so the loop did run
-        // through the disconnect — it simply did not reset.
-        let survivor = server.establish();
-        assert_eq!(
-            server.generation(),
-            generation_after(0),
-            "-noreset must never cross the boundary"
-        );
-        drop(survivor);
-        server.shutdown().expect("clean shutdown");
-    }
-
-    #[test]
-    fn the_last_client_leaving_terminates_under_terminate() {
-        let mut server = Server::with_policy(ResetPolicy::Terminate);
-        let peer = server.establish();
-        drop(peer);
-        let handle = server.handle.take().expect("handle");
-        wait_until("run_core to return", || handle.is_finished());
-        handle
-            .join()
-            .expect("join")
-            .expect("-terminate must shut down cleanly, not error");
-        assert_eq!(
-            server.generation(),
-            generation_after(0),
-            "-terminate exits instead of resetting"
-        );
-    }
-
-    #[test]
-    fn a_retain_permanent_client_does_not_inhibit_the_reset() {
-        // `process_disconnect` keeps a retained client's resources as a
-        // zombie but removes it from `state.clients` regardless, so the
-        // session still counts as drained. Xorg's `really_close_down`
-        // gate does the opposite; the forced teardown at the boundary is
-        // what makes ours safe.
-        let server = Server::with_policy(ResetPolicy::Reset);
-        let mut peer = server.establish();
-        set_retain_permanent(&mut peer);
-        drop(peer);
-        wait_until("a retained client's departure to reset", || {
-            server.generation() == generation_after(1)
-        });
-        server.shutdown().expect("clean shutdown");
-    }
-
-    #[test]
-    fn a_client_that_leaves_while_another_stays_does_not_reset() {
-        let server = Server::with_policy(ResetPolicy::Reset);
-        let first = server.establish();
-        let mut second = server.establish();
-        drop(first);
-        std::thread::sleep(QUIET);
-        round_trip(&mut second);
-        assert_eq!(
-            server.generation(),
-            generation_after(0),
-            "the session is not drained while a client remains"
-        );
-        drop(second);
-        wait_until("the second departure to reset", || {
-            server.generation() == generation_after(1)
-        });
-        server.shutdown().expect("clean shutdown");
-    }
-
-    // -- SIGHUP, per policy -------------------------------------------
-
-    #[test]
-    fn sighup_resets_a_running_session_under_reset() {
-        let server = Server::with_policy(ResetPolicy::Reset);
-        let _peer = server.establish();
-        server
-            .sender
-            .send(Message::ResetRequested)
-            .expect("send SIGHUP request");
-        wait_until("SIGHUP to reset", || {
-            server.generation() == generation_after(1)
-        });
-        server.shutdown().expect("clean shutdown");
-    }
-
-    #[test]
-    fn sighup_resets_rather_than_terminating_under_terminate() {
-        let server = Server::with_policy(ResetPolicy::Terminate);
-        let _peer = server.establish();
-        server
-            .sender
-            .send(Message::ResetRequested)
-            .expect("send SIGHUP request");
-        wait_until("SIGHUP to reset", || {
-            server.generation() == generation_after(1)
-        });
-        assert!(
-            !server.handle.as_ref().expect("handle").is_finished(),
-            "SIGHUP raises DE_RESET, not DE_TERMINATE"
-        );
-        server.shutdown().expect("clean shutdown");
-    }
-
-    #[test]
-    fn sighup_does_not_reset_under_noreset() {
-        // Under the default policy the signal thread never produces this
-        // message (it keeps sending `Shutdown`); the loop refuses it
-        // anyway, so `-noreset` behaviour cannot drift.
-        let server = Server::with_policy(ResetPolicy::NoReset);
-        let mut peer = server.establish();
-        server
-            .sender
-            .send(Message::ResetRequested)
-            .expect("send SIGHUP request");
-        std::thread::sleep(QUIET);
-        round_trip(&mut peer);
-        assert_eq!(server.generation(), generation_after(0));
-        drop(peer);
-        server.shutdown().expect("clean shutdown");
-    }
-
-    // -- the arming cases a happy-path suite misses --------------------
-
-    #[test]
-    fn an_idle_reset_server_never_resets() {
-        // No client has ever connected, so the client set is empty from
-        // the first iteration. A state check would reset here, over and
-        // over.
-        let server = Server::with_policy(ResetPolicy::Reset);
-        std::thread::sleep(QUIET);
-        assert_eq!(server.generation(), generation_after(0));
-        // Still serving: the idle loop was running, not wedged.
-        let peer = server.establish();
-        assert_eq!(server.generation(), generation_after(0));
-        drop(peer);
-        server.shutdown().expect("clean shutdown");
-    }
-
-    #[test]
-    fn a_connection_dropped_before_setup_completes_arms_nothing() {
-        // Accepted, a setup thread spawned, then gone before any
-        // `ClientSetupComplete`. Nothing was ever established, so
-        // nothing may fire.
-        let server = Server::with_policy(ResetPolicy::Reset);
-        for _ in 0..5 {
-            let peer = server.connect();
-            drop(peer);
-        }
-        std::thread::sleep(QUIET);
-        assert_eq!(
-            server.generation(),
-            generation_after(0),
-            "accept is not arming"
-        );
-        let peer = server.establish();
-        assert_eq!(server.generation(), generation_after(0));
-        drop(peer);
-        server.shutdown().expect("clean shutdown");
-    }
-
-    #[test]
-    fn a_client_refused_for_a_bad_cookie_arms_nothing() {
-        // The case a stranger can reach: stage 1's TCP listener binds
-        // 0.0.0.0, so a wrong cookie must not be able to erase a
-        // session. Refused inside the setup thread — the core never
-        // hears about it.
-        let cookie = [0x5A_u8; 16];
-        let auth_path = write_xauth(&cookie);
-        let server = Server::start(ResetPolicy::Reset, AuthState::new(Some(auth_path.clone())));
-
-        let mut peer = server.connect();
-        write_setup_with_cookie(&mut peer, &[0x22_u8; 16]);
-        let mut header = [0_u8; 8];
-        peer.read_exact(&mut header).expect("setup reply header");
-        assert_eq!(header[0], 0, "a bad cookie must be refused");
-        drop(peer);
-
-        std::thread::sleep(QUIET);
-        assert_eq!(
-            server.generation(),
-            generation_after(0),
-            "a refused connection is not arming"
-        );
-
-        // And the good cookie still works, so the refusal was the
-        // server's decision, not a broken fixture.
-        let mut good = server.connect();
-        write_setup_with_cookie(&mut good, &cookie);
-        good.read_exact(&mut header).expect("setup reply header");
-        assert_eq!(header[0], 1, "the matching cookie must be accepted");
-        let len = usize::from(u16::from_le_bytes([header[6], header[7]])) * 4;
-        good.read_exact(&mut vec![0; len])
-            .expect("setup reply body");
-        round_trip(&mut good);
-        assert_eq!(server.generation(), generation_after(0));
-
-        drop(good);
-        wait_until("the authorized client's departure to reset", || {
-            server.generation() == generation_after(1)
-        });
-        server.shutdown().expect("clean shutdown");
-        let _ = std::fs::remove_file(&auth_path);
-    }
-
-    #[test]
-    fn a_reset_disarms_the_new_generation() {
-        // The boundary leaves an empty client set behind, and the dead
-        // generation's reader thread posts its `ClientDisconnected`
-        // afterwards. Neither may produce a second reset.
-        let server = Server::with_policy(ResetPolicy::Reset);
-        let peer = server.establish();
-        drop(peer);
-        wait_until("the first reset", || {
-            server.generation() == generation_after(1)
-        });
-        std::thread::sleep(QUIET);
-        assert_eq!(
-            server.generation(),
-            generation_after(1),
-            "exactly one reset; the fresh generation starts disarmed"
-        );
-        // The new generation serves, and arms again on its own client.
-        let peer = server.establish();
-        drop(peer);
-        wait_until("the second generation to reset in turn", || {
-            server.generation() == generation_after(2)
-        });
-        server.shutdown().expect("clean shutdown");
-    }
-
-    // -- the generation quarantine: producers bound at creation time ---
-
-    /// Watch a socket for `QUIET` and report whether the server wrote
-    /// **no bytes** to it. Restores the long timeout, so the caller can
-    /// keep using the socket afterwards.
-    ///
-    /// "The far end went away without writing" counts as quiet, and has
-    /// three shapes here: a timeout (nobody holds the other half open),
-    /// `Ok(0)`, and — when the other half is dropped while bytes we sent
-    /// are still unread in its queue, which is exactly what discarding a
-    /// message carrying a `Transport` does — `ECONNRESET`. What must not
-    /// happen is bytes arriving; a caller that also cares whether the
-    /// peer is still *alive* follows this with a `round_trip`.
-    fn stays_quiet(peer: &mut UnixStream) -> bool {
-        peer.set_read_timeout(Some(QUIET)).expect("read timeout");
-        let mut byte = [0_u8; 1];
-        let quiet = match peer.read(&mut byte) {
-            Ok(0) => true,
-            Ok(_) => false,
-            Err(err) => matches!(
-                err.kind(),
-                std::io::ErrorKind::WouldBlock
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::UnexpectedEof
-            ),
-        };
-        peer.set_read_timeout(Some(TIMEOUT)).expect("read timeout");
-        quiet
-    }
-
-    /// The hole the quarantine exists to close: a producer belonging to
-    /// the destroyed session must not be able to hand the new one a
-    /// client.
-    ///
-    /// `reset_generation` shuts the setup sockets down, which narrows the
-    /// window but does not close it — a setup thread can already hold a
-    /// fully decoded `ClientSetupComplete` and be one instruction away
-    /// from sending it. The producer here stands in for that thread: it
-    /// takes its handle while generation 0 runs, exactly where
-    /// `accept_pending` hands one to `setup_thread::spawn`, and sends
-    /// after the boundary. Tagging at *send* time would stamp it with the
-    /// new generation and let it through.
-    #[test]
-    fn an_old_setup_completion_cannot_create_a_client_in_the_new_generation() {
-        let server = Server::with_policy(ResetPolicy::Reset);
-        // The id the pre-reset client holds — what a real old setup
-        // thread's completion would carry.
-        let doomed = server.next_client_id();
-        let stale = server.sender.bind();
-        let peer = server.establish();
-        assert_eq!(server.generation(), generation_after(0));
-        drop(peer);
-        wait_until("the drained session to reset", || {
-            server.generation() == generation_after(1)
-        });
-
-        let (core_side, mut phantom) = UnixStream::pair().expect("socketpair");
-        stale
-            .send(Message::ClientSetupComplete {
-                id: doomed,
-                generation: stale.generation(),
-                stream: Transport::Unix(core_side),
-                resource_id_base: 0x0020_0000,
-                resource_id_mask: 0x000F_FFFF,
-                byte_order: ClientByteOrder::LittleEndian,
-                is_local: true,
-                fd_passing: true,
-            })
-            .expect("send the stale completion");
-
-        // Accepted, this would insert a `ClientState` and spawn a reader,
-        // and the request below would come back answered.
-        phantom.write_all(&[43, 0, 1, 0]).expect("GetInputFocus");
-        assert!(
-            stays_quiet(&mut phantom),
-            "a client authorized in the destroyed session must not be served by the new one"
-        );
-        // Nor may it arm the fresh generation: an accepted completion
-        // calls `note_client_established`, and the phantom's own
-        // departure would then reset a session it was never part of.
-        drop(phantom);
-        std::thread::sleep(QUIET);
-        assert_eq!(
-            server.generation(),
-            generation_after(1),
-            "the phantom must not arm — and then drain — the new generation"
-        );
-        server.shutdown().expect("clean shutdown");
-    }
-
-    /// The reader-thread half: a `Request` produced by a retired reader
-    /// must not execute against the new session.
-    ///
-    /// It names a client of the *new* session deliberately. The loop
-    /// already drops a request whose client is unknown
-    /// (`process_request_inline`'s post-disconnect guard), so an old id
-    /// would pass whether or not the generation filter works, and the
-    /// test would prove nothing. The reply landing on a live client's
-    /// socket is the sharpest observable there is.
-    #[test]
-    fn an_old_generation_request_is_not_executed_in_the_new_session() {
-        let server = Server::with_policy(ResetPolicy::Reset);
-        let stale = server.sender.bind();
-        let peer = server.establish();
-        drop(peer);
-        wait_until("the drained session to reset", || {
-            server.generation() == generation_after(1)
-        });
-
-        let live_id = server.next_client_id();
-        let mut live = server.establish();
-
-        stale
-            .send(Message::Request {
-                id: live_id,
-                sequence: SequenceNumber(0x4242),
-                accepted_at: None,
-                header: RequestHeader {
-                    opcode: 43, // GetInputFocus — always replies
-                    data: 0,
-                    length_units: 1,
-                },
-                body: Vec::new(),
-                attached_fd: None,
-            })
-            .expect("send the stale request");
-
-        assert!(
-            stays_quiet(&mut live),
-            "a request tagged by a retired producer must not be executed"
-        );
-        // Quiet because the request was discarded, not because the
-        // client is broken.
-        round_trip(&mut live);
-        assert_eq!(server.generation(), generation_after(1));
-        drop(live);
-        server.shutdown().expect("clean shutdown");
-    }
-
-    /// The other message a retired reader can still emit. Accepted, it
-    /// runs `disconnect_with_pending_cleanup` against the new session —
-    /// which under `-reset` drains it and resets a generation that was
-    /// serving a live client.
-    #[test]
-    fn an_old_generation_disconnect_cannot_tear_down_a_new_session_client() {
-        let server = Server::with_policy(ResetPolicy::Reset);
-        let stale = server.sender.bind();
-        let peer = server.establish();
-        drop(peer);
-        wait_until("the drained session to reset", || {
-            server.generation() == generation_after(1)
-        });
-
-        let live_id = server.next_client_id();
-        let mut live = server.establish();
-
-        stale
-            .send(Message::ClientDisconnected {
-                id: live_id,
-                reason: std::io::Error::other("retired reader"),
-            })
-            .expect("send the stale disconnect");
-
-        std::thread::sleep(QUIET);
-        assert_eq!(
-            server.generation(),
-            generation_after(1),
-            "a retired producer must not be able to drain the new session"
-        );
-        round_trip(&mut live);
-
-        // The real departure still works, so the filter did not wedge
-        // the trigger.
-        drop(live);
-        wait_until("the live client's own departure to reset", || {
-            server.generation() == generation_after(2)
-        });
-        server.shutdown().expect("clean shutdown");
-    }
-
-    /// The other half of binding at accept: a connection accepted *after*
-    /// the boundary gets a producer bound to the new generation, so
-    /// nothing it sends is stale. Both its setup thread and its reader
-    /// thread have to pass the filter for `establish` (which ends in a
-    /// `GetInputFocus` round-trip) to return at all.
-    #[test]
-    fn a_connection_accepted_after_a_reset_is_served_normally() {
-        let server = Server::with_policy(ResetPolicy::Reset);
-        let peer = server.establish();
-        drop(peer);
-        wait_until("the drained session to reset", || {
-            server.generation() == generation_after(1)
-        });
-
-        let mut fresh = server.establish();
-        for _ in 0..3 {
-            round_trip(&mut fresh);
-        }
-        assert_eq!(server.generation(), generation_after(1));
-        drop(fresh);
-        wait_until("the second generation to reset in turn", || {
-            server.generation() == generation_after(2)
-        });
-        server.shutdown().expect("clean shutdown");
-    }
-
-    // -- fixtures for the auth case ------------------------------------
-
-    const MIT_MAGIC_COOKIE: &str = "MIT-MAGIC-COOKIE-1";
-
-    fn write_xauth(cookie: &[u8]) -> PathBuf {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&256_u16.to_be_bytes()); // FamilyLocal
-        for field in [
-            b"host".as_slice(),
-            b"0",
-            MIT_MAGIC_COOKIE.as_bytes(),
-            cookie,
-        ] {
-            bytes.extend_from_slice(
-                &u16::try_from(field.len())
-                    .expect("field fits")
-                    .to_be_bytes(),
-            );
-            bytes.extend_from_slice(field);
-        }
-        let path = std::env::temp_dir().join(format!("yserver-reset-auth-{}", std::process::id()));
-        std::fs::write(&path, bytes).expect("write xauthority");
-        path
-    }
-
-    fn write_setup_with_cookie(peer: &mut UnixStream, cookie: &[u8]) {
-        let name = MIT_MAGIC_COOKIE.as_bytes();
-        let mut buf = Vec::new();
-        buf.push(b'l');
-        buf.push(0);
-        buf.extend_from_slice(&11_u16.to_le_bytes());
-        buf.extend_from_slice(&0_u16.to_le_bytes());
-        buf.extend_from_slice(&u16::try_from(name.len()).expect("name fits").to_le_bytes());
-        buf.extend_from_slice(
-            &u16::try_from(cookie.len())
-                .expect("cookie fits")
-                .to_le_bytes(),
-        );
-        buf.extend_from_slice(&[0, 0]);
-        buf.extend_from_slice(name);
-        while buf.len() % 4 != 0 {
-            buf.push(0);
-        }
-        buf.extend_from_slice(cookie);
-        while buf.len() % 4 != 0 {
-            buf.push(0);
-        }
-        peer.write_all(&buf).expect("setup request with cookie");
-    }
-}

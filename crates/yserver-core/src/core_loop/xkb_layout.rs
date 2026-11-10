@@ -116,6 +116,7 @@ pub fn apply_rules_names_change(state: &mut ServerState, backend: &mut dyn Backe
     ) else {
         return; // unchanged or failed to compile
     };
+    resync_xkb_announced(state, backend);
     let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
     let count = max_kc.saturating_sub(min_kc).saturating_add(1);
 
@@ -188,7 +189,7 @@ pub(crate) fn send_xkb_map_notify(
 }
 
 /// yserver's one XKB keyboard, as every XKB reply and event names it.
-const XKB_DEVICE_ID: u8 = 1;
+pub(crate) const XKB_DEVICE_ID: u8 = 1;
 /// `XkbPerKeyRepeatMask` in `XkbControlsNotify.changedControls`.
 const XKB_PER_KEY_REPEAT_MASK: u32 = 1 << 30;
 /// Core `X_ChangeKeyboardMapping`: the cause Xorg's `XkbApplyMappingChange`
@@ -339,13 +340,32 @@ pub(crate) fn send_indicator_maps_change(
         );
         reason |= XI_INDICATOR_STATE_MASK;
     }
+    send_led_extension_device_notify(
+        state,
+        xkb_event_base,
+        reason,
+        change.leds_defined,
+        change.state,
+    );
+}
+
+/// `XkbSendExtensionDeviceNotify` for the core keyboard's default LED
+/// feedback (class KbdFeedbackClass, id 0), to clients whose
+/// ExtensionDeviceNotify details include `reason`.
+fn send_led_extension_device_notify(
+    state: &mut ServerState,
+    xkb_event_base: u8,
+    reason: u16,
+    leds_defined: u32,
+    led_state: u32,
+) {
     let notify = x11::XkbExtensionDeviceNotify {
         device_id: XKB_DEVICE_ID,
         reason,
         led_class: 0,
         led_id: 0,
-        leds_defined: change.leds_defined,
-        led_state: change.state,
+        leds_defined,
+        led_state,
         first_btn: 0,
         n_btns: 0,
         supported: XI_ALL_FEATURES_MASK,
@@ -377,7 +397,10 @@ pub(crate) fn apply_keyboard_mapping_repeats(
         device_id: XKB_DEVICE_ID,
         num_groups: change.num_groups,
         changed_controls: XKB_PER_KEY_REPEAT_MASK,
-        enabled_controls: change.enabled_controls,
+        enabled_controls: crate::core_loop::xkb_controls::enabled_controls(
+            state,
+            change.enabled_controls,
+        ),
         enabled_control_changes: 0,
         keycode: 0,
         event_type: 0,
@@ -454,6 +477,162 @@ pub fn parse_latch_lock_group(body: &[u8]) -> Option<u8> {
         return None;
     }
     if body[4] != 0 { Some(body[5]) } else { None }
+}
+
+/// Decode the modifier-lock target from an `xkbLatchLockStateReq` body (the
+/// bytes after the 4-byte request header). Returns `Some((affect, values))`
+/// iff `affectModLocks` names at least one modifier, else `None`.
+///
+/// Sibling of [`parse_latch_lock_group`]: one LatchLockState may carry a
+/// group lock, a modifier lock, both or neither, so callers ask both
+/// decoders independently and apply whatever came back.
+///
+/// This is the path `numlockx` uses: `XkbLockModifiers` sends
+/// `lockGroup` clear and only `affectModLocks`/`modLocks` filled in.
+///
+/// Run [`check_latch_lock_state`] first: it rejects `values` bits outside
+/// `affect`, so callers can merge with a plain `(old & !affect) | values`.
+#[must_use]
+pub fn parse_latch_lock_mods(body: &[u8]) -> Option<(u8, u8)> {
+    if body.len() < 4 {
+        return None;
+    }
+    let affect = body[2];
+    if affect == 0 {
+        return None;
+    }
+    Some((affect, body[3]))
+}
+
+/// `xkbLatchLockStateReq` body length (16-byte request minus the header).
+const LATCH_LOCK_STATE_BODY_LEN: usize = 12;
+
+/// Xorg `ProcXkbLatchLockState`'s checks before anything is applied:
+/// `REQUEST_SIZE_MATCH`, then `CHK_MASK_MATCH(0x01, …)` for the modifier
+/// lock pair and the modifier latch pair. `Err` is `(error code, value)`.
+pub fn check_latch_lock_state(body: &[u8]) -> Result<(), (u8, u32)> {
+    if body.len() != LATCH_LOCK_STATE_BODY_LEN {
+        return Err((x11::error::BAD_LENGTH, 0));
+    }
+    for (affect, values) in [(body[2], body[3]), (body[6], body[7])] {
+        if values & !affect != 0 {
+            return Err((
+                x11::error::BAD_MATCH,
+                crate::core_loop::xkb_select::err_code2(0x01, u32::from(values & !affect)),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Xorg `XkbStateChangedFlags` between two keyboard states, each
+/// `(group, (effective, base, latched, locked))`; the group is the locked
+/// group, which is also the effective one.
+///
+/// The serializer fills compat state, grab, compat grab, lookup and
+/// compat lookup mods from the effective mods, so those five bits move
+/// with them.
+#[must_use]
+pub fn state_changed_flags(old: (u8, (u8, u8, u8, u8)), new: (u8, (u8, u8, u8, u8))) -> u16 {
+    let (old_group, (old_eff, old_base, old_latched, old_locked)) = old;
+    let (group, (eff, base, latched, locked)) = new;
+    let mut changed: u16 = 0;
+    if group != old_group {
+        changed |= 0x0090; // XkbGroupStateMask | XkbGroupLockMask
+    }
+    if eff != old_eff {
+        changed |= 0x0001 | 0x1F00; // XkbModifierStateMask + derived fields
+    }
+    if base != old_base {
+        changed |= 0x0002; // XkbModifierBaseMask
+    }
+    if latched != old_latched {
+        changed |= 0x0004; // XkbModifierLatchMask
+    }
+    if locked != old_locked {
+        changed |= 0x0008; // XkbModifierLockMask
+    }
+    changed
+}
+
+/// What caused a keyboard state change: `XkbStateNotify`'s keycode,
+/// eventType and request opcodes.
+#[derive(Debug, Clone, Copy)]
+pub struct XkbStateCause {
+    pub keycode: u8,
+    pub event_type: u8,
+    pub request: (u8, u8),
+}
+
+fn xkb_state_now(backend: &dyn Backend) -> (u8, (u8, u8, u8, u8)) {
+    (backend.current_group(), backend.current_xkb_mods())
+}
+
+/// Xorg `XkbSendStateNotify` for what changed since the last announcement
+/// (`XkbStateChangedFlags`): only to clients whose StateNotify details
+/// include a changed component, nothing when nothing changed. Then
+/// `XkbUpdateIndicators`: IndicatorStateNotify and ExtensionDeviceNotify
+/// (IndicatorState) when the lit indicators changed.
+pub fn announce_xkb_state(
+    state: &mut ServerState,
+    backend: &mut dyn Backend,
+    cause: XkbStateCause,
+) {
+    let now = xkb_state_now(backend);
+    let changed = state_changed_flags(state.xkb_announced, now);
+    state.xkb_announced = now;
+    if changed == 0 {
+        return;
+    }
+    let xkb_event_base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
+    let (group, (mods, base_mods, latched_mods, locked_mods)) = now;
+    let notify = x11::XkbStateNotify {
+        device_id: XKB_DEVICE_ID,
+        mods,
+        base_mods,
+        latched_mods,
+        locked_mods,
+        group,
+        locked_group: group,
+        changed,
+        keycode: cause.keycode,
+        event_type: cause.event_type,
+        request_major: cause.request.0,
+        request_minor: cause.request.1,
+    };
+    let recipients =
+        crate::core_loop::xkb_select::interest_recipients(state, |i| i.state & changed != 0);
+    let _dropped = fanout_event_to_clients(state, &recipients, |buf, seq, order| {
+        let _ = x11::write_xkb_state_notify(buf, order, seq, xkb_event_base, notify);
+    });
+
+    let (lit, defined) = backend.xkb_indicators();
+    let lit_changed = lit ^ state.xkb_announced_indicators;
+    state.xkb_announced_indicators = lit;
+    if lit_changed != 0 {
+        send_indicator_notify(
+            state,
+            xkb_event_base,
+            x11::XkbIndicatorNotifyKind::State,
+            lit,
+            lit_changed,
+        );
+        send_led_extension_device_notify(
+            state,
+            xkb_event_base,
+            XI_INDICATOR_STATE_MASK,
+            defined,
+            lit,
+        );
+    }
+}
+
+/// Take the backend's keyboard state and indicators as announced,
+/// silently: for changes Xorg sends no StateNotify for (keymap loads and
+/// edits), so the next one doesn't report them.
+pub fn resync_xkb_announced(state: &mut ServerState, backend: &mut dyn Backend) {
+    state.xkb_announced = xkb_state_now(backend);
+    state.xkb_announced_indicators = backend.xkb_indicators().0;
 }
 
 pub(crate) use crate::core_loop::xkb_select::subscribers;
@@ -579,6 +758,7 @@ mod tests {
         state.clients.insert(
             id,
             crate::server::ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(server_side))),
                 byte_order: x11::ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -591,11 +771,16 @@ mod tests {
                 xi1_event_classes: HashSet::new(),
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
+                outbound_fds: Default::default(),
                 watching_writable: false,
+                write_failed: false,
+                gone: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
                 fd_passing: true,
+                internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         peer
@@ -755,5 +940,119 @@ mod tests {
             0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         assert_eq!(parse_latch_lock_group(&body2), None);
+    }
+
+    /// `numlockx on` shape: affectModLocks=Mod2 (numlock), modLocks=Mod2,
+    /// lockGroup clear. The group decoder must stay quiet and the mod
+    /// decoder must report the lock.
+    #[test]
+    fn parse_latch_lock_mods_decodes_numlockx_on() {
+        let body = [
+            0x00, 0x01, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(parse_latch_lock_mods(&body), Some((0x10, 0x10)));
+        assert_eq!(
+            parse_latch_lock_group(&body),
+            None,
+            "a mod-only LatchLockState must not read as a group lock"
+        );
+    }
+
+    /// `numlockx off`: the modifier is named in affectModLocks but its
+    /// value bit is clear, so this is an unlock — distinct from "not
+    /// mentioned at all", which must decode as None.
+    #[test]
+    fn parse_latch_lock_mods_distinguishes_unlock_from_absent() {
+        let unlock = [
+            0x00, 0x01, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(parse_latch_lock_mods(&unlock), Some((0x10, 0x00)));
+        let absent = [
+            0x00, 0x01, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            parse_latch_lock_mods(&absent),
+            None,
+            "affectModLocks=0 means don't touch locks, whatever modLocks says"
+        );
+    }
+
+    /// Short bodies must not panic — the wire is client-controlled.
+    #[test]
+    fn parse_latch_lock_mods_rejects_short_body() {
+        assert_eq!(parse_latch_lock_mods(&[]), None);
+        assert_eq!(parse_latch_lock_mods(&[0x00, 0x01, 0x10]), None);
+    }
+
+    #[test]
+    fn check_latch_lock_state_accepts_numlockx_on() {
+        let body = [
+            0x00, 0x01, 0x10, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(check_latch_lock_state(&body), Ok(()));
+    }
+
+    /// Xorg `REQUEST_SIZE_MATCH`: the body is exactly 12 bytes; a short one
+    /// must not lock anything, although the parsers only need 4/6 bytes.
+    #[test]
+    fn check_latch_lock_state_rejects_wrong_length() {
+        for len in [0, 4, 8, 16] {
+            let body = vec![0u8; len];
+            assert_eq!(
+                check_latch_lock_state(&body),
+                Err((x11::error::BAD_LENGTH, 0)),
+                "len {len}"
+            );
+        }
+    }
+
+    /// Xorg `CHK_MASK_MATCH(0x01, …)`: value bits outside the affect mask
+    /// are BadMatch, for the lock pair and the latch pair alike — not
+    /// silently masked off.
+    #[test]
+    fn check_latch_lock_state_rejects_values_outside_affect() {
+        let locks = [
+            0x00, 0x01, 0x10, 0x11, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            check_latch_lock_state(&locks),
+            Err((x11::error::BAD_MATCH, 0x0100_0001))
+        );
+        let latches = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x05, 0x00, 0x00, 0x00, 0x00,
+        ];
+        assert_eq!(
+            check_latch_lock_state(&latches),
+            Err((x11::error::BAD_MATCH, 0x0100_0004))
+        );
+    }
+
+    /// Locking a held Shift changes only the lock component: effective
+    /// mods stay 0x01, so neither ModifierState nor the mirrors are flagged.
+    #[test]
+    fn state_changed_flags_only_what_moved() {
+        assert_eq!(
+            state_changed_flags((0, (1, 1, 0, 0)), (0, (1, 1, 0, 1))),
+            0x0008
+        );
+    }
+
+    /// NumLock on from idle: lock + effective, and the five fields the
+    /// StateNotify serializer derives from effective mods.
+    #[test]
+    fn state_changed_flags_effective_mirrors() {
+        assert_eq!(
+            state_changed_flags((0, (0, 0, 0, 0)), (0, (0x10, 0, 0, 0x10))),
+            0x1F09
+        );
+    }
+
+    #[test]
+    fn state_changed_flags_group_lock() {
+        assert_eq!(
+            state_changed_flags((0, (0, 0, 0, 0)), (1, (0, 0, 0, 0))),
+            0x0090
+        );
+        assert_eq!(state_changed_flags((1, (0, 0, 0, 0)), (1, (0, 0, 0, 0))), 0);
     }
 }

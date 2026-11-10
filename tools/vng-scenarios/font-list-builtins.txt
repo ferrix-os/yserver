@@ -1,0 +1,7 @@
+# max<TAB>pattern, for font-list-probe.c with the path set to built-ins alone.
+# ListFonts only for the bare names: yserver's ListFontsWithInfo reports
+# them by a charset-bearing XLFD, which XCreateFontSet needs (#107). No
+# exact XLFD: Xorg's bitmap scaler lists it twice (font-list-patterns.txt).
+10	fixed	lf
+10	cursor	lf
+10	6x13	lf

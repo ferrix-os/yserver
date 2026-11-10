@@ -5,6 +5,7 @@ on:
   pull_request:
     branches: [master]
   workflow_call:
+  workflow_dispatch:
 env:
   CARGO_TERM_COLOR: always
 jobs:
@@ -30,9 +31,18 @@ jobs:
           # what proves tcp-transport does not drag xdmcp back in.
           - name: xdmcp
             flags: "--features xdmcp"
+          # A fourth, for the rootless Wayland host: no other leg builds
+          # `src/wayland/` or the `cfg(wayland_host)` half of the rootless code.
+          - name: wayland
+            flags: "--features wayland"
     steps:
       - uses: actions/checkout@v7
+      - name: Configure apt (mirror, retries)
+        run: |
+          printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' | sudo tee /etc/apt/apt-mirrors.txt
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\n' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
       - name: Install packages needed for build
+        timeout-minutes: 5
         run: sudo apt-get update && sudo apt-get install -y build-essential just gcc libxshmfence-dev libxkbcommon-dev libinput-dev glslc libudev-dev libgbm-dev libfontconfig-dev xfonts-base xfonts-100dpi xfonts-75dpi mesa-vulkan-drivers vulkan-tools scdoc man-db shellcheck dash
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
@@ -66,12 +76,17 @@ jobs:
         # tcp_tests module, cfg'd on `feature = "tcp-transport"`); without it
         # this leg would build the gated code but never execute it.
         run: cargo test --all-targets ${{ matrix.flags }} --locked
+      - name: Check the source layout rules
+        # File-size ceilings, the backend/portable seam and yserver-render's
+        # dependencies (tools/check-layout.sh). Feature-independent; run once.
+        if: matrix.name == 'unix-only'
+        run: sh tools/check-layout.sh
       - name: Lint the shell scripts
         # starty is installed on every supported platform, so it must work
         # beyond bash. No cargo involved, so feature-independent; run once.
         if: matrix.name == 'unix-only'
         run: |
-          shellcheck -s sh starty tools/install-smoke.sh
+          shellcheck -s sh starty tools/install-smoke.sh tools/check-layout.sh tools/windows/build-xkb-data.sh
           dash ./starty --help > /dev/null
       - name: Render man pages
         # scdoc only — feature-independent. Kept on the same leg as the two
@@ -117,18 +132,246 @@ jobs:
           ./target/debug/yserver --version | grep -q feedfacefeed \
             || { echo "stale stamp — rerun-if-env-changed missing:"; \
                  ./target/debug/yserver --version; exit 1; }
-      - name: Run software-Vulkan render tests (lavapipe)
-        # GPU-less runner: Mesa's lavapipe is the only Vulkan ICD, so
-        # the `#[ignore = "needs live Vulkan ICD"]` render tests run on
-        # it. They self-skip if no Vulkan device is present. KMS/scanout
-        # tests aren't in this set (no /dev/dri on the runner).
-        #
-        # On the xdmcp leg, with --features xdmcp, for the same reason as the
-        # step above: rendering is orthogonal to TCP and XDMCP, but these are
-        # the heaviest code CI actually executes and they ran on the full
-        # build before the default set was emptied. The leg has already
-        # compiled that lib, so this costs nothing extra.
-        if: matrix.name == 'xdmcp'
+  lavapipe:
+    # The `#[ignore = "needs live Vulkan ICD"]` render tests on Mesa's
+    # lavapipe, in an Arch container: the KMS scanout tests (commit identity,
+    # unflip, tearing, cursor sprites) need SYNC_FD export and DRM format
+    # modifiers, which Ubuntu's lavapipe lacks; without them they report `ok`
+    # while skipping. lavapipe offers modifiers only with /dev/udmabuf, which
+    # must be loaded on the host, hence docker run rather than `container:`.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure apt (mirror, retries)
+        run: |
+          printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' | sudo tee /etc/apt/apt-mirrors.txt
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\n' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+      - name: Open /dev/udmabuf
+        timeout-minutes: 5
+        run: |
+          if [ ! -e /dev/udmabuf ]; then
+            sudo modprobe udmabuf \
+              || { sudo apt-get update && sudo apt-get install -y "linux-modules-extra-$(uname -r)" && sudo modprobe udmabuf; }
+          fi
+          ls -la /dev/udmabuf
+      - name: Run software-Vulkan render tests (lavapipe, Arch)
+        run: |
+          docker run --rm --device /dev/udmabuf -v "$PWD:/src" -w /src archlinux:latest bash -euc '
+            pacman -Syu --noconfirm --needed base-devel rustup libxshmfence libxkbcommon libinput \
+              shaderc systemd-libs fontconfig pkgconf mesa vulkan-swrast vulkan-tools \
+              xorg-fonts-misc xorg-fonts-75dpi xorg-fonts-100dpi >/dev/null
+            rustup default stable >/dev/null
+            vulkaninfo 2>/dev/null > /tmp/vulkaninfo.txt || true
+            grep -m1 deviceName /tmp/vulkaninfo.txt || true
+            # Fail here instead of letting those tests pass vacuously.
+            for ext in VK_KHR_external_semaphore_fd VK_EXT_image_drm_format_modifier; do
+              grep -q "$ext" /tmp/vulkaninfo.txt || { echo "lavapipe lacks $ext"; exit 1; }
+            done
+            YSERVER_ALLOW_SOFTWARE_VULKAN=1 cargo test --workspace --locked --features xdmcp --no-fail-fast -- --ignored
+          '
+  freebsd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Clippy and tests on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "15"
+          mem: 12288
+          cache-after-prepare: true
+          # Package list from docs/setup.md plus fonts (the font tests need them, as on
+          # Linux); rustup tracks stable like the Linux legs.
+          prepare: |
+            pkg install -y rustup-init just pkgconf shaderc fontconfig freetype2 libudev-devd libinput \
+              libxkbcommon libxshmfence libdrm mesa-libs vulkan-loader scdoc \
+              mkfontscale xorg-fonts
+            rustup-init -y --profile minimal -c clippy
+          run: |
+            set -e
+            . "$HOME/.cargo/env"
+            rustup update stable
+            cargo clippy --all-targets -- -D warnings
+            cargo clippy --all-targets --features xdmcp -- -D warnings
+            cargo test --all-targets --features xdmcp --locked
+  openbsd:
+    runs-on: ubuntu-latest
+    # Normally 8-12 minutes; a hang must not hold a release for six hours.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - name: Clippy and tests on OpenBSD
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: "8.0"
+          mem: 12288
+          cache-after-prepare: true
+          # Package list from docs/setup.md. Mesa, libgbm, fontconfig and the
+          # fonts come from the X sets, fetched if the image lacks them. Rust
+          # is OpenBSD's package; rustup does not support OpenBSD.
+          prepare: |
+            pkg_add rust rust-clippy just shaderc vulkan-loader libinput-openbsd \
+              libudev-openbsd libxkbcommon scdoc
+            (ulimit -d "$(ulimit -Hd)"; cargo install cargo-nextest --locked --version 0.9.149)
+            if [ ! -e /usr/X11R6/lib/pkgconfig/gbm.pc ]; then
+              v=$(uname -r | tr -d .)
+              for set in xbase xfont xshare; do
+                ftp -o - "$(cat /etc/installurl)/$(uname -r)/$(machine)/$set$v.tgz" | tar xzphf - -C /
+              done
+            fi
+          # The default data size limit is too small for rustc, the default
+          # open-files limit for the accept-flood tests, and debug info would
+          # not fit the disk. nextest kills and retries a hung test: see
+          # .config/nextest.toml.
+          run: |
+            set -e
+            ulimit -d "$(ulimit -Hd)"
+            ulimit -n "$(ulimit -Hn)"
+            export CARGO_PROFILE_DEV_DEBUG=0
+            cargo clippy --all-targets -- -D warnings
+            cargo clippy --all-targets --features xdmcp -- -D warnings
+            cargo nextest run --all-targets --features xdmcp --locked --profile openbsd
+  macos:
+    # KosmicKrisp (Mesa Vulkan on Metal) needs macOS 26+; Apple Silicon only.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install packages
+        run: brew install mesa vulkan-loader vulkan-tools shaderc libxkbcommon fontconfig freetype pkgconf
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: clippy
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Vulkan environment
+        # The loader and the KosmicKrisp ICD come from Homebrew, off dyld's
+        # default search path.
+        run: |
+          prefix=$(brew --prefix)
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$prefix/lib" >> "$GITHUB_ENV"
+          echo "VK_ICD_FILENAMES=$prefix/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json" >> "$GITHUB_ENV"
+      - name: Probe for a Vulkan device
+        # Hosted runners are VMs and may expose no Metal device. Logged,
+        # never fatal; the ignored (GPU) suite below runs only if it finds one.
+        id: probe
+        run: |
+          out=$(vulkaninfo --summary 2>&1) || true
+          echo "$out"
+          if echo "$out" | grep -q deviceName; then
+            echo "device=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "device=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build
+        run: cargo build --workspace --locked
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Run Vulkan tests on KosmicKrisp
+        if: steps.probe.outputs.device == 'true'
         env:
           YSERVER_ALLOW_SOFTWARE_VULKAN: "1"
-        run: cargo test -p yserver --lib --locked --features xdmcp -- --ignored
+        run: cargo test --workspace --locked --no-fail-fast -- --ignored
+  xkb-data:
+    # The XKB data the Windows zip ships, from a pinned xkeyboard-config
+    # release: its rules files are generated at build time (meson, python,
+    # perl), so build it once here and hand it to both Windows legs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure apt (mirror, retries)
+        run: |
+          printf 'http://mirrors.edge.kernel.org/ubuntu/\tpriority:1\nhttp://archive.ubuntu.com/ubuntu/\tpriority:2\n' | sudo tee /etc/apt/apt-mirrors.txt
+          printf 'Acquire::Retries "3";\nAcquire::http::Timeout "20";\n' | sudo tee /etc/apt/apt.conf.d/80-ci-retries
+      - name: Install meson
+        timeout-minutes: 5
+        run: sudo apt-get update && sudo apt-get install -y meson ninja-build
+      - name: Build the XKB data
+        run: sh tools/windows/build-xkb-data.sh target/xkb-data
+      - uses: actions/upload-artifact@v7
+        with:
+          name: xkb-data
+          path: target/xkb-data
+          if-no-files-found: error
+  windows:
+    needs: xkb-data
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    env:
+      # Keep vcpkg's binary packages between runs: a files cache, saved by
+      # actions/cache.
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}\vcpkg-cache,readwrite
+      # vcpkg 2026.10.16. Pinned rather than the image's checkout, which
+      # moves with the image and would invalidate the cache.
+      VCPKG_COMMIT: 9eec002df1cd109f8f104cd966a763daf9751489
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fetch vcpkg
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP\vcpkg"
+          git init --quiet $root
+          git -C $root fetch --quiet --depth 1 https://github.com/microsoft/vcpkg $env:VCPKG_COMMIT
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg fetch failed' }
+          git -C $root checkout --quiet FETCH_HEAD
+          & "$root\bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          "VCPKG_ROOT=$root" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force vcpkg-cache | Out-Null
+      - name: Restore vcpkg packages
+        # Keyed on the vcpkg commit, which pins every port's version.
+        id: vcpkg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: vcpkg-cache
+          key: vcpkg-v3-${{ matrix.target }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('tools/windows/vcpkg-*/**', 'tools/windows/build-env.ps1') }}
+          restore-keys: vcpkg-v3-${{ matrix.target }}-
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          components: clippy
+          toolchain: stable
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Cache glslc
+        # From the Vulkan SDK installer (tools/windows/build-env.ps1).
+        uses: actions/cache@v6
+        with:
+          path: target/tools
+          key: glslc-${{ matrix.os }}-${{ hashFiles('tools/windows/build-env.ps1') }}
+      - name: Install the C libraries (vcpkg) and glslc
+        shell: pwsh
+        run: tools/windows/build-env.ps1 -Target ${{ matrix.target }}
+      - name: Save vcpkg packages
+        # Here rather than at job end, so a later failing step keeps them.
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: vcpkg-cache
+          key: ${{ steps.vcpkg-cache.outputs.cache-primary-key }}
+      - name: Clippy
+        # Not --all-targets: the test code does not build on Windows yet.
+        run: cargo clippy --workspace -- -D warnings
+      - uses: actions/download-artifact@v8
+        with:
+          name: xkb-data
+          path: target/xkb-data
+      - name: Build the zip
+        id: package
+        shell: pwsh
+        run: tools/windows/package.ps1 -Target ${{ matrix.target }} -XkbData target/xkb-data
+      - uses: actions/upload-artifact@v7
+        with:
+          # The zip itself, not zipped again; the artifact takes its name.
+          path: ${{ steps.package.outputs.zip }}
+          archive: false
+          if-no-files-found: error

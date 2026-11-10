@@ -33,6 +33,547 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
 
 ---
 
+- **2026-11-09 DetectableAutoRepeat and XI2 key repeat (#355):** measured on the NVIDIA test server, holding Tab produced 64 `KeyPress` / 64 `KeyRelease` events without XKB DetectableAutoRepeat; enabling it returned “supported, set” but still produced 21 of each, so Proton games treated the repeat as a turbo key. KMS repeat delivery now preserves the existing release/press pair through admission, XKB, grabs and frozen replay, then filters it per recipient: a flagged core/XI1 client does not receive the synthetic release, an XI2 client receives no synthetic release and its repeat press carries `XIKeyRepeat`, and unflagged clients keep today's event bytes and order. The skipped release retains its existing server-side effects; this is the accepted divergence from Xorg's single-press model. `PerClientFlags` is stored per client and follows Xorg's validation order. Hardware follow-up is the `repeat-probe`, Marvel Rivals Tab, and MGSV check. Plan: [`plans/2026-11-09-detectable-autorepeat.md`](superpowers/plans/2026-11-09-detectable-autorepeat.md).
+- **2026-11-09 Access control layer, PR 3c-i: resource checks for SYNC, Present, DRI3, MIT-SHM and GLX:** checks use the shared resource resolver and policy path, with XLibre's modes and the existing operand-validation order. With no policy installed, requests keep their existing replies, errors, events, backend calls and partial effects. System SYNC counters and RANDR CRTCs/providers are policy-visible with owner `SERVER_OWNER`; GLX context tags, screens, visuals and FBConfigs are not resources. SYNC priority and XI client-pointer operands resolve across every resource kind in deterministic order, while `KillClient` keeps `resource_owner`'s narrower lookup (a colormap or extension-only id still answers `BadValue` before an access check, unlike Xorg's `dixLookupClient`). Xorg aliases a GLXWindow under its X window id, so `MakeCurrent` / `SwapBuffers` there ask `WRITE` on the GLX drawable; yserver tracks only the GLX id, so it asks `GET_ATTR` on the core window. The `MakeCurrent` release form with context 0 asks nothing. Remaining policy-visible differences: `SetCounter` / `ChangeCounter` / `DestroyCounter` on system counters answer `BadAccess` before the policy is asked (Xorg asks first, with the same client error), and Present `SelectInput` with mask 0 and a new event id asks `CREATE` for a selection Xorg would not allocate. `ChangeAlarm` keeps fields applied before a denied counter, as it does for a missing counter; a denied Present notify window returns the policy error before anything is presented. New-object checks precede their first allocation or insertion, with MIT-SHM `CreatePixmap` freeing a successful allocation if its later segment check denies. Existing findings retained: a missing-segment `BadValue` in MIT-SHM `CreatePixmap` leaks its allocation, and `DestroyPbuffer` can free a same-XID core pixmap without a GLX record.
+- **2026-11-09 solid fills as one instanced draw (#155, branch `feat/instanced-solid-fill`):** spec `docs/superpowers/specs/2026-11-08-instanced-solid-fill-design.md`, plan `docs/superpowers/plans/2026-11-08-instanced-solid-fill.md`. A `RecordedFillRect` (normal full-plane-mask GXcopy fills such as `PolyFillRectangle`, and the spans core text is drawn with) was emitted with `vkCmdClearAttachments`, one clear rectangle per rectangle. On Ivy Bridge, hasvk runs a full BLORP operation per clear rectangle; without batch chaining on gen7 it grows one batch buffer past its 128 MiB pool classes and crashes (`x11perf -rect10`, `-ftext`, `-fitext`), and the same per-rectangle cost was the core-font stutter. The fill now uploads its rectangles to the frame upload arena as instances and draws them with one `vkCmdDraw(4, N)` through a per-format pipeline without logic op or blending (new `solid_fill.vert`, the existing `logic_fill.frag` and push layout). Pixels are unchanged. Every `logic_fill` case (depth-1 GXcopy included), the CPU fallbacks and the scene background clear are unchanged. The bottom-left vertex is moved 1/16 px: coverage stays exact, and it keeps llvmpipe off its linear rasterizer path, which reads the push-constant colour from the wrong offset for a full 1x1 destination (Mesa issue https://gitlab.freedesktop.org/mesa/mesa/-/work_items/16828). x11perf `-repeat 2 -time 3`, master `68fa4be2` → this branch: AMD Raphael (RADV) `-rect1` 3.98M → 28.0M/s, `-rect10` 3.98M → 27.7M/s, `-ftext` 365k → 2.55M/s, `-fitext` 363k → 2.52M/s (×7), `-rect100` 1.56M → 1.46M/s, `-rect500` 69.2k → 67.4k/s (GPU-bound in both); NVIDIA RTX 5060 Ti `-rect1`/`-rect10`/`-ftext`/`-fitext` +6 to +11%, `-rect100` 8.53M → 7.37M/s and `-rect500` 615k → 329k/s: NVIDIA resolves attachment clears on a path that does not use the shader (154 Gpix/s at 55% GPU busy), and a shaded draw tops out at about 80 Gpix/s, so only fills of very large total area lose, by microseconds per full-screen fill.
+- **2026-11-08 VRR cursor hold lifts while the direct client is idle (branch `feat/vrr-cursor-idle`):** spec `docs/superpowers/specs/2026-11-08-vrr-cursor-idle-design.md`, plan `docs/superpowers/plans/2026-11-08-vrr-cursor-idle.md`. With VRR on, a cursor move is held for the next direct frame (or the 33 ms deadline) only while the direct-scanout owner on that output presented within the last 100 ms. Once the client is idle a move is committed on its own, and the next Present brings the hold back. Before this, the cursor moved at about 30 Hz over a still Steam image or a paused Discord video. VRR itself, the property retry and the gamma path are unchanged. On the spike build `87af70d6` (48–240 Hz panel): NVIDIA RTX 5060 Ti with `--vrr all`, smooth cursor over a still Steam image and a paused Discord video, 48 Hz while still and 240 Hz while moving, no brightness change; AMD Raphael with `--vrr`, a paused fullscreen mpv gave 238–240 cursor-only commits/s while moving with motion-to-visible p99 4.5–5.4 ms.
+- **2026-11-06 Access control layer, PR 3b: resource checks for RENDER, SHAPE, XFIXES, Composite, DAMAGE and input operands (#343, by ariel3259):** second part of the series' PR 3, after #342; plan `docs/superpowers/plans/2026-11-06-access-control-pr3b.md`. Only check sites on #342's helpers (`check_resource`, `AccessContext::owner`, `RequestOpcodes::for_request`, the shared `return_on_access_denial!`), with #342's rules: each check right after its operand's own validation, `SERVER_OWNER` unchecked, an operand we never validated checked only when its id resolves. Covers every RENDER, SHAPE, XFIXES, Composite and DAMAGE request, and the window, cursor and barrier operands of XInput, XKB `Bell` and XTEST (device operands are PR 5). Modes are XLibre's; PictFormats are not checked (a static server table with no owner). Retained cursors: `free_cursor` keeps a host cursor a window still shows and its name keeps matching (d746bc3c), so the resource table now records, per host cursor, the XID and owner it was first bound under (a `ChangeCursor` alias does not replace it) until the backend releases it; because a disconnected owner's XID base can be recycled while its cursor is still shown, the owner belongs to the instance: `ResourceTarget` gains `owner` (`None` everywhere else) and policies read `AccessContext::target_owner`. `GetCursorImage`, `GetCursorImageAndName` and `ChangeCursorByName` use it; a server cursor is not checked. Derived targets, each checked and skipped on denial while the request succeeds: the children of `RedirectSubwindows`/`UnredirectSubwindows` (the parent's rule for future children is unchanged), each Damage `DAMAGE Add` would accumulate into, each cursor `ChangeCursorByName` matches. `XIBarrierReleasePointer` keeps XLibre's sequential shape: a denied entry reports the policy's error after earlier releases took effect. Built on #347 (CompositeGlyphs glyphset switches and CreatePicture's alpha map and clip mask now reach the renderer as backend handles), split out of this PR: each glyph switch is validated and access-checked in stream order in the same translation pass; an invalid looked-up switch returns `BadGlyphSet`, and no drawing occurs. Tests: split by area as #342 asked, in `process_request/tests/access_{render,cursors,composite_damage,input}.rs` plus the SHAPE/XFIXES and RENDER files; review round 1 compacted every row to at most three lines and moved the colormap and GC/font/pixmap/cursor groups to `access_colormap.rs` and `access_gc_font.rs` (`access_resources.rs` 4,150 lines). Review round 1 also: the retained-cursor record lives until the backend destroys the cursor (`Backend::cursor_alive`; KMS: while `cursor_records` holds it, so a grab, root or animation-frame cursor keeps its owner; host handles are monotonic), six sites moved to XLibre's check order (ExpandRegion, CompareCursor, XIWarpPointer, XFIXES SelectSelectionInput/SelectCursorInput, Composite (Un)Redirect*, CreatePicture), and `XISetClientPointer` asks `MANAGE`. `RecordingBackend` now records the RENDER, `xkb_proxy` and `query_pointer` calls these sites can make, so a denial row sees a premature backend effect. Hardware (AMD Raphael, NVIDIA 5060 Ti): identical to the #342 binary, including `x11perf -aa10text -rgb24text` within 1%. Open, not caused here: x11perf's antialiased text draws as dark cells with light strokes and squeezed `rgb24` rows on both GPUs, identically with the #342 binary; desktop text looks right, so something specific to that case differs, still unmeasured. Not yet: 3c (SYNC, Present, MIT-SHM, DRI3, GLX, RANDR, RECORD, …), send/receive (PR 4), device and client hooks (PR 5), the selection hook.
+- **2026-11-06 Access control layer, PR 3a: resource and property checks for core requests (#342, by ariel3259):** third PR of the series designed in #320 (spec `docs/superpowers/specs/2026-10-30-access-control-layer-design.md`), after #328 (interface, admission, lifecycle, server hook) and #334 (extension access and dispatch checks); plan `docs/superpowers/plans/2026-11-05-access-control-pr3a.md`. `AccessPolicy` gains `resource(ctx, client, target, mode)` and `property(ctx, client, window, property, mode)`, both allow by default; `ResourceTarget` carries id, `ResourceKind` (24 kinds, extensions included) and, for a creation, the parent and owner. `AccessContext` gains `owner(id, kind)` (server objects answer `SERVER_OWNER`; `resource_owner` is unchanged), `is_root` and `atom_name`. Modes are XLibre's per site; policies see a core request's minor opcode as 0 (`RequestOpcodes::for_request`, as Xorg's `client->minorOp`). Each check sits right after its operand's existing validation, so a denied operand reports with a missing one's precedence; a creation is asked after all validation and before the first allocation; an operand we never validated is checked only when its id resolves (no new validity errors). Calls made as `SERVER_OWNER` (screensaver) are not checked. Denials that are not errors: a denied `MapWindow` `Show` maps nothing and answers `Success` (XLibre); `DestroySubwindows` stops at a denied child without an error; `MapSubwindows`/`UnmapSubwindows` skip it; `CirculateWindow` does not restack it; `ListProperties` leaves out a denied property. Not yet: extension sites (3b: RENDER, SHAPE, XFIXES, Composite, DAMAGE, XI/XKB/XTEST operands; 3c: SYNC, Present, MIT-SHM, DRI3, GLX, RANDR, RECORD, …), send/receive (PR 4), device and client hooks (PR 5), the selection hook. Bug fix in the same PR: a write into another client's existing XFIXES region or DAMAGE parts region made the writer its owner, so the region vanished when the writer disconnected; owners are now kept. Present `SelectInput` on another client's or another window's event id answers `BadMatch` (`present_select_input`, `present/present_event.c:221`). Still divergent: XFIXES writes to a nonexistent destination create it (Xorg: `BadRegion`); Present mask-0 removal. No policy ships yet, so nothing changes for clients; an allow-all policy costs nothing measurable on a `PolyPoint` loop (`bench_poly_point_with_and_without_policy`, ignored). Tests: `process_request/tests/access_{resources,grabs,properties}.rs`, one deny row and one record row per site; `access_resources.rs` is 5,919 lines against the 6,000 test-file ceiling (`tools/check-layout.sh`) — 3b is asked to use one-line rows and split by area.
+- **2026-11-05 VidMode gamma writes (#263, by SetZero):** supersedes the read-only VidMode policy of the 2026-07-28 entry. A local client's `SetGamma`, `SetGammaRamp` and `LockModeSwitch` now apply, as on Xorg's modesetting server (Wine calls `XF86VidModeSetGamma` with no error handler, so the old `ClientNotLocal` ended it); mode setting (ModModeLine, SwitchMode, AddModeLine, DeleteModeLine, SwitchToMode, SetViewPort) keeps `ClientNotLocal`, and remote clients are still refused. VidMode's gamma is a per-screen 1024-entry table (`backend::gamma::VidModeGammaTable`, Xorg's `ComputeGamma`/`ComputeGammaRamp`); the KMS backend loads every live output's LUT with the output's RandR ramp on top of it (`xf86RandR12CrtcComputeGamma`), on every path that reloads gamma, so `RRGetCrtcGamma` still reports the RandR ramp. A RandR ramp of another size is resampled to 1024 entries first (within one 8-bit step of Xorg). `GetGammaRampSize` is 1024 and `GetGammaRamp` returns the table. Gamma values survive a server reset, as `pScrn->gamma` does. Hardware-checked with `xgamma` and `xrandr --gamma` on two outputs (AMD 6900HX): both outputs change (a busy output gets the LUT in its next scene commit, so only the idle one logs `kind=gamma-only`), and the correction survives a VT switch. Follow-up: report a RandR gamma size of 1024 like modesetting.
+- **2026-11-04 Windows DPI awareness (branch `feat/windows-dpi`):** yserver.exe's manifest (`yserver.rc`, RT_MANIFEST 1) makes it per-monitor DPI aware v2 (and pulls in common controls v6); `windows/scale.rs` falls back to `SetProcessDpiAwarenessContext` without it. Every Win32 coordinate is now a device pixel: a logical pixel (96 DPI) plays the macOS point, DPI/96 the backing scale, and `surface/resize.rs` `PixelScale` reuses macOS's `copy_factor`/`x_per_point` unchanged, so Auto rounds the backing (125% → 1, 150%/175% → 2, the same as macOS at backing 1.5) and the copy factor stays an integer (NEAREST, sharp). X size = client device pixels / factor (floored); pointer = device / factor; cursor images are blown up by the factor; rootless swapchains blit at the factor (`RootlessHost::copy_scale`, 1 on macOS). Rooted `WM_DPICHANGED` takes the suggested rect (same logical size, as macOS keeps points) and posts the new size/factor/mm at once; rootless uses one global factor from the primary (D2) and answers `WM_GETDPISCALEDSIZE` with the same client size, so X geometry survives a DPI change. Output mm: the monitor's EDID (`QueryDisplayConfig` target path → SetupAPI `EDID`, parsed by `surface/edid.rs`), else device pixels at the effective DPI; the core screen keeps 96 DPI as on macOS. The Settings dialog lays out at its DPI (rebuilt on `WM_DPICHANGED`) and has the Scale list back (applies at restart, as on macOS). Measured on the Win11 VM (1600x1200, no EDID) at 100/150/200%, rooted and rootless: sizes, menu clicks and `xrandr` mm as computed. Not covered: two monitors of different DPI, a real EDID.
+- **2026-11-04 Windows clipboard (branch `feat/windows-clipboard`):** the macOS bridge (`surface/clipboard`) now runs on Windows too; `windows/clipboard.rs` is only the `Pasteboard` shim over `CF_UNICODETEXT`, rooted and rootless. Windows has no `socketpair`, so `Message::InternalClient` carries a `Transport` and the bridge's pair there is loopback TCP from a one-shot listener (accepted peer checked against our connect; fd passing off). `GetClipboardSequenceNumber` is the change count the bridge polls, so no `WM_CLIPBOARDUPDATE` listener and no delayed rendering. Line endings and UTF-16 live in `surface/clipboard/text.rs`. Measured on the Win11 VM: another process (clipboard history, presumably) often holds the clipboard open >200 ms right after a change; a busy read bumps the change count's high half so the next poll retries, but the bridge drops CLIPBOARD for that one poll. Still CLIPBOARD only, no PRIMARY.
+- **2026-10-31 xhost host access control (#305, branch `feat/xhost-access-control`):** spec `docs/superpowers/specs/2026-10-30-xhost-access-control-design.md`, plan `docs/superpowers/plans/2026-10-30-xhost-access-control-plan.md`. ChangeHosts, ListHosts and SetAccessControl act on real state. The host list is consulted only after the cookie fails, and only for Unix clients: `si:localuser`/`si:localgroup` match the peer's uid / primary gid (`SO_PEERCRED`, `getpeereid`), `local:` opens local access, `xhost +` disables the check. TCP is never admitted by the list (Xorg admits it after `xhost +`); `si:hostname`/`si:ipv6` entries, and `inet:` entries that are not one of our own addresses, are stored and listed but admit nobody, with one warning; with `-listen tcp`, an entry for one of our own addresses (or an empty `local:`) admits Unix clients, as Xorg's `selfhosts` do. Each client keeps its peer uid/gid/pid (`ClientState.peer`). `local_open` and the list are generation-tagged: a reset closes local access and reloads the auth file, and an older generation's connection cannot write. Deliberate differences from Xorg: `#<num>` ids are not truncated to `int` (`#4294967296` never matches root); `AddLocalHosts` is not mirrored; ListHosts stops at 65535 entries so the count and data agree; `-ac` stays ignored. A reset also drops every loaded cookie before the forced reload, as Xorg's `MitResetCookie` does (`os/mitauth.c:87-97`); reloads within a generation stay additive (branch `fix/cookies-reset`, 2026-11-03). The read and manage access checks (`may_read_access`, `may_manage_access` in `process_request/misc.rs`) are the hook points for SECURITY. vng scenario `xhost` (nightly) passes on yserver and Xorg; hardware-checked under `starty` on an AMD 6900HX. The non-Linux credential code is compiled only by CI.
+- **2026-10-31 Present event-space and frozen CRTC clock (branch `fix/present-event-space`):** Present uses one tagged next-vblank wake per CRTC for future work, in addition to its idle wake: two arms in steady operation. A same-CRTC modeset can clear the local watch while an old kernel event remains unread, so repeated modesets have no strict upper bound. A CRTC whose accepted kernel vblank arm stays silent for one second switches to a software clock at the mode refresh rate, keeping Present completion and buffer retirement moving. Measured NVIDIA 615.78.08: DP-3 froze after i3's `xrandr` sequence; no `ENOMEM`, Alacritty/Firefox/Steam without lag, glxgears at 240 fps, smooth mpv, a completed CS2 match, and a 46-minute session. Without `xrandr`, frozen detection did not occur. AMD Raphael with two outputs, VRR, and picom GLX: no frozen detection and no `ENOMEM`.
+
+- **2026-10-29 direct scanout of a compositor's server-created Present pixmaps (branch `feat/server-pixmap-scanout`):** spec `docs/superpowers/specs/2026-10-29-server-pixmap-direct-scanout.md`, plan `docs/superpowers/plans/2026-10-29-server-pixmap-direct-scanout-plan.md`. Marco's XRender compositor `PresentPixmap`s an `XCreatePixmap`'d root-sized buffer to the COW; Xorg flips it (`tools/present-watch.c`: 301 flips / 10 s on fuji), we copied it and recomposed the whole screen. Now a root-sized depth-24 source Presented to the COW (or an eligible descendant) is promoted once to linear exportable storage (allocate → export → AddFB2 → TEST_ONLY, swap only on success) when its A/B rotation is identified, and then flips through the M2 path as a Root owner with an explicit `IN_FENCE_FD` from our own writes. An external export (DRI3/GLX) disqualifies the pixmap permanently; a DRI3 reply for an on-screen buffer is deferred until every plane left it (250 ms deadline → safe teardown). Caps: 4 failures per topology epoch, success token bucket (burst 8, +1 per 30 s, reserved per rotation), 4 live promoted drawables. Hardware, fullscreen 1080p YouTube under MATE: fuji (i5-7200U, anv) GPU Render/3D 63.8% @655 MHz → 43.3% @467 MHz (Xorg 38.8% @392 MHz), server CPU 15.7% → 9.5%, 0 dropped frames; vaio (Haswell, hasvk) GPU ~4.6x → ~2.5x Xorg busy×clock, CPU 12.8% → 8.8%; silence (RX 6800, two outputs, one 5120x1440 buffer on both CRTCs) flips, re-promotes after `xrandr` output off/on and a compositing toggle; Asahi (apple_drm, no cursor plane) flips, unflips when the pointer shows. Promotion is synchronous: 6–8 ms per buffer on fuji/vaio, 0.4–1.9 ms on RADV/Asahi (one 14.8 ms outlier); `server_promote_present_us_max` is declared but not filled. Fence: no CPU-wait fallback warning on i915, hasvk, RADV or apple_drm. NVIDIA: never a candidate in the tested session (`candidates=0`). Not covered: depth-32 sources, tiled modifiers, NVIDIA/GBM allocation, unredirected client windows.
+
+- **2026-10-29 Present completions on devices without vblank ioctls (master `89cb14be`):** nvidia-drm 580 returns `EOPNOTSUPP` for `CRTC_GET/QUEUE_SEQUENCE` and for legacy `WAIT_VBLANK` (`tools/vblank-probe.c`), and reports `frame=0` in flip events. With two monitors, marco's Present bound to the idle output held its CompleteNotify forever (that output never flipped, so its software MSC never advanced) and MATE froze 1–2 s after start, since v1.8.0 at least. Arming now tries `QUEUE_SEQUENCE`, then `WAIT_VBLANK` (Xorg `modesetting/vblank.c` order), then a per-CRTC software vblank at the mode's refresh interval. Xorg instead completes immediately on `EOPNOTSUPP` (`present_scmd.c`); we pace. HW-verified on the GTX 1050 with two outputs.
+
+- **2026-10-30 per-output VRR:** Each output with a capable connector independently enables VRR while its own fullscreen client scans out directly and asks for it. Several monitors can use VRR at once; others keep their fixed refresh.
+
+- **2026-10-25 VRR adaptive sync (branch `feat/vrr`):** off by default; `--vrr` honors `_VARIABLE_REFRESH` format 32, one item, nonzero for client-owned direct scanout on one capable output, including live changes. In design revision 2.1, an idle clear uses only the live direct frame and is skipped when there is none. `--vrr all` ignores the property on `nvidia-drm` and applies the NVIDIA and Mesa application lists; on other drivers it behaves like `--vrr`. Animated cursors commit each image change, which starts a refresh (Adwaita's watch over a 100 fps video: 100–240 Hz); cursor moves otherwise wait for a direct frame or the 33 ms deadline while the client draws (since 2026-11-08, not once it has been idle for 100 ms). Hardware-validated on AMD Raphael and NVIDIA RTX 5060 Ti (48–240 Hz panel). `starty` passes arguments after `--` to the server.
+
+- **2026-10-27 per-output direct scanout:** a client covering exactly one monitor can scan out on that output while all other outputs continue composing at their own rates; there is no monitor-count limit. A whole-screen window retains grouped direct scanout when every output is on the primary device and refresh rates are within 0.5%. A Present selecting another monitor's CRTC is composed. Tearing has one direct owner at a time and may belong to a fullscreen client on one monitor while other monitors are on. A second client asking to tear stays direct with synchronized flips until the current owner releases tearing; a paused owner keeps tearing. Under a compositing desktop, direct scanout and VRR require the compositor to unredirect fullscreen windows. On Cinnamon, enable `org.cinnamon.muffin unredirect-fullscreen-windows` (`true`) in System Settings → General → “disable compositing for full-screen windows”; it is off by default, and while off Muffin composites the game and the monitor stays at maximum refresh. A measured Cinnamon limitation, also seen on Xorg and reported in [linuxmint/cinnamon#12687](https://github.com/linuxmint/cinnamon/issues/12687), is that a system-tray icon (such as Steam's, present when a game is launched through Steam) creates an override-redirect window above the fullscreen game, preventing Muffin from unredirecting it and keeping VRR off. Desktops without a compositor, such as i3, are unaffected.
+
+- **2026-10-23 PRIME probe helper without `DISPLAY` (branch `fix/probe-helper-display`):** the disposable
+  probe helper inherited the server's `DISPLAY`. The NVIDIA Vulkan ICD connects to it, so a server started with
+  `DISPLAY` set to itself deadlocked a copied-route `RRSetCrtcConfig` under xrandr's `GrabServer` until the 30 s
+  watchdog (measured, RTX 5060 Ti + Raphael). The helper now runs without `DISPLAY`: the same run enables HDMI-1 in
+  0.83 s with no X connection from the helper (master: 30 s, watchdog, `Configure crtc failed`). Plan:
+  [`plans/2026-10-23-probe-helper-no-display.md`](superpowers/plans/2026-10-23-probe-helper-no-display.md).
+- **2026-10-23 gamma through atomic `GAMMA_LUT` (branch `feat/gamma-atomic-lut`):** the gamma LUT moves from the
+  legacy `SETGAMMA` ioctl (a blocking atomic commit the kernel builds itself, which also clears `DEGAMMA_LUT`/`CTM`) to
+  a `GAMMA_LUT` blob of the legacy size on the CRTC's next vsync commit, or its own nonblocking commit when nothing is
+  in flight. `SETGAMMA` is removed (no target driver has legacy-only gamma; nvidia-drm got both in 545); a CRTC without
+  `GAMMA_LUT` reports gamma size 0. On an active CRTC (a page-flip event received within two refresh periods; the
+  receipt time, because nvidia-drm 615's flip UST is ~0.97 s behind `CLOCK_MONOTONIC`) the LUT waits up to one
+  refresh period for the next frame commit; a LUT that cannot go out at once gets the same deadline on an idle CRTC.
+  The RANDR gamma size does not change (#263 territory). Review round (#293): while DPMS is off a LUT only stays
+  pending and goes out on wake; `EINVAL` disables gamma on a CRTC only when the same frame then succeeds without the
+  LUT; a CRTC whose legacy gamma size is 0 uses `GAMMA_LUT_SIZE`. Measured, 30 gamma changes ~45 ms apart, mpv
+  60 fps, one output, skipped vblanks from flip events: NVIDIA RTX 5060 Ti master 33 → branch 0; AMD Raphael 34 → 23 (on
+  kernel 7.2.11 amdgpu delivers the event of a frame with a colour change one refresh late, on direct and composed
+  alike, and a standalone LUT commit holds the CRTC as long; a kernel-version matter, not bisected: the candidates
+  move DCN flip events to VUPDATE_NO_LOCK and hold them while the flip is pending, mainline 7.2, stable 7.1.6/7.1.8).
+  Known stall, amdgpu with two or more outputs on one device: a commit that changes the colour state takes a global
+  lock that waits, inside the ioctl and even with NONBLOCK, for the last commit of every CRTC to be done and flipped.
+  LUT commit ioctl p50 on Raphael, two outputs: 15 ms idle, 12 ms with mpv, max 34 ms (one output 0.6 ms; commits
+  without a colour change 0.02 ms); NVIDIA 0.07 ms. The server loop pays it once per LUT commit. A device-wide gate
+  (a LUT only while no other CRTC is in flight) took it to 0.58 ms but was dropped in review: with two outputs whose
+  commits alternate, the LUT can wait indefinitely; revisit only if normal use shows the stall matters. 0 `SETGAMMA`;
+  kernel LUT readback correct on every CRTC; colour and VT switch checked by eye on both cards.
+  (The earlier "8 → 0" for AMD came from mpv's drop counter, which counts only a late vo thread.) Revises the transport
+  decision of `specs/2026-06-18-randr-gamma-design.md`. Plan:
+  [`plans/2026-10-23-gamma-atomic-lut.md`](superpowers/plans/2026-10-23-gamma-atomic-lut.md).
+
+- **2026-10-23 macOS Settings window (branch `feat/macos-settings`, spec
+  `specs/2026-10-23-macos-settings-design.md`):** app menu with About, Settings… (Cmd-,), Hide/Hide Others/Show All,
+  Quit (Cmd-Q). Settings live in `NSUserDefaults` (`io.github.joske.yserver`) and apply only from the bundle; argv
+  wins per run and is never written back (`launch::apply_settings`, `settings.rs`). Live: click emulation, key
+  equivalents (a Cmd KeyDown is offered once to `performKeyEquivalent:`), clipboard sync (off: the bridge drops
+  CLIPBOARD at once, finishes an INCR send already started, refuses queued requests once). Next launch: mode,
+  scale, with Restart: the normal quit path, then `applicationWillTerminate:` leaves a `/bin/sh` helper that waits
+  for our PID and runs `open -n` on the bundle without arguments (`app_bundle::relaunch_command`). Launch at login
+  = `SMAppService.mainApp` (`objc2-service-management` 0.3.2), re-read whenever the window becomes key. Non-bundle
+  runs disable Restart and launch at login. eiger smoke (bundle): Settings in both modes, register/unregister,
+  restart rootless→window on the same display, restart with `--scale 2` drops it, restart confirm/cancel with an
+  xterm connected. Not run: launch at login across a logout, the requires-approval state.
+
+- **2026-10-23 cursor error attribution and legacy cursor removal (branch `fix/cursor-error-attribution`):** only EINVAL
+  is attributed to the cursor (ENOMEM/EIO no longer trigger cursor recovery; EBUSY unchanged). The legacy cursor
+  executors (`set_cursor2`/`move_cursor`, shared legacy buffer, probe, telemetry) are removed; every device whose
+  static path decision is not Atomic uses the software cursor through the existing `permanently_disabled` latch, and
+  partial plane coverage stays with the refresh-recomputed `topology_blocked`. Review follow-up: a non-EINVAL
+  direct-scanout cursor hide/show failure retries on a 50 ms `next_wakeup` deadline through the existing
+  `CursorHideRecovery` record (no new frame or CRTC event needed) and unflips after 3 failed attempts; EBUSY keeps
+  the event-driven retry. The former Legacy-fixture policy tests run on atomic fixtures, and the software fallback
+  is checked by pixels. Production +650/−1567, tests +2782/−4366. NVIDIA RTX 5060 Ti and AMD Raphael:
+  `atomic reason=qualified`, 0 legacy cursor ioctls under strace.
+  Plan: [`plans/2026-10-23-cursor-error-attribution-and-legacy-removal.md`](superpowers/plans/2026-10-23-cursor-error-attribution-and-legacy-removal.md).
+
+- **2026-10-20 monitor disconnect = Xorg modesetting (branch `fix/273-monitor-disconnect`, issue #273):** a
+  physical disconnect issues no KMS commit and runs no global quiesce. The output keeps its `platform.outputs` row,
+  scanout pool and CRTC (still scanning out); RANDR reports it Disconnected with an empty mode list and no EDID, while
+  its CRTC keeps mode, position and output, and the mode stays in the screen's mode table. Clients get
+  RRScreenChangeNotify plus RROutputChangeNotify (crtc + mode), no CrtcChangeNotify, no root resize. Reconnect
+  re-probes the modes and commits nothing (the CRTC never went off). Only a connected connector with no usable mode
+  still retires its route. DPMS on and VT resume attempt a disconnected route's commit and log a refusal at debug
+  instead of failing the others. Accepted cost: the absent output's scanout BOs (about 44 MB at 2560x1440) stay
+  pinned, as on Xorg. This supersedes the 2026-09-17 P1b remember/relight design (see its spec note): its
+  `last_enabled`/reserved-slot machinery was then removed as dead code. Not done: link-status BAD one-CRTC
+  re-commit (Xorg drmmode_display.c:3995-4009) needs a per-CRTC modeset path, which today only exists as the global
+  quiesce (#275). With atomic cursor state (#276): a disconnect keeps the cursor owned by the kept CRTC, and the
+  shutdown device-wide clear settles every CRTC of a cleared device (it skips their per-output detach). Hardware
+  validation pending.
+
+- **2026-10-20 atomic cursor state (branch `feat/cursor-sprite-state`, P2):** each KMS device selects its cursor state
+  path once from static capability and plane facts. On qualifying devices, cursor image, hotspot, attach and detach
+  changes are full-state atomic commits on the existing per-CRTC commit stream. A per-device pool supplies
+  full-capacity ARGB sprite framebuffers; a replaced sprite is reusable only after the event for its replacing commit
+  ID, or after a successful blocking detach. Position deltas continue to travel with scene, direct, copied and unflip
+  commits. VT, DPMS and output lifecycle paths detach with a separate blocking commit and retain release ownership
+  until the detach is safe. The hotspot client capability is requested at KMS open. Devices that do not qualify retain
+  the legacy ioctls and software-cursor fallback unchanged. Each image or state change occupies that CRTC's commit
+  slot for a vblank; the expected P2 cost is up to one scene frame per animation frame, with repeated unflips possible
+  during animated cursors over held direct scanout. CI runs the ignored suite on lavapipe; capability-dependent
+  fixtures may report skips. Hardware: AMD Raphael and NVIDIA RTX 5060 Ti both qualify for the atomic path and match
+  master in `tools/cursor-bench`; DPMS, `xrandr` off/on, VT switch (NVIDIA), physical hot-unplug and shutdown leave
+  no cursor ghost and no unreleased sprite. An animated cursor over held direct scanout unflips once per animation
+  frame (no dropped client frames; P3 removes it). Not run: dual-head, a paravirtualized driver, Intel, Asahi. Record:
+  [`plans/2026-10-20-cursor-sprite-state-validation.md`](superpowers/plans/2026-10-20-cursor-sprite-state-validation.md).
+
+- **2026-10-19 DRM commit identity (branch `feat/drm-commit-identity`, plan
+  `plans/2026-10-19-drm-commit-identity.md`):** every event-requesting atomic commit the server submits carries a
+  commit ID as its event cookie, allocated before submission and recorded only when the kernel accepts the commit.
+  A flip event retires the pending entry for its device and CRTC whose ID it carries; a stale, duplicate, unknown
+  or other-device ID retires nothing, so it cannot release a scene buffer, a direct-scanout pin or a degraded-unflip requirement. A
+  zero cookie keeps the old first-in-first-out match. A copied frame gets its ID only when the sink accepts it in KMS.
+  While any degraded-unflip replacement is outstanding, direct admission stays closed. KMS setup now requires
+  `DRM_CAP_CRTC_IN_VBLANK_EVENT` (Linux 4.12+), and a flip event with CRTC 0 is dropped instead of reading the cookie
+  as a CRTC. No cursor behavior changes. CI runs the ignored suite on lavapipe. Hardware: AMD Raphael and NVIDIA RTX
+  5060 Ti match master in `tools/cursor-bench` (NVIDIA direct and async tearing included; AMD direct scanout is not
+  reached, `add_fb2` rejects mpv's linear buffer on both builds), with no unmatched events. Not run: dual-head, a
+  physical copied display, VT switch, Intel, Asahi. Record:
+  [`plans/2026-10-19-drm-commit-identity-validation.md`](superpowers/plans/2026-10-19-drm-commit-identity-validation.md).
+- **2026-10-20 rootless RL2, macOS (branch `feat/rootless-rl2`, draft PR #274, plan
+  `plans/2026-10-20-rootless-rl2-macos.md`):** the app bundle starts rootless (`--rooted`/`--rootless` win; KMS and
+  `--headless` default rooted), `just macos-rootless`; one NSWindow + CAMetalLayer swapchain per top-level
+  (`macos/rootless/`), the window-system-neutral half in `rootless/native/` (GlobalSpace, GeometrySync,
+  style/NetStateSync, seat trackers, XStacking, FramePacer; Linux-tested) and `surface::server::run_rootless` (zero
+  outputs, the platform clock for Present MSC, cursor flushed without a cursor plane, RandR configuration refused).
+  Decisions D1-D13 in the plan; follow-ups F1-F13 there. Fixes found on the way: Mesa before 26.0 calls a null
+  `release_images` from vkReleaseSwapchainImagesEXT on headless/Metal surfaces (CI's Ubuntu lavapipe 25.2.8
+  segfaulted), so an abandoned image rebuilds the swapchain instead; title bars under the menu bar made X place
+  menus too high (content now below it, reported to X); XTEST motion moves the Mac pointer
+  (`resync_input_position`); animated cursors wake the loop without an output; Option/Command-click are buttons 2/3
+  (rooted too). Eiger (M2, KosmicKrisp Mesa 27.0-devel, maintenance1 on) smoked Tasks 9-12; Task 13 (stacking,
+  transients, popups) awaits it. Known gaps: SHAPE (F4), motion outside our windows (F5), resize via
+  `_NET_WM_MOVERESIZE` (F8), root reads (RL1b).
+- **2026-10-20 rootless core RL1 (branch `feat/rootless-rl0`, plan `plans/2026-10-19-rootless-rl1.md`):**
+  `yserver::rootless` (built where `surface` is: `any(not(kms), test)`), a `Presenter` in `SurfaceBackendState`
+  installed only by `rootless::start`; the one seam hook `Platform::on_rootless_events` (no-op default, KMS
+  untouched). Frame events ride a second `ShellLink` queue. CPU path: async `begin_readback` (yserver-render, never a
+  fence wait; `core_thread_fence_waits` counts waits), canonical image, pool of 3 filled from each buffer's own seq,
+  snapshots acked on `Delivered` only, stale generations discarded. GPU path: per-window swapchain on the shared
+  `surface::swapchain::chain::Chain`, full-extent copy (D5), the copy ticket is the backing's render ticket, old
+  swapchains retire on present fences (`VK_EXT_swapchain_maintenance1`, now enabled on presenting contexts) or one
+  queue-idle without it; `surface_released` after the last chain. `next_wakeup`: now for a frame the tick would
+  start, 1 ms while a readback is in flight or a swapchain retires (D6), none while Busy; `frame_wanted` once per Busy
+  period (D7); the tick flushes recorded paint before deciding. Rooted fix (7b): `SurfaceOutput` rebuilds no longer
+  queue-idle when maintenance1 is there. Task 9 (approved): `surface` and `rootless` are built on every target,
+  `--headless` runs the surface platform on KMS builds too (no DRM, no input; nothing changes without it), and
+  `--headless --rootless [--rootless-record DIR]` installs a recording host (`rootless/record.rs`: events.log,
+  frames.log, one `<id>-<seq>.bgra` per frame). vng `rootless-headless` (xterm -bw 3, xmessage, xeyes when
+  installed, a popup and a SHAPEd window from `rootless-clients.py`) checks each top-level's newest frame, cropped
+  by its border, against GetImage of the window (`rootless-check.py`). Error paths after review: every present
+  error retires its swapchain with a queue-idle (its fence may never signal), and an allocation failure after an
+  acquire consumes the semaphore and gives the image back. Dmabuf answered with CPU frames (D4); root reads are
+  RL1b (D8). Measured: store damage is recorded at paint-record time (fill and RENDER composite), so the
+  tick's flush matters for GPU ordering, not for the damage snapshot. Lavapipe validation does not flag destroying
+  a swapchain right after its replacement; the retirement tests assert the queue-idle count instead.
+
+- **2026-10-19 rootless core RL0 (branch `feat/rootless-rl0`, plan `plans/2026-10-19-rootless-rl0.md`, spec
+  `specs/2026-10-19-rootless-core-design.md`):** `yserver-core::rootless`, inert until an embedder calls
+  `rootless::enable` (nothing does yet; RL1 adds `run_headless --rootless`, RL2 macOS). In it: server-owned Manual
+  redirect of every root child; a per-tail reconcile (after the Present drain, before `maybe_composite`) into
+  `RootlessEvent`s with a fresh `ToplevelId` (u64) per mapped lifetime, `Unmapped` retiring it, `ParentChanged` for
+  popups; the `WindowInfo` parser with a property dirty set; the built-in WM (EWMH announce on server window 0x107,
+  `WM_S0`, `WM_STATE`, client lists, root ClientMessages → `WmRequest`, SubstructureRedirect on root = BadAccess);
+  `Message::Rootless(HostRequest)` with serial acks (spec §4.2.1) through `configure_window_apply`; local-coordinate
+  pointer input with a scoped hit test, activation; transient centring under the Global policy. Decisions D1-D8 as
+  in the plan: P1 byte order merged first; P2 (AtMostOneClient) still open, RL0 refuses SubstructureRedirect on the
+  root itself; no `--rootless` flag; `next_wakeup` is RL1's; screensaver window excluded; a close never kills, only
+  `ForceKill`; `ScreenLayout` takes exactly one output; `PopupDismissed` left out. Review follow-ups: transients
+  re-resolve when the parent maps or goes away; the WM check window is excluded by identity.
+
+- **2026-10-19 property byte order (branch `fix/property-byte-order`, RL0 prerequisite P1):** oracle
+  `tools/vng-scenarios/prop-order-probe.py` (`prop-order`, stored golden from Xorg 21.1.24), a raw `B` and a raw `l`
+  client on one window. Before: a BE writer's CARDINAL [0x01020304, 5] read as [0x04030201, 0x05000000] to LE
+  clients (and the reverse), ListProperties sent LE atoms to BE clients, a BE client read its own RandR output
+  property reversed, and a type-mismatch GetProperty returned bytes_after in bytes (20) where Xorg returns the item
+  count (5). Fixed: ChangeProperty swaps format-16/32 data in the reader (`request_swap.rs`
+  `swap_property_data_tail`, shared with RRChangeOutputProperty), GetProperty/GetOutputProperty swap per item for BE
+  readers (`x11::swap_property_items`). Internal readers all decoded LE already and are now right for BE writers too
+  (`_XKB_RULES_NAMES` is format 8; the clipboard bridge is an `l` client). Open: XI device properties diverge from
+  Xorg, which leaves a BE writer's data unswapped on input but swaps it on output (`Xi/xiproperty.c`
+  `SProcXIChangeProperty` vs :1229; XI1 the same at :1027 vs :988; XI2 measured), so on Xorg a BE client reads its
+  own value reversed; yserver swaps
+  both ways (`canonicalize_xi_property_data`) and was left so; `PROBE_FULL=1` prints it. RotateProperties (opcode
+  114) was BadRequest for every client; now `handle_rotate_properties` follows `ProcRotateProperties`
+  (`dix/property.c:133-200`), measured in the same golden: property `(i+delta) mod n` takes property i's
+  type/format/data, one NewValue per listed atom in list order, no events for `delta mod n == 0`; errors atom by
+  atom (BadAtom, BadMatch for a later duplicate with Xorg's leftover errorValue = window or previous atom, BadMatch
+  for a missing property).
+- **2026-10-18 redirected backing geometry (branch `fix/redirected-backing-geometry`, plan
+  `plans/2026-10-18-redirected-backing-geometry.md`):** a redirected window's backing now holds what Xorg's pixmap
+  holds. Oracle: `tools/vng-scenarios/redirected-backing-probe.c` (`redirected-backing`, `golden=live`), Xorg 21.1.24
+  vs yserver in vng. Fixed: **D** core draws/reads name the window, not its backing pixmap, so the backend applies the
+  content offset `bw` and ClipByChildren (PutImage, text, CopyPlane, fills, GetImage, SHM); Present completions still
+  fence on the backing (`present_completion_host`). **D2** damage reaches a parent at `x + bw`. **G**
+  `reallocate_redirected_backing` = `compReallocPixmap`: parent seed, no leaf release/restore round trip; the core
+  copies W's content NW from OLD, then `move_subwindows_for_gravity` carries gravity children out of OLD (sources
+  captured at the old positions, copied bottom to top); OLD is retained until then and a failed realloc keeps W on
+  OLD. **C/CF/U** `clip_list` computes `borderExposed` (`border_ring_clip`, `Exposure.border`) and every exposure
+  site paints it (`paint_window_border_rects`, `PW_BORDER`) before the window's exposures. **M/MB** rings painted into
+  an ancestor's backing are clipped to the parent's content and minus higher siblings. **N** a nested redirect seeds
+  from the ancestor backing only (no leaf overlay under a redirected ancestor; `debug_assert`). Measured, kept: a
+  resized redirected bordered window reports its ring once; Xorg twice (`borderExposed` + the `compRepaintBorder` work
+  proc). Out of scope / open: raw damage rect granularity (Xorg `extents ∩ clip` per op; the probe gates coverage,
+  raw rects in `damage-raw.log`); nested unredirect restores leaves, Xorg writes the parent pixmap; tiled or
+  ParentRelative borders of a moved+resized window are not exposed whole as Xorg does; UnmapGravity children are not
+  unmapped; ForgetGravity still copies W's own content. A border-damage probe A/B is byte-identical to master.
+
+- **2026-10-15 macOS M3: window, scale, clipboard, bundle (branch `feat/macos-m0`, plan
+  `plans/2026-10-14-macos-m3-window.md`):** the X screen follows the window. Resizes are coalesced per frame-clock
+  tick (`surface/resize.rs` `ResizeCoalescer`); the root and the output size are separate, so RRSetScreenSize and a
+  RandR mode switch resize the window (`ShellUi` window request with a token), and a host resize goes through the
+  core's `host_screen_resized`. Root storage is resized as prepare/commit (`render` backend), shared with the KMS
+  `xrandr --fb` path. `--scale auto|1|2`: X pixels per point (`auto` = one per point) and a NEAREST slot→swapchain
+  blit at the copy factor; the factor and the WINDOW-0 millimetres (CGDisplayScreenSize) are posted with every
+  `Resized` and passed in `WindowSpec` at startup; the screen keeps 96 DPI. CLIPBOARD is bridged to NSPasteboard by
+  an internal X client on a socketpair (`surface/clipboard/`, flagged `internal`: not counted, no auth, no XDMCP);
+  UTF8_STRING/STRING/TEXT/TARGETS/TIMESTAMP/MULTIPLE, INCR both ways, keeps the text when the X owner exits.
+  Quitting with X clients connected asks first (internal clients excluded). `just macos-bundle` builds
+  `target/yserver.app` (Homebrew Mesa via `VK_DRIVER_FILES`, lowest free display from `:1` in the title, log in
+  `~/Library/Logs/yserver.log`). The core thread flushes Core Animation after each swapchain build (KosmicKrisp sets
+  layer properties there). Verified on eiger: scale, resize at scale 2, mm (ruler), clipboard (589 KB / 969 KB
+  byte-identical, owner gone), bundle, quit dialog. Black startup frames and full-screen black/stale frames are a Mesa
+  26.2.x KosmicKrisp bug, fixed on Mesa main (51ffe555 suspected); HEAD fixes both. Homebrew xterm in Latin-1
+  ("locale not supported by Xlib") is the `libx11` bottle's misnamed locale modules (Homebrew/homebrew-core#318717),
+  not the server. Open: moving the window to a screen with another backing scale (no second screen yet); PRIMARY,
+  clipboard images/files (M4).
+
+- **2026-10-14 macOS M2: input and cursor (branch `feat/macos-m0`, plan `plans/2026-10-14-macos-m2-input.md`):**
+  keyboard, mouse, scroll and the X cursor in the rooted window. A local key monitor sends every key to X (Cmd =
+  Super_L/R on Mod4, Option = Alt on Mod1, Cmd-Q = Super+Q; quit is the close button, the menu's Quit without a
+  shortcut, or SIGTERM). The OS-neutral translator (`src/surface/input/`: kVK→evdev table, sided modifiers from
+  device bits, Caps Lock toggles, dropped autorepeat, releases on focus loss, pointer/scroll front-end over the
+  shared `src/scroll_v120.rs`) feeds `Message::HostInput` from two XI slaves ("macOS keyboard"/"macOS pointer", no
+  Device Node). Key repeat is the core's (XKB controls); Num Lock starts locked; Caps Lock is re-synced when the
+  window becomes key. The cursor is an `NSCursor`: the surface platform is the scene's cursor plane and hands the
+  shown image to the shell; XWarpPointer warps the host pointer (`Platform::host_pointer_warped`). Linux tests the
+  translator (unit) and the backend side (lavapipe); `src/macos/` is compiled on macOS only. Unverified constants
+  (some kVK, the NX device masks) are listed in the plan's implementation notes.
+
+- **2026-10-14 macOS M1: rooted window (branch `feat/macos-m0`, plan
+  `plans/2026-10-14-macos-m0-m1.md`):** the default macOS invocation opens one AppKit window
+  (`--geometry WxH` X pixels, CAMetalLayer) and runs the core loop on a worker thread; `--headless` stays a test
+  mode. The surface platform (`src/surface/`, OS-neutral) presents through a per-surface Vulkan swapchain: the scene
+  composes into one of two offscreen slots, then a non-blocking acquire, a slot→image copy and `vkQueuePresentKHR`;
+  a frame retires on the first frame-clock tick after its copy fence. Present is Copy-only, paced by the clock
+  (CVDisplayLink on macOS), which wakes the core only for a pending frame or an armed MSC target. RandR shows one
+  `WINDOW-0` output. Linux covers all of it on lavapipe through `VK_EXT_headless_surface`
+  (`surface::tests`); the AppKit layer (`src/macos/`) is compiled and run on macOS only. No input yet (M2).
+  Recipe: `just macos-run [display] [geometry] [log]`.
+
+- **2026-10-14 tearing-on-demand Task 1:** Each opened KMS device now records
+  `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`; Present `Async` capability follows the
+  device owning a window's selected CRTC. `AsyncMayTear` remains unset and no
+  page-flip behavior changes in this task. Protocol and encoding tests cover
+  the advertisement; hardware validation remains in Task 6.
+
+- **2026-10-14 tearing-on-demand Task 2:** Atomic direct and composed requests
+  can now carry `PAGE_FLIP_ASYNC` without cursor properties or `OUT_FENCE_PTR`.
+  An async `EINVAL` retries the same frame with Vsync and records consecutive
+  failures by stream and shape; two failures suspend that shape. Production
+  callers still select Vsync until Task 3 wires the Present request policy.
+  Recording-sink and Vulkan-backed scene fixtures cover both submit routes;
+  hardware validation remains in Task 6.
+
+- **2026-10-14 tearing-on-demand Task 3:** Present `Async` requests can enter
+  tearing after probation when the full-root gate passes with the cursor term
+  ignored. The owner is the paint destination host window; exits clear the
+  async ledger and restore normal cursor policy. Tearing suppresses hardware
+  cursor planes, while direct async scanout remains available when no plane is
+  visible. Hardware validation remains in Task 6.
+
+- **2026-10-14 tearing-on-demand Task 4:** Composed scene passes use async only
+  after the shared gate revalidates the owner. Visible-cursor transitions from
+  held direct scanout hand off through a composed pass; the cursor plane is
+  hidden at unflip retirement, and Copy fallback sources are registered for
+  safe replacement. Hardware validation remains in Task 6.
+
+- **2026-10-14 tearing-on-demand Task 5:** Visible software-cursor motion while
+  tearing is on recomposes at most once per shortest output refresh interval.
+  The core-loop deadline triggers the deferred pass; client Copy damage remains
+  immediate, and composed submits or tearing exits clear the timer state. Exit
+  tests cover HW, transformed-output SW, XFIXES-hidden, DPMS-off, and owner
+  destruction. Hardware validation remains in Task 6.
+
+- **2026-10-14 tearing-on-demand Amendment A, item 1:** Cursor records cache
+  whether every final BGRA alpha byte is zero; an animated cursor is hidden
+  only when all its snapshotted frames are transparent. The effective-hidden
+  predicate combines XFIXES state, missing cursor images, and image transparency
+  across scene visibility, direct scanout, tearing handoff, pointer motion, and
+  VT/DPMS rearm. Cursor tests cover core, glyph, RENDER, recolor, animation, and
+  transparent-to-opaque handoff. The segfault seen in
+  `entry_waits_for_queued_show_on_retire` was a real defect: the unflip shadow
+  copy read a null Vulkan image. It now rejects an unavailable image before
+  copying.
+
+- **2026-10-15 tearing-on-demand Task 6 (telemetry and bench):** loop telemetry
+  adds `tearing_summary` (async/vsync submits, EINVAL fallbacks, suspensions,
+  entries and exits) and `present_latency_summary`. In the latter,
+  `async_flip_turnaround` is ioctl to event receipt. `present_to_flip_event`
+  maps the kernel flip timestamp into the submit clock and prints `n/a` when it
+  cannot detect the clock domain (nvidia-drm today).
+  `tools/cursor-bench/tests/tearing.sh` runs mpv (Vulkan immediate/mailbox/fifo)
+  and GL interval 0 with the cursor visible and XFIXES-hidden. `aggregate.sh`
+  summarises the logs and skips unavailable windows. The cursor-only
+  recomposition cap now also covers `run_core`'s `mark_dirty` wake: `build_scene`
+  fell from about 5.7k/s to about 405/s with a moving visible cursor.
+
+- **2026-10-15 tearing-on-demand Amendment B (core supersession parity with
+  Xorg, spec §1b):** the core scraps a pending Present only while it is parked
+  for a future MSC (whether or not its fence has signalled). A due Present waiting
+  for its acquire/source fence is never scrapped; it executes
+  when the fence signals, in arrival order. It completes as Skip if a newer
+  same-window, same-target Present has already executed. This applies to every
+  Present, not only while tearing; Vsync stays paced by vblank. Before this, an
+  explicit-sync Vulkan client that presents before the GPU finishes (NVIDIA WSI,
+  radv, DXVK, CS2) had almost every frame scrapped: CS2 sent 330–360 Presents/s
+  with 300–340/s scrapped and stuttered. A `run_core`-driven regression with late
+  acquire points covers it.
+
+  Hardware (Xid 0 throughout):
+  - NVIDIA RTX 5060 Ti (driver 615), mpv Vulkan immediate with XFIXES-hidden
+    cursor: 519–549 direct async flips/s, every Present shown, 0 core skips
+    (about 77/s before Amendment B). Present→submit p50 about 43 µs (p99
+    about 140 µs); Present→flip is `n/a` on nvidia-drm (see below). GL interval 0: 155 flips/s for 164–186 Presents/s.
+  - NVIDIA, CS2 for about 8 minutes: median 312 direct flips/s (p10 231, max 413),
+    1.0 flip per Present, no second below 60. Menus (composed, cursor visible):
+    median 199/s. The user's verdict: smooth, low-latency play.
+  - AMD iGPU (card0), mpv Vulkan immediate with XFIXES-hidden cursor, after
+    Amendment B: 507–536 direct async flips/s, 1.0 per Present, 0 core skips
+    (7/s before Amendment B). Present→submit p50/p99 10/34 µs, async
+    turnaround p50/p99 41/87 µs. Present→flip reads about 0 µs: amdgpu stamps
+    async flips with the last vblank, so that metric is not meaningful there.
+  - AMD iGPU (card0), GL: 329 direct async flips/s (0.999 per Present),
+    present_to_submit 10 µs, async turnaround 58 µs. Composed path with a visible
+    cursor: 474/s at 0.47 ms composite GPU time.
+  - Controls: mpv mailbox and fifo never entered tearing.
+  - Known gaps: `present_to_flip_event` is `n/a` on NVIDIA. AMD fifo with a
+    moving cursor runs at about 30 flips/s (pre-existing, also on master).
+
+- **2026-10-13 hardware cursor in the wlroots model (branch `feat/atomic-cursor`):** on every device whose
+  cursor planes expose `CRTC_X`/`CRTC_Y`, the cursor is driven through atomic commits. Each CRTC has one commit
+  stream with at most one commit in flight:
+  - the cursor position rides the scene's commits (shared and copied flips, direct scanout, composed unflip);
+  - a cursor-only `NONBLOCK | PAGE_FLIP_EVENT` commit goes out from the scheduling pass when the CRTC is idle;
+  - the scene and direct scanout wait for it like for their own flip.
+
+  This removes the NVIDIA stall. nvidia-drm has no `atomic_async_check`/`atomic_async_update`, and its own
+  `nv_drm_atomic_commit` ignores `legacy_cursor_update`, so every legacy cursor ioctl was a blocking commit costing
+  about a vblank. The NVIDIA software-cursor policy is deleted, so direct scanout now engages on NVIDIA.
+
+  Also: a cursor hidden on every output (XFIXES `HideCursor`) no longer counts as a software cursor, so direct scanout
+  engages when a game hides the cursor before going fullscreen (on every GPU).
+
+  Rejections:
+  - after an EBUSY, the CRTC waits for its next flip event before another cursor-only attempt;
+  - other errors hide the plane through the legacy ioctl and fall back to the software cursor;
+  - accepted cursor-only commits join the old-event drain on topology changes, DPMS and VT release.
+
+  Measured on NVIDIA (card1), branch vs. master's software cursor and master's legacy hardware cursor:
+  - 0 core round trips over 8 ms on pure motion, drag and animation plus motion (legacy: 900–1200);
+  - drag lag p99 12 px (legacy 13–19);
+  - 2066 direct submits in fullscreen with motion;
+  - with the cursor hidden before fullscreen: 863 direct submits, where master gets 0;
+  - EBUSY 0, NONBLOCK ioctl p99 under 0.4 ms, motion-to-visible about 20 ms;
+  - a MATE session through 5 DPMS cycles while moving.
+
+  amdgpu and i915 now use the same model: their cursor can be up to a frame later than with the immediate legacy
+  move. `tools/cursor-bench/` measures this on a given card. On an AMD integrated GPU (amdgpu) every bench row matches master's legacy cursor and
+  motion-to-visible p99 stays at 20–30 ms. i915 and the VT switch are not yet validated on hardware. Plan: `docs/superpowers/plans/2026-10-13-atomic-cursor-wlroots-model.md`.
+
+- **2026-10-13 phase 3b, scene compositor in `yserver-render` (branch
+  `refactor/phase3b-scene-split`):** the scene (`kms::render::scene`, with
+  its tests) and `WindowGeometry`/`WindowsMap` (`kms::render::window_geometry`)
+  now live in `yserver-render`, and `yserver` re-exports them at the old
+  paths. The scene reads core state and output geometry from a borrowed
+  `SceneInput`, and drives outputs only through `&mut dyn OutputSink`
+  (frame slots, `finish_frame`, flip retirement, the copied route) and
+  `CursorPlaneSink`. Their KMS implementation, including the scanout
+  `ComposeRenderTarget` impls, is in `yserver`'s `platform/scene_sink.rs`.
+  **The scene's log target is now `yserver_render::kms::render::scene…`.**
+  Details: `docs/superpowers/plans/2026-10-13-phase3b-scene-split.md`
+  ("Execution").
+
+- **2026-10-13 phase 3a, `yserver-render` crate (branch
+  `refactor/phase3a-render-crate`):** `crates/yserver-render` holds the
+  renderer: `kms::vk` (device, pipelines, ops, dri3; not `scanout`) and
+  `kms::render::{engine, store, frame_builder, gpu, …}`, with the glslc
+  `build.rs`. It depends on ash/libc/log/thiserror/yserver-protocol only (no
+  drm/gbm/input/udev/core). `yserver` re-exports the modules at the old
+  `kms::{vk, render}` paths. Seams: `GpuCore` (the GPU half of
+  `PlatformBackend`, engine/store take `&mut GpuCore`), `Box<dyn
+  PresentCompletionEntry>` for Present completions, a `test-support` feature
+  for the fixtures `yserver`'s tests use. Timings on silence: release/32
+  −11%, dev/4 −11%, test/4 −4%, release/4 −2%. **Log targets of the moved
+  modules are now `yserver_render::kms::…`** (`RUST_LOG=yserver_render=debug`,
+  or `yserver_render::kms::render::telemetry=info`); explicit targets such as
+  `yserver::kms::render::store` are unchanged. Details:
+  `docs/superpowers/plans/2026-10-13-phase3-render-crate.md` ("Execution
+  (3a)").
+
+- **2026-10-13 server-reset test race:** `an_old_setup_completion_cannot_create_a_client_in_the_new_generation`
+  wrote its GetInputFocus after sending the stale completion; when the core
+  had already discarded it (dropping the socket) the write failed with EPIPE.
+  The request is now queued first. Reproduced with a 100 ms delay after the
+  send; a disabled generation filter still fails the test.
+
+- **2026-10-13 FreeBSD setup documentation:** replace GhostBSD development
+  packages with FreeBSD's base-system bzip2/zlib, list graphics/input build
+  dependencies explicitly, and document the separate Vulkan/kernel drivers.
+
+- **2026-10-13 X-Resource test portability:** retain the Linux PID identity
+  assertions and check an empty PID identity reply on non-Linux targets,
+  matching the current implementation. XID identities remain tested everywhere.
+
+- **2026-10-13 FreeBSD GetImage test hang:** use the capture transport for
+  the redirected off-screen window test. Its 120 KB reply could fill the
+  blocking Unix socket before the test began reading it.
+
+- **2026-10-13 FreeBSD probe test portability:** use `/usr/bin/true` in
+  supervisor fixtures; `/bin/true` is absent on FreeBSD and caused the
+  post-spawn exchange test to fail before spawning. Assertion failures now
+  include the actual supervisor error.
+
+- **2026-10-12 explicit imports (branch `refactor/explicit-imports`):** the
+  121 non-test `use super::*` globs from the phase-1/2 splits and the
+  dispatcher roots' private downward globs are explicit `crate::` imports;
+  `clippy::wildcard_imports` is on. 173 split-tree items narrowed to private
+  / `pub(super)`. Tools: `split globs`, `tools/split/prune-unused-imports.py`,
+  `tools/use-only-diff.py`, `split verify` `[[sibling_moves]]`. Details and
+  deviations: `docs/superpowers/plans/2026-10-12-explicit-imports.md`
+  ("Execution"). FreeBSD check pending (jos).
+
+- **2026-10-12 FreeBSD dependency build workaround:** pin `libc` to
+  `0.2.189`; `0.2.190` removed `NOTE_PCTRLMASK` on FreeBSD, which
+  `nix 0.31.3` still requires. Revisit the pin when upstream compatibility
+  is restored.
+
+- **2026-10-11 copied PRIME transport (#235):** the copied transport prefers
+  a compatible non-`DEVICE_LOCAL` memory type on the renderer (an iGPU sink
+  cannot read a dGPU's VRAM); same-device exports keep `DEVICE_LOCAL`. Only
+  the transport is padded to a 64-pixel width so RADV GFX9+ can import
+  NVIDIA's 128-byte-aligned linear pitch; the render target, copy regions and
+  digests keep the logical extent. The `*_two_gpu` tests need an NVIDIA + AMD
+  pair. On silence (RX 6800 + i915) the shared route qualifies first, so the
+  copied path is not exercised there.
+
+- **2026-10-07 #100 fix:** submit paint before
+  DamageSubtract consumes coalesced damage and before XFixes FetchRegion
+  publishes it. The KMS boundary drains render batches, open frames and queued
+  submissions. HW-confirmed (jos, silence, upstream Plasma X11): the stale
+  Dolphin hover highlight reproduces on master and is gone with this change.
+
+- **2026-10-02 dynamic XI device registry implemented (branch
+  `feat/xi-dynamic-registry-implementation`):** KMS/libinput publishes
+  source-owned keyboard, pointer, and touchpad facets with independent
+  properties; recognized property writes commit only after libinput confirms
+  them. XI1 and XI2 expose hotplug through presence and hierarchy notifications.
+  VT continuation preserves proven source identities and settings, and server
+  reset replays the current enabled and suspended inventory into a fresh XI
+  registry. Direct touch and a server-wide acceleration default are not
+  provided. `xinput set-prop 4 ...` targets the virtual XTEST pointer and
+  configures no physical device; use each physical device's own ID, as in the
+  [per-device acceleration loop](superpowers/specs/2026-09-29-dynamic-xinput-device-registry-design.md#mouse-acceleration-configuration).
+  Each physical device has its own `Device Enabled` state for `xinput disable`
+  and `xinput enable`. Hardware verification: see PR.
+
+- **2026-09-29 RANDR CRTC rotation and reflection (branch
+  `feat/randr-rotation`):** SetCrtcConfig accepts modesetting's
+  `rotations = 0x3f`; GetCrtcInfo and the three RANDR events carry the
+  rotation. The rotation is combined with the client transform as
+  `RRTransformCompute` (`randr::crtc_matrix`, fixed point) and runs through
+  #185's intermediate + scale pass (now a full affine pass, pixman-exact
+  nearest), SW cursor, confinement and framebuffer-space GetImage.
+  SetScreenSize's crop box swaps for 90/270 (measured). Client matrices stay
+  pure scale (D2). RANDR 1.0 (`xrandr -o`) is real now: GetScreenInfo lists
+  the first output's mode sizes and `RRVerticalRefresh` rates (rate lists
+  only for a ≥ 1.1 client, per-client QueryVersion kept), SetScreenConfig
+  follows `ProcRRSetScreenConfig` (size-by-version BadLength, statuses
+  InvalidConfigTime/InvalidTime/Failed, lastSetTime moves on every success,
+  other CRTCs off + screen resized when the size changes, CRTC at 0,0) over
+  the SetCrtcConfig path. vng A/B (`xrandr-rotate*.sh`,
+  `xrandr-orientation.sh`, `pointer-rotate*.sh`): geometry, root captures,
+  scanout-vs-matrix and pointer deltas identical to Xorg. Divergences: Xorg
+  keeps a rotated HW cursor for rotation without a client transform (we use
+  the SW cursor); SetScreenConfig reconfigures the first CRTC in place, so
+  Xorg's intermediate disable notifies (Screen/Crtc off/Output) are not
+  sent; an in-place rotation also sends OutputChangeNotify (Xorg: Crtc
+  only); yserver's initial `lastSetTime` is 1, not server start, so a stale
+  client time before the first set is not InvalidTime; screen mm at startup
+  round (339×212) where Xorg truncates (338×211). Two-output vng runs hang in
+  the known blocking DRM read when a CRTC is re-enabled (not this branch).
+  Spec addendum in the #185 design doc.
+
+- **2026-09-29 RANDR CRTC transforms / fractional scaling, partial (#185,
+  branch `feat/185-crtc-transform`):** `hasTransforms = 1`; SetCrtcTransform
+  / GetCrtcTransform with Xorg's validation order and pending→current on
+  SetCrtcConfig; footprint = `pixman_transform_bounds` port
+  (`randr/transform.rs`). Accepted: pure scale, filters nearest/bilinear
+  (+ fast/good/best); client matrices with translation, rotation, shear,
+  reflection or projection, and convolution → BadMatch on purpose (CRTC
+  rotation/reflection through SetCrtcConfig is supported, see the entry
+  above). A transformed output composites into a
+  footprint-sized intermediate, then a scale pass writes the mode-sized
+  scanout; direct scanout off and SW cursor on every output while any CRTC is
+  transformed; root reads in framebuffer space with the SW cursor removed
+  (save-under, as misprite). SetScreenSize's crop check stays on the
+  untransformed box (measured). Design + measurements:
+  `docs/superpowers/specs/2026-09-29-randr-crtc-transform-design.md`; probes
+  `tools/vng-scenarios/xrandr-scale*.sh`, `pointer-scale*.sh`. ★ RANDR
+  timestamps: muffin compares `timestamp` with its last SetCrtcConfig reply
+  (`meta-monitor-manager-xrandr.c:1427`) and rebuilds its config on a
+  mismatch (Cinnamon came back at 200%); only SetCrtcConfig/SetScreenConfig
+  may move `timestamp`, never SetScreenSize or output-property writes, as
+  Xorg. Also: GetMonitors/GetScreenResources replies now honour the client's
+  byte order. HW: silence, two 2560×1440, Cinnamon scale-down 100/125/150%
+  and back, screenshot without pointer.
+
+- **2026-09-28 RECORD 1.13, partial (#180, branch `feat/180-record`):**
+  advertised (major 154, first error 189) so python-xlib/pynput find it.
+  All eight requests with Xorg's validation order and GetContext range
+  rebuild (`core_loop/record.rs`, wire in `x11::record`). Recorded: core
+  device events KeyPress..MotionNotify (once, before grabs, not on replay;
+  autorepeat as a press with the sequence field set, no release),
+  ClientStarted (the setup bytes the client got) and ClientDied. Request,
+  reply, error and delivered-event ranges are accepted, validated, stored and
+  returned by GetContext but NOT recorded yet; XI1 device events neither. The
+  enabling client is suspended via `client_runnable`; a data connection whose
+  write fails (incl. `OUTBOUND_CAP`) stops recording and is disconnected from
+  the core loop (`take_failed_recorders`). Ground truth:
+  `tools/record-probe.c` on Xvfb 21.1.24; vng A/B
+  (`tools/vng-scenarios/record-host.sh yserver|xorg`) matches apart from the
+  items below. Deviations: one reply per element (Xorg batches), zeroed pads,
+  stale Xorg error values sent as 0, ClientDied rec seq is the 16-bit client
+  sequence, retained clients' contexts are freed, the nested backend records
+  host autorepeat as release+press pairs. Pre-existing, not RECORD: XTEST-held
+  keys do not autorepeat on yserver (XTEST bypasses the repeat timer). Xorg
+  and Xvfb 21.1 abort (`free(): invalid pointer`) in the server reset after
+  the probe's `basic` scenario, so run Xvfb with `-noreset`.
 - **2026-09-26 XI2 raw key events (#173, branch `fix/173-xi2-raw-keys`):**
   `XI_RawKeyPress` / `XI_RawKeyRelease` were never generated (only the pointer
   path had raw events), so global-hotkey clients selecting them on the root
@@ -710,7 +1251,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   and never detaches a live CRTC or clears client layout policy. Thus a light
   disconnect reports `RR_Disconnected` while retaining the current CRTC/mode
   until the heavy physical boundary turns it Off and emits the scoped CRTC
-  transition. A same-mode EDID-only replacement remains intentionally
+  transition. *(Superseded 2026-10-20, #273: the heavy boundary also keeps the
+  CRTC, and a disconnected output lists no modes.)* A same-mode EDID-only replacement remains intentionally
   undetectable until that heavy boundary. Output/CRTC XIDs stay stable,
   disconnected notifications carry the real connection byte, and a programmed
   timing omitted by a replacement monitor remains in ScreenResources until it
@@ -1579,7 +2121,8 @@ lives in [`code-quality-audit-2026-07-26.md`](code-quality-audit-2026-07-26.md).
   polls made forced `GetScreenResources` refreshes call full
   `discover_outputs`, redundantly enumerating planes, properties, modifiers,
   and hypothetical assignments. The forced refresh now uses a connector-only
-  connection/mode probe and retains last-known modes across disconnect.
+  connection/mode probe and retains last-known modes across disconnect
+  (no longer: since #273 a disconnected output lists no modes, like Xorg).
   Hardware testing showed no regression, but under GPU load the connector
   ioctl itself still produced an 89--94 ms opcode-128 stall, so this removes
   redundant work without fixing that kernel-facing latency.
@@ -7255,13 +7798,15 @@ regression and must not be reverted on this evidence. The diagnostic selector
 and harness remain useful reproduction tools, but `post95` stays the production
 behavior.
 
-This branch deliberately stops at VBlank-synchronized direct scanout. It does
-not advertise async-tear capability or submit `PAGE_FLIP_ASYNC`. On-demand
-tearing is a separate follow-up (Phase C): only a Present that both qualifies
-for fullscreen direct scanout and carries an effective `PresentOptionAsync` or
-`PresentOptionAsyncMayTear` request may use an async KMS flip, and only when the
-DRM device reports support. Synced Presents, ineligible windows, and unsupported
-devices retain the tear-free path provided here.
+Production flips still use VBlank synchronization at this task boundary. Task 1
+advertises `PresentCapabilityAsync` on devices that report async page-flip
+support, and Task 2 adds async request building, same-frame Vsync fallback and
+per-stream shape suspension. No production caller requests `PAGE_FLIP_ASYNC`
+until Task 3 wires the Present request policy. The intended policy is limited
+to eligible fullscreen direct Presents carrying an effective
+`PresentOptionAsync` or `PresentOptionAsyncMayTear` request on a supporting DRM
+device; synced Presents, ineligible windows and unsupported devices retain the
+Vsync path.
 
 ## Damage-clipped repaint for non-composited desktops (branch `fix/noncomposited-damage-repaint`, 2026-09-01 → 2026-09-03)
 

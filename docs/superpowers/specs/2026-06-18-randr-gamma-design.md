@@ -2,6 +2,12 @@
 
 **Date:** 2026-06-18 · **Status:** approved, codex-reviewed (2 passes), pre-plan · **Scope:** RANDR `GetCrtcGammaSize` / `GetCrtcGamma` / `SetCrtcGamma` (CRTC color LUT), KMS-backed, persisted across modeset/VT-switch/DPMS.
 
+> **Superseded transport (2026-10-23):** the LUT no longer goes through the legacy `drmModeCrtcSetGamma` ioctl. It
+> rides the CRTC's own atomic commits as `GAMMA_LUT`, and `SETGAMMA` is removed; the cache, sizes and reapply points of
+> this spec are unchanged. The make-or-break question below was answered on hardware: legacy gamma under active flips
+> cost a direct-scanout client one frame per change on AMD and NVIDIA. See
+> [`plans/2026-10-23-gamma-atomic-lut.md`](../plans/2026-10-23-gamma-atomic-lut.md).
+
 ## Motivation
 
 `redshift`, `gammastep`, and GNOME Night Light are flatly broken on yserver today: `GetCrtcGammaSize` returns `0` (`process_request.rs:2452`), `GetCrtcGamma` returns an empty ramp (`:2460`), and `SetCrtcGamma` is not dispatched at all. A client that asks for the gamma size gets `0` and either errors or no-ops. This is a real-client divergence from Xorg, the kind worth fixing (see `docs/superpowers/findings/2026-06-17-tech-debt-stub-audit.md`, Tier 4, and the re-prioritisation under the Xorg-baseline lens).

@@ -92,6 +92,7 @@ impl Backend for HostX11Backend {
         match ev {
             HostInputEvent::Key(raw) | HostInputEvent::KeyRepeat(raw) => {
                 self.push_pending_host_event(HostEvent::Key(HostKeyEvent {
+                    origin: raw.origin,
                     pressed: raw.pressed,
                     keycode: raw.keycode,
                     time: raw.time,
@@ -102,8 +103,15 @@ impl Backend for HostX11Backend {
                     state: raw.state,
                 }));
             }
-            HostInputEvent::PointerMotion { x, y, time, .. } => {
+            HostInputEvent::PointerMotion {
+                origin, x, y, time, ..
+            } => {
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    // XTEST selects its virtual device with GetXTestDevice
+                    // (Xext/xtest.c:351); preserve that source ID through
+                    // nested host fanout. Physical nested input arrives as
+                    // NestedHost on the same path.
+                    origin,
                     kind: PointerEventKind::MotionNotify,
                     host_xid: container,
                     detail: 0,
@@ -121,6 +129,7 @@ impl Backend for HostX11Backend {
                     // here (0). Real relative deltas come from the KMS path.
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 }));
             }
             // ynest is a nested backend fed by the parent X server's input,
@@ -128,23 +137,26 @@ impl Backend for HostX11Backend {
             // has no XI2 smooth-scroll valuators to signal one. No-op.
             HostInputEvent::PointerScrollStop { .. } => {}
             HostInputEvent::PointerButton {
+                origin,
                 button,
                 pressed,
                 time,
+                ..
             } => {
                 // `button` is a Linux input code (BTN_LEFT = 0x110, …).
                 // Translate to X11 button numbers — same mapping as
                 // `KmsBackend::process_pointer_button`.
                 let detail = match button {
-                    0x110 => 1, // BTN_LEFT
-                    0x111 => 3, // BTN_RIGHT
-                    0x112 => 2, // BTN_MIDDLE
-                    0x113 => 8, // BTN_SIDE
-                    0x114 => 9, // BTN_EXTRA
-                    0x180 => 4, // SYNTH_SCROLL_UP
-                    0x181 => 5, // SYNTH_SCROLL_DOWN
-                    0x182 => 6, // SYNTH_SCROLL_LEFT
-                    0x183 => 7, // SYNTH_SCROLL_RIGHT
+                    0x110 => 1,  // BTN_LEFT
+                    0x111 => 3,  // BTN_RIGHT
+                    0x112 => 2,  // BTN_MIDDLE
+                    0x113 => 8,  // BTN_SIDE
+                    0x114 => 9,  // BTN_EXTRA
+                    0x115 => 10, // BTN_FORWARD -> X 10 via btn_linux2xorg (xf86-input-libinput/src/xf86libinput.c:253-272)
+                    0x180 => 4,  // SYNTH_SCROLL_UP
+                    0x181 => 5,  // SYNTH_SCROLL_DOWN
+                    0x182 => 6,  // SYNTH_SCROLL_LEFT
+                    0x183 => 7,  // SYNTH_SCROLL_RIGHT
                     _ => {
                         log::debug!(
                             "ynest: dropping HostInputEvent::PointerButton for unknown linux code 0x{button:x}"
@@ -158,6 +170,7 @@ impl Backend for HostX11Backend {
                     PointerEventKind::ButtonRelease
                 };
                 self.push_pending_host_event(HostEvent::Pointer(HostPointerEvent {
+                    origin,
                     kind,
                     host_xid: container,
                     detail,
@@ -171,11 +184,16 @@ impl Backend for HostX11Backend {
                     child: 0,
                     raw_dx: 0,
                     raw_dy: 0,
+                    tree_change: false,
                 }));
             }
             // Device add/remove are plumbing-only in the host-X11 backend;
             // the nested backend has no XI2 device registry of its own.
-            HostInputEvent::DeviceAdded(_) | HostInputEvent::DeviceRemoved { .. } => {}
+            HostInputEvent::DeviceAdded(_)
+            | HostInputEvent::DeviceSuspended { .. }
+            | HostInputEvent::DeviceResumed(_)
+            | HostInputEvent::DeviceRemoved { .. }
+            | HostInputEvent::Rootless(_) => {}
         }
     }
 
@@ -183,14 +201,22 @@ impl Backend for HostX11Backend {
     fn on_page_flip_ready(
         &mut self,
         _state: &mut crate::server::ServerState,
-        _drm_fd: std::os::fd::RawFd,
+        _drm_fd: crate::fd::RawFd,
     ) {
     }
 
     /// F2: host fd registered with the core's poller. Readiness drives
     /// `drain_host_socket`.
-    fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)> {
+    #[cfg(unix)]
+    fn poll_fds(&self) -> Vec<(crate::fd::RawFd, crate::backend::BackendFdKind)> {
         vec![(self.host_fd(), crate::backend::BackendFdKind::HostX11)]
+    }
+
+    /// TODO(windows): a poll source is a socket there; no core poller
+    /// registers one yet.
+    #[cfg(windows)]
+    fn poll_fds(&self) -> Vec<(crate::fd::RawFd, crate::backend::BackendFdKind)> {
+        Vec::new()
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

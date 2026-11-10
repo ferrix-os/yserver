@@ -3,6 +3,9 @@
 //! readiness handshake. See
 //! `docs/superpowers/specs/2026-06-12-lightdm-launch-design.md`.
 
+#[cfg(windows)]
+use std::path::PathBuf;
+#[cfg(unix)]
 use std::{
     fs::{self, OpenOptions},
     io::{self, ErrorKind, Read, Write},
@@ -16,12 +19,22 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// `-displayfd`'s descriptor; Windows has none to name, but parses it alike.
+#[cfg(windows)]
+type RawFd = i32;
+
 use yserver_core::core_loop::ResetPolicy;
+
+use crate::settings::{Live, Mode, SetByArgv, Settings};
 
 /// Display yserver uses when neither an explicit display nor `-displayfd`
 /// is given. 7 avoids clashing with a real Xorg on `:0` (existing
 /// convention).
 pub const DEFAULT_DISPLAY: u16 = 7;
+
+/// First display tried by [`LaunchOptions::pick_free_display`]: `:0` is left
+/// to XQuartz, whose launchd agent may own it.
+pub const FIRST_FREE_DISPLAY: u16 = 1;
 
 const TCP_PORT_BASE: u16 = 6_000;
 
@@ -109,13 +122,16 @@ pub struct LaunchOptions {
     /// `-auth FILE` — stashed for item 4, unused now.
     pub auth_file: Option<PathBuf>,
     /// Whether `-listen tcp` is the last TCP transport option in argv.
-    /// TCP remains disabled by default, matching Xorg's no-listen list.
+    /// Off by default, matching Xorg's no-listen list, except on Windows,
+    /// where TCP is the only transport.
     pub tcp_listen: bool,
     /// `--version` / `-version` — print version + git commit and exit
     /// (handled by the binary before `run()`).
     pub show_version: bool,
     /// `-layout NAME` — XKB layout for the startup keymap (Xorg-style).
     pub layout: Option<String>,
+    /// VRR policy for direct scanout: disabled or property-controlled.
+    pub vrr: VrrMode,
     /// What happens when the last established client disconnects:
     /// `-noreset` (the default), `-reset` or `-terminate`. Ordered and
     /// last-wins, like `-listen`/`-nolisten`.
@@ -123,6 +139,158 @@ pub struct LaunchOptions {
     /// XDMCP configuration: `None` unless one of `-query`, `-broadcast`
     /// or `-indirect` was given. See [`XdmcpOptions`].
     pub xdmcp: Option<XdmcpOptions>,
+    /// `--headless`: run the surface platform without a window or display
+    /// device (on KMS builds too: no DRM, no input).
+    pub headless: bool,
+    /// `--geometry WxH`: the screen size in pixels on a platform without
+    /// KMS.
+    pub geometry: Option<(u16, u16)>,
+    /// `--rootless`: every top-level becomes a native window (a recording
+    /// host with `--headless`; on a KMS build with the Wayland host, a
+    /// window of the Wayland compositor's).
+    pub rootless: bool,
+    /// `--rooted`: one window shows the whole root, also from the app bundle.
+    pub rooted: bool,
+    /// `--rootless-record DIR`: the recording host writes its event log and
+    /// every delivered frame there.
+    pub rootless_record: Option<PathBuf>,
+    /// `--scale auto|1|2`: backing pixels per X pixel in a window.
+    pub scale: ScaleOption,
+    /// Not from argv: set for a launch that cannot be given a display (the
+    /// macOS app bundle). Without `:N` and `-displayfd`, the lowest free
+    /// display from [`FIRST_FREE_DISPLAY`] is locked and used.
+    pub pick_free_display: bool,
+    /// Not from argv: started as the macOS app bundle, or on Windows (every
+    /// launch there): rootless by default, and the saved settings apply.
+    pub from_bundle: bool,
+    /// The settings that apply immediately: the stored ones from the
+    /// bundle ([`apply_settings`]), else the defaults.
+    pub live: Live,
+    /// Which stored settings argv overrode for this run.
+    pub set_by_argv: SetByArgv,
+    /// Not set by [`parse_args`]: argv changed something for this run
+    /// ([`has_argv_overrides`]), which a restart from the Settings window
+    /// does not keep.
+    pub argv_overrides: bool,
+}
+
+/// Command-line policy for adaptive sync on direct-scanned client windows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VrrMode {
+    /// VRR is disabled (the default), but inherited kernel state is cleared.
+    #[default]
+    Off,
+    /// Enable VRR only when `_VARIABLE_REFRESH` has format 32, one item, and a nonzero value.
+    Property,
+    /// Enable VRR on direct-scanned client windows, subject to NVIDIA and Mesa application lists.
+    All,
+}
+
+/// Whether `parsed` (straight from [`parse_args`]) differs from a launch
+/// without arguments; flags that change nothing do not count.
+#[must_use]
+pub fn has_argv_overrides(parsed: &LaunchOptions) -> bool {
+    *parsed != LaunchOptions::without_args()
+}
+
+impl LaunchOptions {
+    /// The options of a launch without arguments.
+    fn without_args() -> Self {
+        Self {
+            tcp_listen: cfg!(windows),
+            ..Self::default()
+        }
+    }
+}
+
+/// Rooted (one window is the root) or rootless (one native window per
+/// top-level).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShellMode {
+    Rooted,
+    Rootless,
+}
+
+/// How many backing pixels of a window one X pixel covers per axis.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleOption {
+    /// The window's backing scale, rounded: one X pixel per point.
+    #[default]
+    Auto,
+    /// A fixed factor, 1 or 2.
+    Factor(u32),
+}
+
+/// Parse `--scale`: `auto`, `1` or `2`.
+pub(crate) fn parse_scale(value: &str) -> Result<ScaleOption, String> {
+    match value {
+        "auto" => Ok(ScaleOption::Auto),
+        "1" => Ok(ScaleOption::Factor(1)),
+        "2" => Ok(ScaleOption::Factor(2)),
+        _ => Err(format!(
+            "invalid --scale argument: {value} (expected auto, 1 or 2)"
+        )),
+    }
+}
+
+/// The mode for this launch (decision 1, spec §7): an explicit flag wins;
+/// else rootless iff a window shell runs from the app bundle. `window_shell`:
+/// this build has one (a KMS build's is the Wayland host).
+///
+/// # Errors
+///
+/// The combination is refused, with the reason.
+pub fn shell_mode(o: &LaunchOptions, window_shell: bool) -> Result<ShellMode, String> {
+    if o.rooted && o.rootless {
+        return Err("--rooted and --rootless exclude each other".into());
+    }
+    if o.rootless_record.is_some() && !(o.rootless && o.headless) {
+        return Err("--rootless-record needs --rootless --headless".into());
+    }
+    if o.rootless && !o.headless && !window_shell {
+        return Err(
+            "--rootless needs --headless: KMS is never rootless, and this yserver was built \
+             without the Wayland host (the `wayland` build feature, on Linux)"
+                .into(),
+        );
+    }
+    Ok(
+        if o.rootless || (!o.rooted && window_shell && o.from_bundle && !o.headless) {
+            ShellMode::Rootless
+        } else {
+            ShellMode::Rooted
+        },
+    )
+}
+
+/// The `stored` settings under argv, for a launch from the app bundle
+/// without `--headless`; any other launch keeps the defaults. A stored
+/// window mode is `--rooted` (rootless is the bundle's default already).
+#[must_use]
+pub fn apply_settings(mut o: LaunchOptions, stored: &Settings) -> LaunchOptions {
+    if !o.from_bundle || o.headless {
+        return o;
+    }
+    if !o.set_by_argv.mode && stored.mode == Mode::Window {
+        o.rooted = true;
+    }
+    if !o.set_by_argv.scale {
+        o.scale = stored.scale;
+    }
+    o.live = stored.live;
+    o
+}
+
+/// Parse a `WxH` screen size; both sides must be non-zero.
+fn parse_geometry(value: &str) -> Result<(u16, u16), String> {
+    let invalid = || format!("invalid --geometry argument: {value} (expected WxH)");
+    let (w, h) = value.split_once(['x', 'X']).ok_or_else(invalid)?;
+    let w = w.parse::<u16>().map_err(|_| invalid())?;
+    let h = h.parse::<u16>().map_err(|_| invalid())?;
+    if w == 0 || h == 0 {
+        return Err(invalid());
+    }
+    Ok((w, h))
 }
 
 fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {
@@ -133,8 +301,8 @@ fn next_value(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<Strin
 /// hard-errors only on malformed *explicit* requests and missing values
 /// for known value-taking flags.
 pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions, String> {
-    let mut o = LaunchOptions::default();
-    let mut it = args.into_iter();
+    let mut o = LaunchOptions::without_args();
+    let mut it = args.into_iter().peekable();
     // XDMCP fields build up alongside `o` as local state, and are only
     // assembled into `o.xdmcp` at the end of the loop: `XdmcpOptions`
     // exists at all only if one of the three query-mode options was
@@ -204,6 +372,28 @@ pub fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOption
             };
         } else if arg == "-novtswitch" {
             // Known no-arg no-op (lightdm passes it).
+        } else if arg == "--headless" {
+            o.headless = true;
+        } else if arg == "--rootless" {
+            o.rootless = true;
+            o.set_by_argv.mode = true;
+        } else if arg == "--rooted" {
+            o.rooted = true;
+            o.set_by_argv.mode = true;
+        } else if arg == "--rootless-record" {
+            o.rootless_record = Some(PathBuf::from(next_value(&mut it, "--rootless-record")?));
+        } else if arg == "--geometry" {
+            o.geometry = Some(parse_geometry(&next_value(&mut it, "--geometry")?)?);
+        } else if arg == "--scale" {
+            o.scale = parse_scale(&next_value(&mut it, "--scale")?)?;
+            o.set_by_argv.scale = true;
+        } else if arg == "--vrr" {
+            o.vrr = if it.peek().is_some_and(|next| next == "all") {
+                it.next();
+                VrrMode::All
+            } else {
+                VrrMode::Property
+            };
         } else if matches!(arg.as_str(), "--version" | "-version") {
             // Print-and-exit; the binary acts on this before `run()`.
             // Keep scanning so it works regardless of position.
@@ -331,6 +521,9 @@ pub enum Resolution {
     Explicit { display: u16, lock: bool },
     /// Scan for the lowest free display (gdm-style `-displayfd`); no lock.
     AutoPick,
+    /// The lowest display from `first` whose lock and socket are free;
+    /// locked (see [`autopick_locked`]).
+    FirstFree { first: u16 },
 }
 
 /// The display-resolution table from the spec. Lock iff `-displayfd` is
@@ -347,6 +540,9 @@ pub fn resolve(opts: &LaunchOptions) -> Resolution {
             lock: false,
         },
         (None, Some(_)) => Resolution::AutoPick,
+        (None, None) if opts.pick_free_display => Resolution::FirstFree {
+            first: FIRST_FREE_DISPLAY,
+        },
         (None, None) => Resolution::Explicit {
             display: DEFAULT_DISPLAY,
             lock: true,
@@ -354,6 +550,7 @@ pub fn resolve(opts: &LaunchOptions) -> Resolution {
     }
 }
 
+#[cfg(unix)]
 /// RAII handle for an acquired display lock. Dropping removes the lock
 /// file. `run()` holds this for the server's lifetime and lets it drop
 /// *after* the socket is removed at shutdown (the lock is the
@@ -363,12 +560,14 @@ pub struct LockGuard {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for LockGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
+#[cfg(unix)]
 /// Removes the temp lock file when `acquire_lock` exits by ANY path —
 /// including `?` error propagation. The success path's hard link
 /// survives the temp's unlink, so unconditional cleanup is safe.
@@ -376,24 +575,28 @@ struct TmpGuard {
     path: PathBuf,
 }
 
+#[cfg(unix)]
 impl Drop for TmpGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
+#[cfg(unix)]
 /// `/tmp/.X<N>-lock` path for a display.
 #[must_use]
 pub fn lock_path(lock_dir: &Path, display: u16) -> PathBuf {
     lock_dir.join(format!(".X{display}-lock"))
 }
 
+#[cfg(unix)]
 enum LockState {
     Alive,
     Stale,
     Bogus,
 }
 
+#[cfg(unix)]
 fn inspect_lock(path: &Path) -> io::Result<LockState> {
     let f = match OpenOptions::new()
         .read(true)
@@ -434,6 +637,7 @@ fn inspect_lock(path: &Path) -> io::Result<LockState> {
     }
 }
 
+#[cfg(unix)]
 /// Acquire the `/tmp/.X<N>-lock` display lock using Xorg's temp-file +
 /// atomic `link()` protocol (`os/utils.c`), reclaiming stale/bogus locks.
 /// Errors with `AddrInUse` if a live server owns the display.
@@ -528,6 +732,7 @@ pub fn acquire_lock(lock_dir: &Path, display: u16) -> io::Result<LockGuard> {
     ))
 }
 
+#[cfg(unix)]
 /// Occupancy classification for a path in the socket directory.
 enum Occupancy {
     /// Nothing there — free to bind.
@@ -542,13 +747,17 @@ enum Occupancy {
     Opaque,
 }
 
+#[cfg(unix)]
 /// Probe a socket-dir path. The connect is NONBLOCKING: a blocking
 /// connect to a live-but-backlogged AF_UNIX listener waits for accept —
 /// potentially forever (a wedged server, or a hostile local user's
 /// never-accepting listener in the world-writable socket dir, must not
 /// hang the launch). EAGAIN ⇒ backlog full ⇒ the display IS occupied.
 fn probe(path: &Path) -> Occupancy {
-    use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+    use nix::{
+        fcntl::{FcntlArg, FdFlag, OFlag, fcntl},
+        sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket},
+    };
 
     let meta = match fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -558,15 +767,21 @@ fn probe(path: &Path) -> Occupancy {
     if !meta.file_type().is_socket() {
         return Occupancy::NonSocket;
     }
+    // Flags via fcntl: Apple has no SOCK_NONBLOCK/SOCK_CLOEXEC.
     let fd = match socket(
         AddressFamily::Unix,
         SockType::Stream,
-        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+        SockFlag::empty(),
         None,
     ) {
         Ok(fd) => fd,
         Err(_) => return Occupancy::Opaque,
     };
+    if fcntl(&fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).is_err()
+        || fcntl(&fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).is_err()
+    {
+        return Occupancy::Opaque;
+    }
     let addr = match UnixAddr::new(path) {
         Ok(a) => a,
         Err(_) => return Occupancy::Opaque,
@@ -582,12 +797,14 @@ fn probe(path: &Path) -> Occupancy {
     // fd is an OwnedFd — closed on drop.
 }
 
+#[cfg(unix)]
 fn chmod_socket(path: &Path) -> io::Result<()> {
     // X clients connect as the invoking user; the socket needs world
     // write (connect() on AF_UNIX requires `w`). Xorg sets 0777.
     fs::set_permissions(path, fs::Permissions::from_mode(0o777))
 }
 
+#[cfg(unix)]
 /// Bind `<socket_dir>/X<display>` for the explicit-`:N` and
 /// back-compat-default cases. Probes an existing socket before removing
 /// it: a live server's socket is NEVER stolen (old yservers take no
@@ -631,6 +848,7 @@ pub fn bind_explicit(socket_dir: &Path, display: u16) -> io::Result<(UnixListene
     Ok((listener, path))
 }
 
+#[cfg(unix)]
 /// Scan `0..256` for the lowest free display and bind it. Disambiguates an
 /// existing socket file via `connect()`: refused ⇒ stale ⇒ reclaim;
 /// connected ⇒ live ⇒ skip; other error ⇒ occupied ⇒ skip. Moves on to the
@@ -671,6 +889,35 @@ pub fn autopick(socket_dir: &Path) -> io::Result<(u16, UnixListener, PathBuf)> {
     ))
 }
 
+#[cfg(unix)]
+/// Lock and bind the lowest display in `first..256` whose lock is not held
+/// by a live server and whose socket is not live, skipping any display
+/// lost to a concurrent starter.
+pub fn autopick_locked(
+    lock_dir: &Path,
+    socket_dir: &Path,
+    first: u16,
+) -> io::Result<(u16, LockGuard, UnixListener, PathBuf)> {
+    for n in first..256 {
+        let guard = match acquire_lock(lock_dir, n) {
+            Ok(guard) => guard,
+            Err(e) if e.kind() == ErrorKind::AddrInUse => continue,
+            Err(e) => return Err(e),
+        };
+        match bind_explicit(socket_dir, n) {
+            Ok((listener, path)) => return Ok((n, guard, listener, path)),
+            // Dropping the guard releases the lock before the next display.
+            Err(e) if e.kind() == ErrorKind::AddrInUse => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        ErrorKind::AddrInUse,
+        format!("no free X display in {first}..256"),
+    ))
+}
+
+#[cfg(unix)]
 /// Write `"<display>\n"` (Xorg's `-displayfd` format) to `fd`, then close
 /// it. Takes ownership of the fd (closed on every exit path via drop).
 /// Close errors are ignored: the fd is single-use and there is nothing
@@ -683,6 +930,7 @@ pub fn write_displayfd(fd: RawFd, display: u16) -> io::Result<()> {
     f.write_all(format!("{display}\n").as_bytes())
 }
 
+#[cfg(unix)]
 /// True if SIGUSR1's *inherited disposition* is `SIG_IGN` — the signal
 /// the DM (lightdm/Xorg convention) uses to request "signal me when
 /// ready". Querying via `sigaction(…, NULL, &old)` does not mutate the
@@ -697,6 +945,7 @@ pub fn sigusr1_is_ignored() -> bool {
     rc == 0 && old.sa_sigaction == libc::SIG_IGN
 }
 
+#[cfg(unix)]
 /// Capture the parent PID once at startup — Xorg's `InitParentProcess`
 /// (`os/connection.c`). Returns `None` if already orphaned (`ppid <= 1`,
 /// no DM to signal). MUST be called early, before long init during which
@@ -707,6 +956,7 @@ pub fn startup_parent_pid() -> Option<i32> {
     if ppid > 1 { Some(ppid) } else { None }
 }
 
+#[cfg(unix)]
 /// Send SIGUSR1 to the parent (the DM) captured at startup, matching
 /// Xorg's `NotifyParentProcess` (`ParentProcess` set in
 /// `InitParentProcess`). `parent_pid` comes from [`startup_parent_pid`].
@@ -715,6 +965,7 @@ pub fn signal_ready_to_parent(parent_pid: i32) {
     unsafe { libc::kill(parent_pid, libc::SIGUSR1) };
 }
 
+#[cfg(unix)]
 /// Perform the readiness handshake: report the chosen display on
 /// `-displayfd` (if given) and signal the startup-captured parent (if
 /// SIGUSR1 was inherited ignored). Call once, just before the core loop.
@@ -740,6 +991,32 @@ pub fn signal_ready(
                 "yserver: SIGUSR1 inherited-ignored but orphaned at startup — no parent to signal"
             ),
         }
+    }
+}
+
+/// Windows has no inherited signal disposition to hand readiness over.
+#[cfg(windows)]
+#[must_use]
+pub fn sigusr1_is_ignored() -> bool {
+    false
+}
+
+#[cfg(windows)]
+#[must_use]
+pub fn startup_parent_pid() -> Option<i32> {
+    None
+}
+
+/// TODO(windows): `-displayfd` names a descriptor, which Windows lacks.
+#[cfg(windows)]
+pub fn signal_ready(
+    opts: &LaunchOptions,
+    _display: u16,
+    _sigusr1_was_ignored: bool,
+    _parent_pid: Option<i32>,
+) {
+    if opts.displayfd.is_some() {
+        log::warn!("yserver: -displayfd is unsupported on Windows");
     }
 }
 
@@ -1130,6 +1407,263 @@ mod tests {
     }
 
     #[test]
+    fn shell_mode_follows_decision_1() {
+        let bundle = LaunchOptions {
+            from_bundle: true,
+            ..parse(&[]).unwrap()
+        };
+        assert_eq!(shell_mode(&bundle, true), Ok(ShellMode::Rootless));
+        assert_eq!(
+            shell_mode(&parse(&[]).unwrap(), true),
+            Ok(ShellMode::Rooted)
+        );
+        let headless = LaunchOptions {
+            from_bundle: true,
+            ..parse(&["--headless"]).unwrap()
+        };
+        assert_eq!(shell_mode(&headless, true), Ok(ShellMode::Rooted));
+        assert_eq!(
+            shell_mode(&bundle, false),
+            Ok(ShellMode::Rooted),
+            "no window shell"
+        );
+    }
+
+    #[test]
+    fn explicit_flags_win_and_conflict() {
+        let o = parse(&["--rooted"]).unwrap();
+        assert!(o.rooted);
+        let o = LaunchOptions {
+            from_bundle: true,
+            ..o
+        };
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rooted));
+        let o = parse(&[":1", "--rootless"]).unwrap();
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rootless));
+        let o = parse(&["--rooted", "--rootless"]).unwrap();
+        assert!(shell_mode(&o, true).is_err(), "both flags");
+        assert!(shell_mode(&o, false).is_err(), "both flags");
+        let o = parse(&["--rooted", "--headless"]).unwrap();
+        assert_eq!(shell_mode(&o, false), Ok(ShellMode::Rooted));
+    }
+
+    #[test]
+    fn rootless_without_a_shell_needs_headless() {
+        let o = parse(&[":1"]).unwrap();
+        assert!(!o.rootless);
+        assert_eq!(o.rootless_record, None);
+        assert_eq!(shell_mode(&o, false), Ok(ShellMode::Rooted));
+        let o = parse(&[
+            ":1",
+            "--headless",
+            "--rootless",
+            "--rootless-record",
+            "/tmp/r",
+        ])
+        .unwrap();
+        assert!(o.rootless);
+        assert_eq!(o.rootless_record, Some(PathBuf::from("/tmp/r")));
+        assert_eq!(shell_mode(&o, false), Ok(ShellMode::Rootless));
+        assert!(parse(&["--rootless-record"]).is_err(), "missing value");
+        let o = parse(&[":1", "--rootless"]).unwrap();
+        assert!(shell_mode(&o, false).is_err(), "rootless needs --headless");
+        let o = parse(&[":1", "--headless", "--rootless-record", "/tmp/r"]).unwrap();
+        assert!(shell_mode(&o, false).is_err(), "a record needs --rootless");
+    }
+
+    /// A KMS build with the Wayland host passes `window_shell`: `--rootless`
+    /// alone is the Wayland host, and with `--headless` the recording host.
+    #[test]
+    fn rootless_on_a_build_with_the_wayland_host() {
+        let o = parse(&[":1", "--rootless"]).unwrap();
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rootless));
+        assert!(shell_mode(&o, false).is_err(), "no Wayland host");
+        let o = parse(&[":1"]).unwrap();
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rooted), "KMS");
+        let o = parse(&[":1", "--headless", "--rootless"]).unwrap();
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rootless));
+    }
+
+    #[test]
+    fn record_needs_headless_rootless() {
+        let o = parse(&[":1", "--rootless", "--rootless-record", "/tmp/r"]).unwrap();
+        assert!(
+            shell_mode(&o, true).is_err(),
+            "the recording host is headless"
+        );
+        let o = LaunchOptions {
+            from_bundle: true,
+            ..parse(&[":1", "--rootless-record", "/tmp/r"]).unwrap()
+        };
+        assert!(
+            shell_mode(&o, true).is_err(),
+            "a bundle default is no --rootless"
+        );
+    }
+
+    fn bundle(args: &[&str]) -> LaunchOptions {
+        LaunchOptions {
+            from_bundle: true,
+            ..parse(args).unwrap()
+        }
+    }
+
+    #[test]
+    fn stored_settings_apply_from_the_bundle() {
+        let stored = Settings {
+            mode: Mode::Window,
+            scale: ScaleOption::Factor(2),
+            live: Live {
+                emulate_buttons: false,
+                key_equivalents: false,
+                sync_clipboard: false,
+            },
+        };
+        let o = apply_settings(bundle(&[]), &stored);
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rooted));
+        assert_eq!(o.scale, ScaleOption::Factor(2));
+        assert_eq!(o.live, stored.live);
+        assert_eq!(o.set_by_argv, SetByArgv::default());
+        let o = apply_settings(bundle(&[]), &Settings::default());
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rootless));
+        assert_eq!(o.scale, ScaleOption::Auto);
+    }
+
+    #[test]
+    fn argv_wins_over_stored_settings_and_is_recorded() {
+        let stored = Settings {
+            mode: Mode::Window,
+            scale: ScaleOption::Factor(2),
+            ..Settings::default()
+        };
+        let o = apply_settings(bundle(&["--rootless", "--scale", "auto"]), &stored);
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rootless));
+        assert_eq!(o.scale, ScaleOption::Auto);
+        assert_eq!(
+            o.set_by_argv,
+            SetByArgv {
+                mode: true,
+                scale: true
+            }
+        );
+        let o = apply_settings(bundle(&["--rooted"]), &Settings::default());
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rooted));
+        assert_eq!(
+            o.set_by_argv,
+            SetByArgv {
+                mode: true,
+                scale: false
+            }
+        );
+    }
+
+    #[test]
+    fn argv_overrides_are_not_written_back() {
+        use crate::settings::{KEY_MODE, KEY_SCALE, tests::store};
+        let st = store(&[(KEY_MODE, "window"), (KEY_SCALE, "1")]);
+        let before = st.clone();
+        let _ = apply_settings(
+            bundle(&["--rootless", "--scale", "2"]),
+            &Settings::load(&st),
+        );
+        assert_eq!(st, before);
+    }
+
+    #[test]
+    fn argv_overrides_are_flags_that_change_something() {
+        let given = |args: &[&str]| has_argv_overrides(&parse(args).unwrap());
+        assert!(!given(&[]));
+        assert!(!given(&["-novtswitch", "-noreset", "--unknown-flag"]));
+        assert!(given(&["--scale", "2"]));
+        assert!(given(&["--rootless"]));
+        assert!(given(&[":3"]));
+        assert!(given(&["--geometry", "800x600"]));
+    }
+
+    #[test]
+    fn stored_settings_are_ignored_outside_the_bundle_and_headless() {
+        let stored = Settings {
+            mode: Mode::Window,
+            scale: ScaleOption::Factor(2),
+            live: Live {
+                emulate_buttons: false,
+                key_equivalents: false,
+                sync_clipboard: false,
+            },
+        };
+        for o in [parse(&[]).unwrap(), bundle(&["--headless"])] {
+            assert_eq!(apply_settings(o.clone(), &stored), o);
+        }
+        let o = apply_settings(parse(&[]).unwrap(), &stored);
+        assert_eq!(o.live, Live::default());
+        assert_eq!(shell_mode(&o, true), Ok(ShellMode::Rooted));
+    }
+
+    #[test]
+    fn headless_flag_parses() {
+        assert!(!parse(&[":1"]).unwrap().headless);
+        let o = parse(&[":1", "--headless"]).unwrap();
+        assert!(o.headless);
+        assert_eq!(o.display, Some(1));
+    }
+
+    #[test]
+    fn geometry_parses_and_rejects_malformed_values() {
+        assert_eq!(parse(&[":1"]).unwrap().geometry, None);
+        assert_eq!(
+            parse(&["--geometry", "1600x1000"]).unwrap().geometry,
+            Some((1600, 1000))
+        );
+        for bad in ["1600", "0x10", "10x", "x10", "70000x10", "axb"] {
+            assert!(parse(&["--geometry", bad]).is_err(), "{bad}");
+        }
+        assert!(parse(&["--geometry"]).is_err(), "missing value");
+    }
+
+    #[test]
+    fn scale_parses_and_rejects_other_values() {
+        assert_eq!(parse(&[":1"]).unwrap().scale, ScaleOption::Auto);
+        assert_eq!(
+            parse(&["--scale", "auto"]).unwrap().scale,
+            ScaleOption::Auto
+        );
+        assert_eq!(
+            parse(&["--scale", "1"]).unwrap().scale,
+            ScaleOption::Factor(1)
+        );
+        assert_eq!(
+            parse(&["--scale", "2"]).unwrap().scale,
+            ScaleOption::Factor(2)
+        );
+        for bad in ["0", "3", "1.5", "Auto", "", "-1"] {
+            assert!(parse(&["--scale", bad]).is_err(), "{bad:?}");
+        }
+        assert!(parse(&["--scale"]).is_err(), "missing value");
+    }
+
+    #[test]
+    // Mutation: consume a display argument after --vrr or fail to consume exactly `all`.
+    fn launch_vrr_flag_forms() {
+        assert_eq!(parse(&[]).unwrap().vrr, VrrMode::Off);
+        assert_eq!(parse(&["--vrr"]).unwrap().vrr, VrrMode::Property);
+        let property_before_display = parse(&["--vrr", ":5"]).unwrap();
+        assert_eq!(property_before_display.vrr, VrrMode::Property);
+        assert_eq!(property_before_display.display, Some(5));
+        assert_eq!(parse(&["--vrr", "all"]).unwrap().vrr, VrrMode::All);
+        let all_before_display = parse(&["--vrr", "all", ":6"]).unwrap();
+        assert_eq!(all_before_display.vrr, VrrMode::All);
+        assert_eq!(all_before_display.display, Some(6));
+        let all_prefix = parse(&["--vrr", "allx", ":7"]).unwrap();
+        assert_eq!(all_prefix.vrr, VrrMode::Property);
+        assert_eq!(all_prefix.display, Some(7));
+        assert_eq!(parse(&["--vrr", "--vrr"]).unwrap().vrr, VrrMode::Property);
+        assert_eq!(
+            parse(&["--vrr", "all", "--vrr"]).unwrap().vrr,
+            VrrMode::Property
+        );
+    }
+
+    #[test]
     fn unknown_flags_are_tolerated() {
         let o = parse(&["-bogus", "--whatever", ":1"]).unwrap();
         assert_eq!(o.display, Some(1));
@@ -1200,6 +1734,52 @@ mod tests {
                 lock: true
             }
         );
+        let pick = |d: Option<u16>, fd: Option<RawFd>| LaunchOptions {
+            pick_free_display: true,
+            ..mk(d, fd)
+        };
+        assert_eq!(
+            resolve(&pick(None, None)),
+            Resolution::FirstFree {
+                first: FIRST_FREE_DISPLAY
+            }
+        );
+        assert_eq!(
+            resolve(&pick(Some(3), None)),
+            Resolution::Explicit {
+                display: 3,
+                lock: true
+            }
+        );
+        assert_eq!(resolve(&pick(None, Some(9))), Resolution::AutoPick);
+    }
+
+    #[test]
+    fn autopick_locked_takes_first_free_and_locks_it() {
+        let dir = unique_tmp_dir("autopick-locked");
+        let (n, guard, listener, path) = autopick_locked(&dir, &dir, 1).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(path, dir.join("X1"));
+        assert!(lock_path(&dir, 1).exists());
+        assert!(!dir.join("X0").exists());
+        drop(listener);
+        drop(guard);
+        assert!(!lock_path(&dir, 1).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autopick_locked_skips_held_lock_and_live_socket() {
+        let dir = unique_tmp_dir("autopick-locked-busy");
+        // :1 locked by a live server (us), :2 served by a lock-less server.
+        let held = acquire_lock(&dir, 1).unwrap();
+        let live = TestListener::bind(dir.join("X2")).unwrap();
+        let (n, guard, listener, _path) = autopick_locked(&dir, &dir, 1).unwrap();
+        assert_eq!(n, 3);
+        // The lock taken for :2 was released when its socket was live.
+        assert!(!lock_path(&dir, 2).exists());
+        drop((listener, guard, live, held));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

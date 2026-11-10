@@ -233,31 +233,6 @@ pub(super) fn reply_get_device_info() -> Vec<u8> {
     r
 }
 
-/// XKB PerClientFlags reply (minor=21). Fixed 32 bytes.
-/// Mirrors Xorg's reply shape: advertise the standard per-client flag
-/// mask and report the requested value for changed bits. This keeps
-/// clients that enable detectable auto-repeat from seeing an all-zero
-/// capability/value pair.
-pub(super) fn reply_per_client_flags(body: &[u8]) -> Vec<u8> {
-    const XKB_PCF_ALL_FLAGS_MASK: u32 = 0x1f;
-
-    let mut r = vec![0u8; 32];
-    r[0] = 1; // reply type
-    r[1] = 1; // deviceID
-    // [2..4] sequence: rewritten by caller
-    // [4..8] extra length in 4-byte units = 0
-    r[8..12].copy_from_slice(&XKB_PCF_ALL_FLAGS_MASK.to_le_bytes());
-
-    if body.len() >= 12 {
-        let change = u32::from_le_bytes([body[4], body[5], body[6], body[7]]);
-        let value = u32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-        let effective = value & change & XKB_PCF_ALL_FLAGS_MASK;
-        r[12..16].copy_from_slice(&effective.to_le_bytes());
-    }
-
-    r
-}
-
 /// Minimal all-zero 32-byte reply for XKB minors that clients tolerate silently.
 /// Only use for minors with no required reply content (e.g. SetControls has none).
 pub(super) fn reply_minimal(minor: u8) -> Vec<u8> {
@@ -267,8 +242,7 @@ pub(super) fn reply_minimal(minor: u8) -> Vec<u8> {
     r[1] = 1; // deviceID — must match the value returned by reply_get_map
     // and reply_get_controls etc.; xkbcommon-x11 cross-validates the
     // deviceID across replies and tears down the keymap when it
-    // doesn't agree. GTK3's startup path probes minors 4 (GetState)
-    // and 21 (PerClientFlags) through here.
+    // doesn't agree. GTK3's startup path probes minor 4 (GetState).
     r
 }
 
@@ -558,6 +532,16 @@ pub(super) fn reply_get_state(state: &xkbcommon::xkb::State, locked_group: u8) -
     r
 }
 
+/// `xkbGetIndicatorStateReply`: the lit indicators (Xorg
+/// `ProcXkbGetIndicatorState`: `sli->effectiveState`).
+pub(super) fn reply_get_indicator_state(state: u32) -> Vec<u8> {
+    let mut r = vec![0u8; 32];
+    r[0] = 1; // reply type
+    r[1] = 1; // deviceID
+    r[8..12].copy_from_slice(&state.to_le_bytes());
+    r
+}
+
 /// Minimal empty `xkbGetGeometryReply` (XKBproto.h:796-815,
 /// `sz_xkbGetGeometryReply` = 32). `name`=0, all section counts 0 — a
 /// structurally-valid empty geometry, the embedded block for
@@ -710,7 +694,8 @@ pub(super) fn reply_get_kbd_by_name(
 /// xkeyboard-config 2.48, the version in the goldens' headers). Compiling
 /// from RMLVO instead reads the host's xkeyboard-config, so a distro with
 /// another version compiles a different keymap and every golden diff fails
-/// on the input, not on our conversion (Ubuntu CI).
+/// on the input, not on our conversion (Ubuntu CI). Compiled in
+/// [`golden_context`], so the seed reads 2.48's type sources too.
 #[cfg(test)]
 pub(crate) fn golden_keymap(layout: &str, options: Option<&str>) -> xkbcommon::xkb::Keymap {
     let text = match (layout, options) {
@@ -720,14 +705,26 @@ pub(crate) fn golden_keymap(layout: &str, options: Option<&str>) -> xkbcommon::x
         ("us,ru", Some("grp:alt_shift_toggle")) => include_str!("testdata/xkb-keymap-usru.xkb"),
         other => panic!("no frozen golden keymap for {other:?}"),
     };
-    let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
     xkbcommon::xkb::Keymap::new_from_string(
-        &ctx,
+        &golden_context(),
         text.to_owned(),
         xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
         xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
     .expect("frozen golden keymap parses")
+}
+
+/// The context [`golden_keymap`]s are compiled in: xkeyboard-config 2.48's
+/// `types/` (vendored) as the only include path, not the host's.
+#[cfg(test)]
+pub(crate) fn golden_context() -> xkbcommon::xkb::Context {
+    let mut ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_DEFAULT_INCLUDES);
+    let root = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/kms/testdata/xkeyboard-config-2.48"
+    );
+    assert!(ctx.include_path_append(std::path::Path::new(root)));
+    ctx
 }
 #[cfg(test)]
 mod tests {
@@ -751,8 +748,10 @@ mod tests {
         .expect("us,de keymap")
     }
 
+    /// The seed of a keymap compiled from the host's xkeyboard-config.
     fn desc_of(km: &xkbcommon::xkb::Keymap) -> XkbDesc {
-        XkbDesc::from_keymap(km).expect("seed")
+        let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        XkbDesc::from_keymap(km, &ctx).expect("seed")
     }
 
     fn names_body(which: u32) -> [u8; 8] {
@@ -962,8 +961,10 @@ mod tests {
         assert_eq!(u32::from_le_bytes([r[4], r[5], r[6], r[7]]), 15);
         assert_eq!(r[9], 1, "numGroups");
         assert_eq!(r[10], 0x01, "groupsWrap (golden: groupsWrap=0x01)");
-        assert_eq!(u16::from_le_bytes([r[20], r[21]]), 500);
-        assert_eq!(u16::from_le_bytes([r[22], r[23]]), 33);
+        // repeatDelay / repeatInterval: Xorg's defaults
+        // (testdata/xorg-repeat-controls.txt).
+        assert_eq!(u16::from_le_bytes([r[20], r[21]]), 660);
+        assert_eq!(u16::from_le_bytes([r[22], r[23]]), 40);
         let enabled = u32::from_le_bytes([r[56], r[57], r[58], r[59]]);
         assert_eq!(enabled & 0x01, 0x01, "RepeatKeys bit set");
     }
@@ -1204,18 +1205,6 @@ mod tests {
         assert_eq!(u16::from_le_bytes([r[32], r[33]]), 0, "nameLen = 0");
     }
 
-    #[test]
-    fn per_client_flags_reports_supported_and_requested_flags() {
-        let mut body = vec![0u8; 24];
-        body[4..8].copy_from_slice(&1u32.to_le_bytes()); // change DetectableAutoRepeat
-        body[8..12].copy_from_slice(&1u32.to_le_bytes()); // value DetectableAutoRepeat
-        let r = reply_per_client_flags(&body);
-        assert_eq!(r.len(), 32);
-        assert_eq!((r[0], r[1]), (1, 1));
-        assert_eq!(u32::from_le_bytes(r[8..12].try_into().unwrap()), 0x1f);
-        assert_eq!(u32::from_le_bytes(r[12..16].try_into().unwrap()), 1);
-    }
-
     fn us_keymap() -> xkbcommon::xkb::Keymap {
         test_keymap()
     }
@@ -1323,7 +1312,7 @@ mod tests {
     /// dump, key by key.
     fn core_map_diffs(layout: &str, options: Option<&str>, golden: &str) -> Vec<String> {
         let (min, width, rows) = parse_core_golden(golden);
-        let ours = desc_of(&golden_keymap(layout, options)).core_map();
+        let ours = crate::kms::xkb_desc::tests::seeded(layout, options).core_map();
         let mut diffs = Vec::new();
         if (ours.min_keycode, ours.width) != (min, width) {
             diffs.push(format!(
@@ -1408,7 +1397,7 @@ mod tests {
                 .enumerate()
                 .collect()
         };
-        let got = desc_of(&golden_keymap(layout, options)).modifier_mapping();
+        let got = crate::kms::xkb_desc::tests::seeded(layout, options).modifier_mapping();
         let want = modmap_golden(case);
         assert_eq!((got.0, rows(&got)), (want.0, rows(&want)), "{case}");
     }
@@ -1450,7 +1439,7 @@ mod tests {
             .map(|i| u8::from_str_radix(&bits[2 * i..2 * i + 2], 16).unwrap())
             .collect();
         assert!(text.contains("query: layout:     us"));
-        let got = desc_of(&golden_keymap("us", None)).per_key_repeat;
+        let got = crate::kms::xkb_desc::tests::seeded("us", None).per_key_repeat;
         let diff: Vec<u8> = (8..=255u8)
             .filter(|&kc| {
                 let (i, b) = (usize::from(kc >> 3), 1u8 << (kc & 7));

@@ -1,8 +1,14 @@
 use std::{env, process::ExitCode};
 
 fn main() -> ExitCode {
+    // First, before any thread: it may set the Vulkan driver variable.
+    #[cfg(target_os = "macos")]
+    let startup = yserver::app_bundle::prepare();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    #[cfg(target_os = "macos")]
+    startup.log();
 
+    #[cfg(kms)]
     if let Some(result) = yserver::internal_probe::run_reexec_helper_if_requested() {
         return match result {
             Ok(()) => ExitCode::SUCCESS,
@@ -19,11 +25,42 @@ fn main() -> ExitCode {
             eprintln!("yserver: {err}");
             eprintln!(
                 "usage: yserver [:N | N] [vtN] [-seat NAME] [-auth FILE] \
-                 [-displayfd N] [-nolisten PROTO] [-novtswitch] [--version]"
+                 [-displayfd N] [-nolisten PROTO] [-novtswitch] [--headless] [--version]"
+            );
+            #[cfg(target_os = "macos")]
+            eprintln!("       macOS: [--rootless | --rooted] [--geometry WxH] [--scale auto|1|2]");
+            #[cfg(windows)]
+            eprintln!(
+                "       Windows: [--rootless | --rooted] [--geometry WxH] [--scale auto|1|2]"
             );
             return ExitCode::FAILURE;
         }
     };
+
+    // Started from Finder, nobody can pass `:N`; the saved settings apply
+    // under argv.
+    #[cfg(target_os = "macos")]
+    let opts = yserver::launch::apply_settings(
+        yserver::launch::LaunchOptions {
+            pick_free_display: startup.bundle.is_some(),
+            from_bundle: startup.bundle.is_some(),
+            argv_overrides: yserver::launch::has_argv_overrides(&opts),
+            ..opts
+        },
+        &yserver::stored_settings(),
+    );
+
+    // Every Windows launch is the app's: the saved settings apply under
+    // argv, so a launch without `--rooted` is rootless by default.
+    #[cfg(windows)]
+    let opts = yserver::launch::apply_settings(
+        yserver::launch::LaunchOptions {
+            from_bundle: true,
+            argv_overrides: yserver::launch::has_argv_overrides(&opts),
+            ..opts
+        },
+        &yserver::stored_settings(),
+    );
 
     if opts.show_version {
         println!("{}", yserver::version::line());

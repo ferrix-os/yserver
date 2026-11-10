@@ -42,6 +42,19 @@ pub struct ModeSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CrtcConfigToken(pub u64);
 
+/// What `Backend::realize_window_storage` does about the background.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealizeBackground {
+    /// Paint it now (`miPaintWindow` on realize).
+    Paint,
+    /// The core paints it once the redirect backing the window paints into
+    /// exists; until then the storage shows what is underneath.
+    Deferred,
+    /// Never: Xorg's `inhibitBGPaint` (`mi/miexpose.c:435`). The storage shows
+    /// what is underneath, as for a None background.
+    Inhibited,
+}
+
 /// Initial disposition of a client-driven CRTC configuration request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrtcConfigApply {
@@ -81,6 +94,10 @@ pub enum BackendFdKind {
     /// fences which gate a copied scanout path. Readiness means work rendered
     /// on the source GPU may advance to the sink-GPU copy.
     ScanoutRenderCompletion,
+    /// A rootless host's connection to its window system, served on the
+    /// core thread (a Wayland compositor's socket). Readiness drives
+    /// `Backend::on_host_display_ready`.
+    HostDisplay,
 }
 
 /// Result of arming the implicit producer fence for a `PresentPixmap`
@@ -101,6 +118,8 @@ pub enum PresentSourceWait {
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct PresentScanoutCandidate {
     pub client_id: u32,
+    /// Local peer PID for the Presenting X client, when the platform exposes it.
+    pub client_pid: Option<u32>,
     pub present_id: u64,
     /// RANDR CRTC XID selected for this Present. `0` is the synthetic
     /// headless domain used when no output is enabled.
@@ -108,6 +127,9 @@ pub struct PresentScanoutCandidate {
     pub crtc_epoch: u64,
     pub src_pixmap_xid: u32,
     pub dst_window_xid: u32,
+    /// The presented window has `_VARIABLE_REFRESH` as CARDINAL/32 with
+    /// at least one item and a first value of 1.
+    pub variable_refresh: bool,
     pub src_host_xid: u32,
     pub paint_dst_host_xid: u32,
     pub completion_dst_host_xid: u32,
@@ -176,6 +198,9 @@ pub struct PresentCaps {
     /// false, the path selector short-circuits to `Copy` regardless
     /// of pixmap/window match per design §3.3.1.
     pub flip_path: bool,
+    /// The window's KMS device supports `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`.
+    /// Advertises Present's Async capability independently of `flip_path`.
+    pub async_flip: bool,
     /// `DRM_MODE_ATOMIC_NONBLOCK` accepted by the kernel — the
     /// `PresentOptionAsyncMayTear` bit is honourable. When false,
     /// the bit is **silently cleared** on incoming requests (per
@@ -191,7 +216,7 @@ pub struct PresentCaps {
 impl PresentCaps {
     /// Encode as a `u32` for the `QueryCapabilities` reply.
     /// `presentproto` bit assignments:
-    ///  - `Async` (0x1)        — Phase 4.2 advertises if `flip_path`.
+    ///  - `Async` (0x1)        — advertised if `flip_path` or `async_flip`.
     ///  - `Fence` (0x2)        — XSync `Fence` always supported once
     ///    DRI3 fence_fd cap is true; Phase 4.2 always advertises.
     ///  - `UST` (0x4)          — vblank UST timestamps; Phase 4.1's
@@ -206,7 +231,7 @@ impl PresentCaps {
         const ASYNC_MAY_TEAR: u32 = 0x8;
         const SYNCOBJ: u32 = 0x10;
         let mut out = FENCE | UST;
-        if self.flip_path {
+        if self.flip_path || self.async_flip {
             out |= ASYNC;
         }
         if self.async_may_tear {
@@ -331,10 +356,25 @@ mod present_caps_tests {
     fn full_caps_set_all_bits() {
         let caps = PresentCaps {
             flip_path: true,
+            async_flip: true,
             async_may_tear: true,
             syncobj: true,
         };
         assert_eq!(caps.encode(), 0x1 | 0x2 | 0x4 | 0x8 | 0x10);
+    }
+
+    #[test]
+    fn present_caps_encode_async_bit_from_async_flip() {
+        // Mutation killed: dropping `async_flip` from `encode` leaves Async unset.
+        let caps = PresentCaps {
+            flip_path: false,
+            async_flip: true,
+            async_may_tear: false,
+            syncobj: false,
+        };
+
+        assert_eq!(caps.encode() & 0x1, 0x1, "Async advertised for async flip");
+        assert_eq!(caps.encode() & 0x8, 0, "AsyncMayTear stays unset");
     }
 }
 
@@ -427,7 +467,24 @@ pub struct Dri3PixmapExport {
     pub depth: u8,
     pub bpp: u8,
     pub modifier: u64,
-    pub fd: std::os::fd::OwnedFd,
+    pub fd: crate::fd::OwnedFd,
+}
+
+/// Opaque identity of a DRI3 export the backend deferred.
+///
+/// Tokens stay unique until the core calls [`Backend::release_dri3_export`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Dri3ExportToken(pub u64);
+
+/// How a DRI3 pixmap export began.
+#[derive(Debug)]
+pub enum Dri3ExportBegin {
+    /// Exported now.
+    Ready(Dri3PixmapExport),
+    /// The pixmap's storage is still scanned out. The core parks the client
+    /// and finishes the token once [`Backend::drain_ready_dri3_exports`]
+    /// returns it.
+    Pending(Dri3ExportToken),
 }
 
 /// Stage 5 Task 6.1: opaque handle to a DRI3 xshmfence's underlying
@@ -461,11 +518,7 @@ pub trait SyncobjHandle: std::fmt::Debug + Send + Sync {
     /// completes. This is the PresentPixmapSynced Copy-path operation used
     /// by Xorg/Xwayland: clients may queue dependent work without reusing the
     /// pixmap before the server's GPU read has retired.
-    fn import_sync_file(
-        &self,
-        _value: u64,
-        _fd: std::os::fd::BorrowedFd<'_>,
-    ) -> std::io::Result<()> {
+    fn import_sync_file(&self, _value: u64, _fd: crate::fd::BorrowedFd<'_>) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "sync_file import unsupported",
@@ -634,9 +687,18 @@ pub trait Backend {
     /// The live RandR provider set (`RRGetProviders`). Empty for
     /// backends that expose no provider topology.
     fn randr_providers(&mut self) -> Vec<crate::randr::RandrProvider>;
+    /// What the CRTCs can do and the screen size range.
+    fn randr_limits(&self) -> crate::randr::RandrLimits {
+        crate::randr::RandrLimits::default()
+    }
     fn render_opcode(&self) -> Option<u8>;
     fn xkb_opcode(&self) -> Option<u8>;
     fn xkb_info(&self) -> Option<(u8, u8, u8)>;
+    /// Whether this backend serves XKB `PerClientFlags` from the core's
+    /// per-client state. The nested host-X11 backend keeps proxying it.
+    fn xkb_per_client_flags_in_core(&self) -> bool {
+        false
+    }
     /// Set the authoritative locked keyboard group (read by
     /// `serialize_modifiers` into key-event group bits). Default no-op for
     /// backends without an XKB keymap.
@@ -645,12 +707,28 @@ pub trait Backend {
     fn current_group(&self) -> u8 {
         0
     }
+    /// Lock or unlock the real modifiers named by `affect` to the matching
+    /// bits of `values` — `XkbLatchLockState`'s affectModLocks/modLocks,
+    /// which is how `numlockx` (`XkbLockModifiers`) turns NumLock on.
+    ///
+    /// `values` has no bits outside `affect` (the request is BadMatch
+    /// otherwise), so implementations merge with `(old & !affect) | values`.
+    /// They own the lock-LED side effect too: locking Num_Lock/Caps_Lock
+    /// this way must light the keyboard LED exactly as pressing the key does.
+    ///
+    /// Default no-op for backends without an XKB state machine.
+    fn set_locked_mods(&mut self, _affect: u8, _values: u8) {}
     /// The current real-modifier state as `(effective, base, latched,
     /// locked)` masks, read from the live xkb state. Drives
     /// `XkbStateNotify` so libxkbcommon clients track modifier changes.
     /// Default `(0,0,0,0)` for backends without an XKB keymap.
     fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
         (0, 0, 0, 0)
+    }
+    /// The core keyboard's lit XKB indicators and the defined ones, `(Xorg
+    /// sli->effectiveState, namesPresent | mapsPresent)`. Default none.
+    fn xkb_indicators(&mut self) -> (u32, u32) {
+        (0, 0)
     }
     fn composite_opcode(&self) -> Option<u8>;
     fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32>;
@@ -666,10 +744,25 @@ pub trait Backend {
     /// (KMS) and F2 (host-X11); inert until then.
     fn on_host_input(&mut self, state: &mut ServerState, ev: HostInputEvent);
 
+    /// Reconcile backend-owned per-device state after XI slave attachment
+    /// changes. XKB implementations use this to create a floating slave's
+    /// independent state or retire it when the slave is attached again.
+    /// Backends without per-device keyboard state need no work.
+    fn sync_floating_keyboard_states(&mut self, _state: &ServerState) {}
+
+    /// Release holds owned by one still-enabled physical XI facet before a
+    /// client-driven Device Enabled disable is committed. Backends without
+    /// host-device state have no cleanup to perform.
+    fn disable_xi_facet(&mut self, _state: &mut ServerState, _device_id: u16) {}
+
+    /// Reconcile backend-owned state after a client-driven XI facet enable.
+    /// The core has already restored the facet's role-derived home master.
+    fn enable_xi_facet(&mut self, _state: &mut ServerState, _device_id: u16) {}
+
     /// `drm_fd` is readable. The backend should drain completion events from
     /// that exact DRM device and submit the next composite/flip. The fd is one
     /// returned by [`Backend::poll_fds`] with [`BackendFdKind::Drm`].
-    fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: std::os::fd::RawFd);
+    fn on_page_flip_ready(&mut self, state: &mut ServerState, drm_fd: crate::fd::RawFd);
 
     /// The DRM hotplug monitor is readable. Default: no-op.
     fn on_display_hotplug(&mut self, _state: &mut ServerState) {}
@@ -809,12 +902,34 @@ pub trait Backend {
         (Vec::new(), Vec::new(), Vec::new())
     }
 
+    /// The screen's VidMode gamma table, under every CRTC's RANDR ramp
+    /// (Xorg's CMap gamma on modesetting): each CRTC's hardware LUT becomes
+    /// [`VidModeGammaTable::crtc_lut`] of its RANDR ramp, now, whenever
+    /// that ramp changes and whenever the CRTC is lit. `None` loads the
+    /// RANDR ramps alone. `get_crtc_gamma` keeps reporting the RANDR ramp.
+    /// Default: Ok(()) no-op, for a backend without gamma.
+    ///
+    /// [`VidModeGammaTable::crtc_lut`]: crate::backend::gamma::VidModeGammaTable::crtc_lut
+    fn set_vidmode_gamma(
+        &mut self,
+        _table: Option<&crate::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Refresh RANDR state after a successful `RRSetCrtcConfig`, setting
     /// `lastSetTime` to the client's request timestamp (0/CurrentTime
     /// already resolved to `now` by the caller). A CRTC set bumps
     /// `lastSetTime` but NOT `lastConfigTime` (the available config did
-    /// not change). Default no-op for nested/recording backends.
+    /// not change). Also after a host resize (`host_screen_resized`), with
+    /// the resize's timestamp. Default no-op for nested/recording backends.
     fn refresh_randr_state_set_time(&mut self, _state: &mut ServerState, _set_time: u32) {}
+
+    /// The RANDR layout changed (a CRTC set, a screen resize or a server
+    /// reset): take the CRTC transforms and root extent from `state.randr`
+    /// and move the pointer onto a CRTC (`RRPointerScreenConfigured`).
+    /// Default no-op.
+    fn randr_layout_changed(&mut self, _state: &mut ServerState) {}
 
     /// Resize the logical (virtual) screen to `w`×`h`: reallocate the
     /// root + Composite-overlay backing storage and update the pointer
@@ -833,6 +948,23 @@ pub trait Backend {
     /// Direct-mode VT release signal. Default no-op.
     fn on_vt_release(&mut self, _state: &mut ServerState) {}
 
+    /// Begin a direct-mode VT release before the core drains input-thread
+    /// configuration results. Return true only when a FIFO pause barrier was
+    /// queued; the core waits for its acknowledgement only in that case.
+    fn begin_vt_release(&mut self) -> bool {
+        false
+    }
+
+    /// Finish the release after the core has consumed the input pause barrier.
+    /// Backends that only implement `on_vt_release` retain their old behavior.
+    fn finish_vt_release(
+        &mut self,
+        state: &mut ServerState,
+        _input_inventory: &crate::core_loop::input_inventory::InputInventory,
+    ) {
+        self.on_vt_release(state);
+    }
+
     /// Direct-mode VT acquire signal. Default no-op.
     fn on_vt_acquire(&mut self, _state: &mut ServerState) {}
 
@@ -844,6 +976,26 @@ pub trait Backend {
     /// Dispatch libinput inline. Default: no-op; direct KMS uses a dedicated
     /// input thread and never registers this fd.
     fn on_libinput_ready(&mut self, _state: &mut ServerState) {}
+
+    /// The rootless host's display connection is readable
+    /// ([`BackendFdKind::HostDisplay`]), or writable while
+    /// [`Backend::host_display_wants_writable`]: send what is queued, read
+    /// its events and act on them with `state` in hand. `false` when the window system closed the
+    /// connection, which ends the server as the loss of its only display
+    /// would. Default: `true`; only a host that registers the fd sees this.
+    fn on_host_display_ready(&mut self, _state: &mut ServerState) -> bool {
+        true
+    }
+
+    /// The rootless host's display connection holds output its last flush
+    /// could not send, the socket being full. Asked each loop iteration
+    /// after [`Backend::before_block`]: while it is true the loop watches the
+    /// [`BackendFdKind::HostDisplay`] fd for writable as well as readable,
+    /// and its readiness comes as [`Backend::on_host_display_ready`], which
+    /// flushes. A client's output is watched the same way. Default: `false`.
+    fn host_display_wants_writable(&self) -> bool {
+        false
+    }
 
     /// Called once per core-loop iteration (with `state`) so a backend can
     /// service time-based backend work that isn't tied to an fd readiness
@@ -876,9 +1028,9 @@ pub trait Backend {
     /// from the main loop. On real hardware the desktop's clients can
     /// enumerate devices (`XIQueryDevice` / `XListInputDevices`) seconds
     /// before that burst lands, so they cache a plain pointer and never
-    /// recognise the touchpad (observed on M2/Asahi MATE: all four
-    /// libinput devices first processed ~2s AFTER the clients queried
-    /// device 4).
+    /// recognise the physical touchpad facet (observed on M2/Asahi MATE:
+    /// all four libinput devices first processed ~2s after clients queried
+    /// the registry's initial devices).
     ///
     /// Implementations MUST be bounded and non-blocking: if libinput has
     /// nothing yet, return immediately rather than waiting. Backends without
@@ -890,10 +1042,9 @@ pub trait Backend {
         0
     }
 
-    /// Apply a decoded touchpad config change to the live input device
-    /// identified by `device_node`. `Ok` = applied (or nothing to apply
-    /// on this backend). `Err(Unsupported)` → BadMatch, `Err(Invalid)`
-    /// → BadValue.
+    /// Start applying a decoded libinput config change to the live input
+    /// source. `Applied` confirms synchronous application; `Pending(token)`
+    /// means the backend will report the actual setter result later.
     ///
     /// Default: no-op success — only backends that own a live libinput
     /// context write through to a device.
@@ -903,12 +1054,16 @@ pub trait Backend {
     /// Returns `DeviceConfigError::Unsupported` when the setting isn't
     /// available on the addressed device, or `Invalid` when the value
     /// is out of range / not a legal one-hot.
-    fn apply_device_config(
+    fn start_device_config(
         &mut self,
-        _device_node: &str,
+        _source: crate::xinput::InputSourceId,
         _change: crate::xinput::libinput_props::DeviceConfigChange,
-    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
-        Ok(())
+        _cancel: crate::xinput::libinput_props::DeviceConfigCancelToken,
+    ) -> Result<
+        crate::xinput::libinput_props::DeviceConfigStart,
+        crate::xinput::libinput_props::DeviceConfigError,
+    > {
+        Ok(crate::xinput::libinput_props::DeviceConfigStart::Applied)
     }
 
     /// Hand the backend a core-channel sender so backend-originated shutdowns
@@ -916,15 +1071,16 @@ pub trait Backend {
     /// Default: no-op.
     fn set_input_sender(&mut self, _sender: crate::core_loop::CoreSender) {}
 
-    /// Tell the backend that something that could affect on-screen
-    /// pixels has changed since the last composite. KMS uses this to
-    /// gate `composite_and_flip` so an idle server doesn't burn
-    /// vsync-paced composite cycles. Default is a no-op for backends
-    /// (e.g. host-X11) that don't drive their own composite loop.
+    /// Ask the next composite to re-inspect the scene after core-driven
+    /// paint outside request handling (Present execution, server reset).
+    /// Not called per request: backend calls that change on-screen pixels
+    /// or scene structure raise their own wake. Default is a no-op for
+    /// backends (e.g. host-X11) that don't drive their own composite loop.
     fn mark_dirty(&mut self) {}
 
-    /// Submit drawing that precedes a queued DamageNotify. The core invokes
-    /// this before the notification can drain to an external compositor.
+    /// Submit drawing before exposing its damage to an external compositor,
+    /// through DamageNotify or the Subtract/FetchRegion requests that retrieve
+    /// coalesced damage without another notification.
     /// Immediate-rendering backends keep the default no-op.
     fn flush_before_damage_notify(&mut self) {}
 
@@ -950,6 +1106,23 @@ pub trait Backend {
         Ok(())
     }
 
+    /// The platform posted `Message::PlatformEvent`: drain its queue.
+    /// Default no-op for backends whose platform never posts one.
+    fn on_platform_event(&mut self, _state: &mut ServerState) {}
+
+    /// Rootless top-level events of this iteration (spec §4.1, §4.2), after the
+    /// Present drain and before `maybe_composite`. Default no-op.
+    fn on_rootless_events(
+        &mut self,
+        _state: &ServerState,
+        _events: &[crate::rootless::RootlessEvent],
+    ) {
+    }
+
+    /// `state.clients` gained or lost an established client; `count` is
+    /// its new size. Default no-op.
+    fn note_client_count(&mut self, _count: usize) {}
+
     /// Dump the current scanout buffer to a file in the process's
     /// cwd. Diagnostic-only — fired from `Message::DumpScanout`
     /// (Ctrl-Alt-Enter on KMS). Default no-op for backends that don't
@@ -972,9 +1145,8 @@ pub trait Backend {
         false
     }
 
-    /// Notify the backend that a window property changed or was
-    /// deleted. KMS uses this to re-evaluate EWMH stack hints
-    /// (`_NET_WM_WINDOW_TYPE`, `_NET_WM_STATE`, `WM_TRANSIENT_FOR`).
+    /// Notify the backend that a window property changed or was deleted.
+    /// Platforms may use it to refresh policy tied to a live window.
     /// Default no-op.
     fn on_window_property_changed(
         &mut self,
@@ -1111,6 +1283,20 @@ pub trait Backend {
     /// the destination disappeared).
     fn finish_present_source_wait(&mut self, _wait_id: u64) {}
 
+    /// Whether a Present that is not yet executed is scrapped (completed as
+    /// Skip) by a later one for the same window and target MSC, as Xorg's
+    /// `present_scmd.c` does ("don't bother doing the previous one if this
+    /// one will overwrite it in the same frame"). Default true. A backend
+    /// whose windows are another window system's says false, since that
+    /// window system -- not the X server -- decides which frame a refresh
+    /// shows, and copies each present in turn. Xwayland scraps no copy at
+    /// arrival (`xwl_present_pixmap`); what it does scrap is a flip queued
+    /// behind a pending one (`xwl_present_execute`'s mailbox handling), and
+    /// such a backend has no flips.
+    fn present_supersedes_same_msc(&self) -> bool {
+        true
+    }
+
     /// A scanout pageflip is submitted and not yet retired. Used ONLY by
     /// the immediate-target arrival rule (spec §msc-due). Default false:
     /// non-KMS backends execute everything at arrival.
@@ -1131,28 +1317,20 @@ pub trait Backend {
     fn present_crtc_clock_epoch(&self, _crtc_id: u32) -> u64 {
         0
     }
-    /// Kernel accepts absolute CRTC_QUEUE_SEQUENCE arming. Gates the
-    /// idle-display fallback to flip-driven-clock drivers. Default false.
+    /// Kernel accepts CRTC_QUEUE_SEQUENCE arming. Gates the idle-display
+    /// fallback to flip-driven-clock drivers. Default false.
     fn present_absolute_vblank_arm_supported(&self, _crtc_id: u32) -> bool {
         false
     }
-    /// Arm absolute vblank sequences for parked future-target presents.
-    /// Own per-CRTC target set; must not consume or suppress the
-    /// relative-1 idle arm.
+    /// Keep one tagged next-vblank wake outstanding for Present work on a
+    /// CRTC. The wake covers every Present target on that CRTC and is
+    /// independent of the untagged idle-vblank arm.
     ///
-    /// Returns the number of targets now **covered** by an in-flight arm
-    /// — newly issued or already armed from a prior call — not just
-    /// newly issued arms: the caller re-arms every iteration, and a
-    /// still-parked already-armed target must not read as failure. `0`
-    /// or `Err` means the caller must not park on this mechanism (no
-    /// targets, no outputs, arming unsupported/failed) and should fall
-    /// through to another due-execution trigger. Default `Ok(0)`.
-    fn arm_present_absolute_vblank(
-        &mut self,
-        _crtc_id: u32,
-        _targets: &[u64],
-    ) -> std::io::Result<usize> {
-        Ok(0)
+    /// Returns `true` when the tagged wake is already outstanding or was
+    /// newly armed. `false` means no wake is available; `Err` reports an
+    /// arming failure. Default `Ok(false)`.
+    fn arm_present_shared_wake(&mut self, _crtc_id: u32) -> std::io::Result<bool> {
+        Ok(false)
     }
     /// Display cannot scan out at all (VT-away OR DPMS-off). Gates the
     /// blackout flush. Default false.
@@ -1172,7 +1350,7 @@ pub trait Backend {
     /// Raw fds the core's poller should watch on this backend's behalf. The
     /// core gives every entry a unique token and retains both the fd and its
     /// `BackendFdKind` for readiness dispatch.
-    fn poll_fds(&self) -> Vec<(std::os::fd::RawFd, BackendFdKind)>;
+    fn poll_fds(&self) -> Vec<(crate::fd::RawFd, BackendFdKind)>;
 
     /// Downcast to `Any` for backend-specific operations (e.g. KMS composite).
     fn as_any(&self) -> &dyn Any;
@@ -1210,8 +1388,9 @@ pub trait Backend {
         &mut self,
         origin: Option<OriginContext>,
         host_xid: u32,
+        background: RealizeBackground,
     ) -> io::Result<()> {
-        let _ = (origin, host_xid);
+        let _ = (origin, host_xid, background);
         Ok(())
     }
 
@@ -1343,6 +1522,80 @@ pub trait Backend {
             io::ErrorKind::Unsupported,
             "allocate_redirected_backing not supported",
         ))
+    }
+
+    /// `miPaintWindow(PW_BORDER)` over `rects` of `host_xid`'s border, in
+    /// its content space (`mi/miexpose.c:445-470`). Default no-op.
+    ///
+    /// # Errors
+    ///
+    /// A failed fill.
+    fn paint_window_border_rects(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_xid: u32,
+        rects: &[yserver_protocol::x11::xfixes::RegionRect],
+    ) -> io::Result<()> {
+        let _ = (origin, host_xid, rects);
+        Ok(())
+    }
+
+    /// `compReallocPixmap` (composite/compalloc.c:670-712): give
+    /// `host_window` a new backing of `width x height`, seeded from its
+    /// parent, and move its route and reason-1 hold off `old`. The caller
+    /// keeps `old` retained; nothing is read back from window leaves.
+    ///
+    /// # Errors
+    ///
+    /// `Unsupported` by default. On error the window stays on `old`.
+    fn reallocate_redirected_backing(
+        &mut self,
+        origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        old: PixmapHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> io::Result<PixmapHandle> {
+        let _ = (origin, host_window, old, width, height, depth);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reallocate_redirected_backing not supported",
+        ))
+    }
+
+    /// Move children repositioned by `win_gravity` (`(host_xid, x, y)`).
+    /// With `carry_from`, a child sharing its parent's backing takes its
+    /// pixels from that old backing (`compCopyWindow` from `pOldPixmap`,
+    /// composite/compwindow.c:489-528); otherwise each child moves as a
+    /// plain `configure_subwindow`.
+    ///
+    /// # Errors
+    ///
+    /// The first failing move.
+    fn move_subwindows_for_gravity(
+        &mut self,
+        origin: Option<OriginContext>,
+        moves: &[(u32, i16, i16)],
+        carry_from: Option<PixmapHandle>,
+    ) -> io::Result<()> {
+        let _ = carry_from;
+        for &(host_xid, x, y) in moves {
+            self.configure_subwindow(
+                origin,
+                host_xid,
+                crate::host_x11::HostSubwindowConfig {
+                    x: Some(x),
+                    y: Some(y),
+                    width: None,
+                    height: None,
+                    border_width: None,
+                    sibling: None,
+                    stack_mode: None,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     /// L2 plan B.6c: release a redirect's reason-1 hold on a
@@ -1574,14 +1827,14 @@ pub trait Backend {
         Ok(())
     }
 
-    /// Composite Overlay Window materialization — the **0 → 1 claim
-    /// edge**, and nothing else.
+    /// Composite Overlay Window materialization.
     ///
     /// Core owns the claim list ([`crate::server::ServerState::cow_claims`])
     /// and is the single authority on how many holds the overlay has;
     /// **the backend must not count**. Two counters that can disagree is
     /// what leaked the overlay across a compositor crash. Core calls this
-    /// only when the claim list goes empty → non-empty, so an
+    /// from GetOverlayWindow whenever the core COW record is absent,
+    /// whatever the claim count (Xorg `compext.c:303`), so an
     /// implementation may assume no COW of its own is live (bar a
     /// physical teardown it deferred behind direct scanout, which it
     /// re-adopts here).
@@ -1620,38 +1873,41 @@ pub trait Backend {
         Ok(false)
     }
 
-    /// Composite Overlay Window teardown — the **1 → 0 claim edge**, and
-    /// nothing else.
+    /// Composite Overlay Window teardown, part 1: everything that can fail.
     ///
-    /// The mirror of [`Backend::get_overlay_window`]: core calls this
-    /// only when the last claim is about to go, so this is always a final
-    /// teardown. Non-final Releases never reach the backend, and the
-    /// backend keeps no count of its own.
+    /// Core calls this when a destroy plan contains the COW (the last
+    /// ReleaseOverlayWindow, `DestroyWindow(COW)`, `DestroySubwindows(root)`),
+    /// before anything of the destroy happens, and follows `Ok(true)` with
+    /// [`Backend::retire_overlay_window`] in the same request.
     ///
-    /// Free the storage and unregister the `windows` entry plus the COW's
-    /// slot in `top_level_order` — the mirror of what the materialize
-    /// edge installs. Single hook owns the lifecycle in both directions;
-    /// there is no separate `destroy_cow` API.
+    /// Returns `Ok(false)` when this backend has no materialized COW (v1,
+    /// ynest, the trait default): core then gives the COW the ordinary
+    /// backend teardown.
     ///
-    /// Returns `Ok(true)` when the backend tore a COW down, so core
-    /// mirrors it with `destroy_cow_resource()`: the resources-side
-    /// Window record and its slot in `root.children` come down together
-    /// with the backend storage. `Ok(false)` means this backend has no
-    /// COW implementation (v1, ynest, the trait default) or had nothing
-    /// materialized, so there is nothing for core to mirror down.
-    ///
-    /// On `Err` **the overlay is still up**, and core keeps the caller's
-    /// claim: the claim is what keeps the overlay alive, so dropping it
-    /// before the overlay is gone is precisely the leak.
+    /// On `Err` nothing changed: the overlay is still up, and core answers
+    /// `BadAlloc` or keeps the caller's claim. An `Ok` that is never
+    /// followed by the retirement must leave nothing that needs undoing.
     ///
     /// # Errors
     ///
-    /// Backend-internal failures — on `KmsBackend`, the shadow-buffer
-    /// allocation that must succeed before a scanned-out buffer can be
-    /// released.
-    fn release_overlay_window(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
+    /// Backend-internal failures — on `KmsBackend`, the unflip shadow
+    /// (`materialize_direct_shadow_for_unflip`) that must exist before a
+    /// scanned-out buffer can be released.
+    fn prepare_overlay_release(&mut self, origin: Option<OriginContext>) -> io::Result<bool> {
         let _ = origin;
         Ok(false)
+    }
+
+    /// Composite Overlay Window teardown, part 2: cannot fail.
+    ///
+    /// Called by the destroy executor in place of `destroy_subwindow` for
+    /// the COW, after its children's backend teardown and only after
+    /// [`Backend::prepare_overlay_release`] returned `Ok(true)`. Frees the
+    /// storage and the `windows` entry, or defers both behind direct
+    /// scanout until the composed replacement retires; a
+    /// [`Backend::get_overlay_window`] before then re-adopts them.
+    fn retire_overlay_window(&mut self, origin: Option<OriginContext>) {
+        let _ = origin;
     }
 
     /// Stage 4e — return the host xid the backend has assigned to the
@@ -1742,6 +1998,12 @@ pub trait Backend {
     /// no boilerplate.
     fn free_cursor(&mut self, _origin: Option<OriginContext>, _host_xid: u32) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Whether the backend still retains a cursor after the core asked it to
+    /// free it. Backends that destroy cursors immediately keep the default.
+    fn cursor_alive(&self, _host_xid: u32) -> bool {
+        false
     }
 
     /// Recolor a core monochrome cursor. RENDER/ARGB cursors ignore this
@@ -2129,6 +2391,13 @@ pub trait Backend {
         None
     }
 
+    /// Whether a Picture's subwindow mode is IncludeInferiors, which
+    /// keeps a destination's children inside its clip
+    /// (`miValidatePicture`, `render/mipict.c:114-118`).
+    fn picture_includes_inferiors(&self, _host_pic: u32) -> bool {
+        false
+    }
+
     fn render_change_picture(
         &mut self,
         origin: Option<OriginContext>,
@@ -2312,7 +2581,7 @@ pub trait Backend {
     ///
     /// `_drawable` is currently unused (single-GPU only — the fd is
     /// the same regardless of which drawable triggered the request).
-    fn dri3_open(&mut self, _drawable: u32) -> io::Result<std::os::fd::OwnedFd> {
+    fn dri3_open(&mut self, _drawable: u32) -> io::Result<crate::fd::OwnedFd> {
         Err(io::Error::other("DRI3 unsupported on this backend"))
     }
 
@@ -2324,6 +2593,12 @@ pub trait Backend {
     /// — see the §4 fallback matrix.
     fn dri3_capabilities(&self) -> Dri3Caps {
         Dri3Caps::unsupported()
+    }
+
+    /// Whether GLX (indirect, server-synthesised) is advertised. A platform
+    /// without a GL client stack to talk to turns it off.
+    fn glx_available(&self) -> bool {
+        true
     }
 
     /// Import a client-supplied dma-buf as a server-owned pixmap and
@@ -2343,7 +2618,7 @@ pub trait Backend {
     #[allow(clippy::too_many_arguments)]
     fn dri3_import_pixmap(
         &mut self,
-        _fd: std::os::fd::OwnedFd,
+        _fd: crate::fd::OwnedFd,
         _width: u16,
         _height: u16,
         _stride: u32,
@@ -2378,7 +2653,7 @@ pub trait Backend {
     fn dri3_export_pixmap(
         &mut self,
         _host_xid: u32,
-    ) -> io::Result<(u32, u16, u16, u16, u8, u8, std::os::fd::OwnedFd)> {
+    ) -> io::Result<(u32, u16, u16, u16, u8, u8, crate::fd::OwnedFd)> {
         Err(io::Error::other("DRI3 export unsupported on this backend"))
     }
 
@@ -2395,12 +2670,35 @@ pub trait Backend {
         ))
     }
 
-    /// Import a `sync_file` fd as the backing of an XSync `Fence`
-    /// resource. The fd ownership transfers into the backend; on
-    /// success the backend owns a `VkSemaphore` keyed by `fence_xid`.
+    /// Begin a DRI3 export for `BufferFromPixmap` / `BuffersFromPixmap`.
+    /// A backend may defer it while the pixmap is on a CRTC.
+    fn dri3_begin_export_pixmap_buffers(&mut self, host_xid: u32) -> io::Result<Dri3ExportBegin> {
+        self.dri3_export_pixmap_buffers(host_xid)
+            .map(Dri3ExportBegin::Ready)
+    }
+
+    /// Deferred DRI3 exports whose result is ready for
+    /// [`Backend::finish_dri3_export`].
+    fn drain_ready_dri3_exports(&mut self) -> Vec<Dri3ExportToken> {
+        Vec::new()
+    }
+
+    /// The result of a ready deferred DRI3 export.
+    fn finish_dri3_export(&mut self, _token: Dri3ExportToken) -> io::Result<Dri3PixmapExport> {
+        Err(io::Error::other("unknown deferred DRI3 export token"))
+    }
+
+    /// The core is done with `token`: after its reply or error, or because
+    /// its client went away.
+    fn release_dri3_export(&mut self, _token: Dri3ExportToken) {}
+
+    /// Import a DRI3 FenceFromFD fd (an xshmfence, or a `sync_file`) as
+    /// the backing of an XSync `Fence` resource keyed by `fence_xid`. The
+    /// fd ownership transfers into the backend. An error is the client's
+    /// BadValue, and no fence is made.
     ///
     /// Default impl is unsupported.
-    fn dri3_fence_from_fd(&mut self, _fence_xid: u32, _fd: std::os::fd::OwnedFd) -> io::Result<()> {
+    fn dri3_fence_from_fd(&mut self, _fence_xid: u32, _fd: crate::fd::OwnedFd) -> io::Result<()> {
         Err(io::Error::other("DRI3 FenceFromFD unsupported"))
     }
 
@@ -2409,7 +2707,7 @@ pub trait Backend {
     /// caller.
     ///
     /// Default impl is unsupported.
-    fn dri3_fd_from_fence(&mut self, _fence_xid: u32) -> io::Result<std::os::fd::OwnedFd> {
+    fn dri3_fd_from_fence(&mut self, _fence_xid: u32) -> io::Result<crate::fd::OwnedFd> {
         Err(io::Error::other("DRI3 FDFromFence unsupported"))
     }
 
@@ -2422,7 +2720,7 @@ pub trait Backend {
         &mut self,
         _client_id: yserver_protocol::x11::ClientId,
         _syncobj_xid: u32,
-        _fd: std::os::fd::OwnedFd,
+        _fd: crate::fd::OwnedFd,
     ) -> io::Result<()> {
         Err(io::Error::other("DRI3 ImportSyncobj unsupported"))
     }
@@ -2531,8 +2829,9 @@ pub trait Backend {
 
     /// Per-window Present capability surface. Default impl: all-false
     /// (Copy-only, no syncobj). KmsBackend overrides;
-    /// `HostX11Backend` and `RecordingBackend` keep the default.
-    fn present_capabilities(&self, _window: u32) -> PresentCaps {
+    /// `HostX11Backend` and `RecordingBackend` keep the default. Non-KMS
+    /// backends ignore `crtc_id`.
+    fn present_capabilities(&self, _window: u32, _crtc_id: u32) -> PresentCaps {
         PresentCaps::default()
     }
 
@@ -2663,6 +2962,13 @@ pub trait Backend {
     /// contribution here. Default no-op.
     fn client_disconnected(&mut self, _client_id: yserver_protocol::x11::ClientId) {}
 
+    /// Retire state held by the old input session immediately before a
+    /// server-generation reset destroys its clients and replaces its XI
+    /// registry. Backends whose input state lives entirely in `ServerState`
+    /// need no extra work; stateful backends can route releases while the old
+    /// facets and resources are still present. Default no-op.
+    fn reset_input_session(&mut self, _old_state: &mut ServerState) {}
+
     /// GLX-TFP Task 3.5: promote the backing for `host_xid` to
     /// dma-buf-exportable storage (idempotent) WITHOUT touching the
     /// lifetime refcount (`glx_refs`) or allocating/exporting a dmabuf fd.
@@ -2763,6 +3069,13 @@ pub trait Backend {
     /// Default no-op for backends that draw no sprite of their own.
     fn set_cursor_hidden(&mut self, _hidden: bool) {}
 
+    /// Whether the cursor the user sees shows nothing: the `None` cursor,
+    /// XFIXES `HideCursor`, or a cursor whose every pixel is transparent.
+    /// Rootless mode's pointer lock reads it (`rootless/lock.rs`).
+    fn displayed_cursor_hidden(&self) -> bool {
+        false
+    }
+
     /// Take the pending "the effective cursor changed" report, if the sprite
     /// switched to a different cursor since the last call. Drained by the
     /// core after every request and loop iteration to send XFIXES
@@ -2831,13 +3144,20 @@ pub trait Backend {
     /// its test window ("Expected event not received" en masse).
     fn warp_pointer_root(&mut self, _state: &mut ServerState, _x: i32, _y: i32) {}
 
+    /// The window tree changed under a pointer that did not move: a map,
+    /// unmap, configure, restack, reparent, shape change or a destroy (called
+    /// before the dying windows leave the tree). Re-resolve the window under
+    /// the pointer and fan out the crossings within the request, as Xorg's
+    /// `WindowsRestructured` does (`dix/events.c:3269`). Default no-op: a
+    /// host-forwarding backend gets these crossings from the host.
+    fn windows_restructured(&mut self, _state: &mut ServerState) {}
+
     /// After the server moved the pointer on its own (XTEST fake motion),
-    /// hand the new position to whatever tracks physical pointer input, so
-    /// the next real motion continues from there instead of jumping back.
-    /// The KMS backend's direct-mode input thread accumulates relative
-    /// deltas from its own copy of the position ([`Self::warp_pointer_root`]
-    /// resyncs it the same way). Default no-op: host-forwarding backends get
-    /// their position from the host.
+    /// hand the new position to backends that keep a producer-side pointer
+    /// position, so the next real motion continues from there. KMS integrates
+    /// physical relative deltas from its current cursor and needs no resync.
+    /// Default no-op: host-forwarding backends get their position from the
+    /// host.
     fn resync_input_position(&mut self) {}
 
     fn query_pointer(&mut self, origin: Option<OriginContext>) -> io::Result<PointerPosition>;
@@ -2906,6 +3226,13 @@ pub trait Backend {
     /// startup as Xorg's `XkbFinishInit` does. `None` = no keymap: keep
     /// Xorg's `DEFAULT_AUTOREPEATS`.
     fn keymap_auto_repeats(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    /// `(numGroups, enabledControls)` of the backend's XKB keyboard, as its
+    /// GetControls reply carries them, for the `XkbControlsNotify` the core
+    /// loop sends. `None` = no XKB keymap here.
+    fn xkb_controls_base(&self) -> Option<(u8, u32)> {
         None
     }
 

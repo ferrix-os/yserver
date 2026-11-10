@@ -1,0 +1,220 @@
+# Pure move commits (source layout cleanup). Moves across files still need `git blame -C -C`.
+
+# refactor(core): split resources.rs into resources/ (move)
+6897ad0aa0df0d727b74a36ba841e08c6814f5f4
+
+# refactor(core): move process_request.rs tests out of line (move)
+c0bf9a8a8988a75d16707ac875b06282a126cb27
+
+# refactor(kms): move render/backend.rs tests out of line (move)
+1c0c7af185feed7303e0b987bb5c00303f02440b
+
+# refactor(kms): move render/engine.rs tests out of line (move)
+3009e6525145e2cae4b9044784cbf6166d8a6469
+
+# refactor(kms): move render/scene.rs tests out of line (move)
+b1fc252a0b1b26d240ba9d3140e77df967a88396
+
+# refactor(kms): move render/platform.rs tests out of line (move)
+3d2c7807e25f6fc659621ab533bb112c4fbe3ca4
+
+# refactor(kms): move vk/scanout.rs tests out of line (move)
+ca4e05f8f6e65728b9eb920d8a9e622ce17924e6
+
+# refactor(core): move core_loop/pointer_fanout.rs tests out of line (move)
+5f4f3f545d162a6c345db72b0791cde344fb2c46
+
+# refactor(core): move core_loop/run.rs tests out of line (move)
+46864d2e4814d67d7bc1404794b16b611c9ec9ca
+
+# refactor(core): move server.rs tests out of line (move)
+b34bb685edbac5b0fa940985f5309eafdfb9f55a
+
+# refactor(protocol): move x11/mod.rs tests out of line (move)
+dd5ba5da6c7d0e29907d35dad8e95eca8415d60d
+
+# refactor(core): split process_request tests into topic modules (move)
+c16e8fb7d44c68acfea96420a935c77f3f60bae8
+
+# refactor(kms): split backend tests into topic modules (move)
+5a9b1ad6fc80e92b3fce1b7daa9b37518ae458e9
+
+# refactor(tests): split render_acceptance into one binary with topic modules (move)
+90c712ddffa3897dc30f94ec6adf8f72e9e967d0
+
+# refactor(kms): split scene tests into topic modules (move)
+5b041d1913d05c6df6b4906533a999121cc34663
+
+# refactor(kms): split engine tests into topic modules (move)
+c85d9b2fe615d725ae0763d96075576a08e2aefc
+
+# refactor(core): qualify process_request tests' super::super paths (prep)
+0960ff995512ab134c5c840a9929dee7326a9fac
+
+# refactor(kms): qualify backend tests' super:: paths (prep)
+eca005eb64a454f0b36ec2ff1c6011e7a2898148
+
+# refactor(kms): qualify scene tests' super::super paths (prep)
+4c80b03030dcc2d27c535ab43d640de1a8e3cc30
+
+# refactor(kms): qualify engine tests' super:: paths (prep)
+57c2cb097c4ea2acbff1f83c38ad9e2dd1540f76
+
+# refactor(core): qualify process_request super:: paths (prep)
+1684ccdf9261079955766e2a29c05256ddbed3fd
+
+# refactor(core): split process_request into request-family modules (move)
+8153b67438fc3b5ce431670a6ebab99d7b800734
+
+# refactor(kms): qualify backend super:: paths (prep)
+6b6e20a0e95f3b6d77e125cc3c59af78f7841ce7
+
+# refactor(kms): split backend into portable/kms/trait_impl modules (move)
+777758f4727f4bb88f0e580851b9bb1b8dd8a7f0
+
+# refactor(kms): delegate window trait methods to portable/windows helpers
+3d4037314accf85aeb9cdb0f51ec9d911ca687d4
+
+# refactor(kms): delegate redirect, backing and pixmap trait methods to portable/redirect helpers
+f74c626fcfacf21f7148d615dcab47a78eda801d
+
+# refactor(kms): delegate GC, clip and core drawing trait methods to portable/draw and clip helpers
+5da4011b5da2ee9995932c5c426d781d1a069621
+
+# refactor(kms): delegate RENDER trait methods to portable/render_ops, clip and text helpers
+d4d6ffc6472f7e8c4446ad5699bba2541dce1668
+
+# refactor(kms): delegate core text and font trait methods to portable/draw and text helpers
+08b63c594c07c7bafa5146e643fca487de1c6c75
+
+# refactor(kms): delegate cursor trait methods to kms/cursor helpers
+7dfe88fd6a2da09c375114e9f4a91f47f6a7626f
+
+# refactor(kms): delegate Present trait methods to kms/present helpers
+caf1a33bc4f451217cfc306492df73151a441805
+
+# refactor(kms): delegate DRI3 and export trait methods to kms/export helpers
+d88bab96a1cdf17d62ac28dde4075c5849aab436
+
+# refactor(kms): delegate RANDR, gamma and crtc-config trait methods to kms/randr helpers
+9bcff23aee85d5ea6b495125be6c8012c5c5d176
+
+# refactor(kms): delegate frame loop, COW and dump trait methods to kms/scanout, readback and dump helpers
+192b77239f5bd7bba0a794f9be3612089b4586cb
+
+# refactor(kms): delegate input, VT and DPMS trait methods to devices, pointer and kms/session helpers
+8b7b9145d677ff3954ae4bbe9170e9d7265c2e7c
+
+# refactor(kms): delegate XKB and keymap trait methods to portable/keyboard helpers
+43e9ffe1d722efc6cba018d11bb4a61dbba14d54
+
+# refactor(kms): qualify engine super:: paths (prep)
+399b91f42e43e9c3d82b2fed1a8e365675d5ff86
+
+# refactor(kms): split engine into lifecycle/frame/op modules (move)
+3ae1f634d1b2f782d3d55d26fcd7c04b7c2b084b
+
+# refactor(kms): qualify scene super:: paths (prep)
+40d5f0a4825de9994371d31e15cb6a7c579df842
+
+# refactor(kms): split scene into lifecycle/tick/compose/walk modules (move)
+f18205508691f53edd12399564661e9932da1ad1
+
+# refactor(kms): qualify platform super:: paths (prep)
+525636c2eb914745b2c343502afb41f1ab9267e3
+
+# refactor(kms): split platform into fence/submit/init/connectors modules (move)
+13703cade2961301e591a1e4ea8e2e3fa08f92d4
+
+# refactor(kms): qualify scanout super:: paths (prep)
+edbf67665bd10b3eb0fdf8191a3e86dbbe33af76
+
+# refactor(kms): split scanout into bo/copied/probe/image_alloc modules (move)
+83693c2d565229ef216be8b918e57b5a4c295c2a
+
+# refactor(xi): hoist handle_xi2_request's fn-local import (prep)
+e4552e7184276d32ae6447561c82aa8790dc3fca
+
+# refactor(xi): one fn per XI minor (extract)
+a0cc43da481e46469a07d64c0c2359adf39822a0
+
+# refactor(xi): split XI dispatch into devices/control/events/grabs/props/focus (move)
+ea82d0095f7c3274d179d2c91b932740cea033cf
+
+# refactor(randr): hoist handle_randr_request's fn-local items (prep)
+cd5d7798c3641cfda20b3fa7ca9b9bb17b8d1129
+
+# refactor(randr): one fn per RANDR minor (extract)
+9dfcc2e63fa8c1284eb2eca3af97ad1568bb4206
+
+# refactor(randr): split randr_ext into screen/output/crtc/provider/monitor/xinerama (move)
+e35594e1451aea8cfa71115dbcc12d2ba586463d
+
+# refactor(kms): allow the session and present re-exports to go unused until the import rewrite (prep)
+de1ff506cf1da0dd6f0f4da169d2ae10c69ab711
+
+# refactor(kms): delegate on_vt_acquire / arm_present_absolute_vblank to kms/session and kms/present (delegate)
+f49fbaefa62c5006340748b504296330e01ee705
+
+# refactor(kms): allow the crtc_config re-export to go unused until the import rewrite (prep)
+9c5df20961e2dd698cb2a0c15767b828b4405d1e
+
+# refactor(kms): move crtc-config lifecycle from kms/randr into kms/crtc_config (move)
+26c69786b51b121cca9fe269160be2d0b68217eb
+
+# refactor(kms): allow the portable text re-export to go unused until the import rewrite (prep)
+f3f4cff724c1aac41e2826c784d3e3dab959296a
+
+# refactor(kms): move core text requests from portable/draw into portable/text (move)
+638eed09099e41650f46b39836181771a8943394
+
+# refactor(core): explicit imports in process_request/*
+175f9a2948c4a58dac58ba2cec4dfd28cf592cf4
+
+# refactor(core): explicit imports in xi/*, xi/dispatch/*, randr_ext.rs and randr_ext/*
+85139673e25b63c31274d87ceb882a4555fae1bb
+
+# refactor(core): explicit imports in resources/*
+b302a721d59bff83e8b37ca0115bcb2f11c9b4e4
+
+# refactor(kms): explicit imports in backend/{portable,kms}/*, trait_impl, for_tests
+ab09f18414afabdda6bd1303c7840dc0a8b5bd51
+
+# refactor(kms): explicit imports in engine/*
+5d8a43af43b202904fb6f34e613e0714ea841db1
+
+# refactor(kms): explicit imports in scene/*
+08daa62f3ba55c66bcea881af53f1f91586fb731
+
+# refactor(kms): explicit imports in platform/*
+2fe04de18ba994b0e4e512a215dfddbb9c9b0c9f
+
+# refactor(kms): explicit imports in vk/scanout/*
+58c2baf483a5c3773e9999cf7824966efc390b8a
+
+# refactor(core): explicit child imports in the process_request, xi/dispatch, randr_ext dispatchers
+934a8dfae9b3489d55eb6a7eee10000498b5c2f3
+
+# refactor(kms): explicit child imports in the backend root
+3d036fd4fdb682ebb41574bae730ba95f94692aa
+
+# refactor(kms): narrow scene visibility to private / pub(super)
+34f3b7de197d0bd1a7e94a0ed321643797807cae
+
+# refactor(kms): narrow engine visibility to private / pub(super)
+61719b412fc586cb07a9252f1b5594215bbd613f
+
+# refactor(kms): narrow platform visibility to private / pub(super)
+cbba672aad4f07faddf28aeeef686b2a693b42ee
+
+# refactor(kms): narrow scanout visibility to private / pub(super)
+6a4656ada5d1bda5e1f538794913ef0acb0757a0
+
+# refactor(kms): narrow backend visibility to private / pub(super)
+7b65740d4247955e6faa739146b09e005f2373ed
+
+# refactor(core): narrow process_request visibility to private / pub(super)
+ad41c5c6203c8ae9ddc43a83b9455e774b31ebdd
+
+# refactor(core): narrow resources visibility to private / pub(super)
+f61f26bf7545a2ad17f2ed1f327054093d2de4f8

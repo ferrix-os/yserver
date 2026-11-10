@@ -23,8 +23,9 @@ use super::message::Message;
 /// A generation ordinal. Cheap to copy/compare; carries no behaviour of
 /// its own. Numeric identity is deliberately not exposed — nothing
 /// outside this module needs to construct one except by reading a
-/// `GenerationCounter`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// `GenerationCounter`. Ordered, so that process-lifetime state can tell a
+/// newer session from a quarantined older one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Generation(u64);
 
 /// Shared, process-lifetime counter. `CoreSender` holds a clone to tag
@@ -70,13 +71,18 @@ pub(crate) fn is_session_scoped(message: &Message) -> bool {
 
         Message::HostInput(_)
         | Message::CrtcConfigReady
+        | Message::DeviceConfigResult { .. }
+        | Message::InputPaused
         | Message::Shutdown
         | Message::ResetRequested
         | Message::VtRelease
         | Message::VtAcquire
         | Message::SwitchVt(_)
         | Message::DumpScanout
-        | Message::DumpDrawables => false,
+        | Message::DumpDrawables
+        | Message::PlatformEvent
+        | Message::Rootless(_) => false,
+        Message::InternalClient(_) => false,
     }
 }
 
@@ -98,9 +104,9 @@ mod tests {
     use crate::core_loop::message::HostInputEvent;
     use yserver_protocol::x11::ClientId;
 
-    fn device_removed(node: &str) -> Message {
+    fn device_removed() -> Message {
         Message::HostInput(HostInputEvent::DeviceRemoved {
-            device_node: node.into(),
+            source_id: crate::xinput::InputSourceId(1),
         })
     }
 
@@ -117,6 +123,13 @@ mod tests {
         let next = counter.bump();
         assert_eq!(clone.current(), next);
         assert_ne!(clone.current(), Generation::default());
+    }
+
+    #[test]
+    fn bump_orders_after_the_previous_generation() {
+        let counter = GenerationCounter::new();
+        let before = counter.current();
+        assert!(counter.bump() > before);
     }
 
     #[test]
@@ -172,7 +185,7 @@ mod tests {
         let old = Generation::default();
         let current = GenerationCounter::new();
         current.bump();
-        let msg = device_removed("/dev/input/event3");
+        let msg = device_removed();
         assert!(should_dispatch(current.current(), old, &msg));
     }
 
@@ -187,11 +200,13 @@ mod tests {
             Message::ResetRequested,
             Message::CrtcConfigReady,
             Message::VtRelease,
+            Message::InputPaused,
             Message::VtAcquire,
             Message::SwitchVt(1),
             Message::DumpScanout,
             Message::DumpDrawables,
-            device_removed("/dev/input/event0"),
+            Message::PlatformEvent,
+            device_removed(),
             Message::ClientDisconnected {
                 id: ClientId(1),
                 reason: std::io::Error::other("gone"),

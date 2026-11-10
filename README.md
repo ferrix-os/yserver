@@ -25,6 +25,82 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 
 ### Recent work
 
+- Windows (x86_64 and aarch64): X clients from WSL or other machines show up
+  on the Windows desktop, each in its own window or in one rooted window, with
+  a shared clipboard, a Settings dialog and DPI awareness; `ssh -Y` from
+  Windows' own ssh client works with the bundled `xauth.exe`
+- window operations 5-700x faster on slow machines: window clip regions are
+  computed in linear time
+- compositors that Present their own buffers (marco, ...) get them flipped to
+  the screen instead of recomposited
+- `xhost` access control (ChangeHosts, ListHosts, SetAccessControl)
+- the first parts of an access control layer for client isolation (@ariel3259)
+- Present keeps going when a monitor's vblank clock freezes (@ariel3259)
+- TCP listens on IPv6 too
+- shaped windows with many rectangles (xeyes) draw like on Xorg
+- macOS: yserver runs in a window on Apple Silicon (Mesa KosmicKrisp), with a
+  Dock icon and a Settings window; rootless mode gives every X window its own
+  Mac window
+- OpenBSD support
+- per-output direct scanout: a fullscreen client on one monitor is scanned out
+  there whatever the other monitors' refresh rates, while they keep composing
+  at their own (@ariel3259)
+- variable refresh rate per monitor (`--vrr`): each monitor a fullscreen client
+  is scanned out to runs VRR on its own, several at once, while the others keep
+  their fixed refresh (@ariel3259)
+- `--vrr all`: VRR for NVIDIA clients too, honouring the NVIDIA and Mesa
+  application lists (@ariel3259)
+- tearing on demand: fullscreen clients that ask for async flips get uncapped
+  direct scanout (@ariel3259)
+- hardware cursor on atomic KMS: a cursor plane per CRTC, and cursor changes no
+  longer drop direct scanout (@ariel3259)
+- gamma through atomic GAMMA_LUT (@ariel3259)
+- multi-monitor: a window covering all monitors keeps direct scanout when their
+  refresh rates differ by less than 0.5%; switching off or unplugging one
+  monitor no longer blanks the others; `xrandr` changes to one output leave the
+  others alone
+- compositors: redirected windows keep their own and their subwindows' borders
+  (@SetZero), and draw at the right offset when resized; no more blank windows
+  after a workspace switch under picom; no more smudged decorations when
+  resizing under fvwm + xcompmgr
+- less CPU in the core loop: a client's socket is only polled for writing while
+  output is waiting (@SetZero)
+- XKB modifier locks apply and survive `setxkbmap` (@petrovo-as)
+- RENDER text no longer loses glyphs after a long session
+- no more crash when a window tree is destroyed while windows in it are still
+  in use (#297); window teardown follows Xorg's order for grabs, focus,
+  selections and Present
+- clipboard and selection events go to the client that set the owner, as on
+  Xorg, and a second window manager is refused instead of fighting the first
+
+### Previously
+
+- CDE (the Common Desktop Environment) runs: dtsession, dtwm with its panel,
+  dtterm, dtfile, dtpad, and the Motif/Xaw apps around it
+- old-style toolkits (Motif, Xaw, Tk, xterm) draw like on Xorg: lines, text and
+  clipping, exposures and GraphicsExpose, GetImage of windows with children
+- CDE and Motif apps start as fast as on Xorg 
+- font lookups are indexed and cached
+- compressed bitmap fonts now work as expected
+- fractional scaling via RANDR transforms (Cinnamon 125%/150%, `xrandr --scale`),
+  screen rotation and reflection, virtual monitors (`xrandr --setmonitor`), and
+- `xrandr --dpi` now works
+- RECORD extension (pynput and other global input listeners)
+- one XInput device per physical device (mouse, keyboard and touchpad, as on Xorg) (@ariel3259)
+- runs on Vulkan 1.2 GPUs such as Intel Haswell and Ivy Bridge; older drivers get a
+  clear error naming what is missing
+- XFCE dialogs under the compositor keep their button bar when scrolled; MATE tray
+  icons keep their pixels when moved
+- the Cinnamon lock screen shows up again, and fullscreen windows can be
+  re-composited after leaving fullscreen
+- fix slow VRAM growth: the cache of freed pixmaps is capped, and pixmaps held by
+  GCs and freed cursors are released
+- window backgrounds no longer flash in odd colours (CDE with sloppy focus)
+- lower CPU use with x11vnc and other screen grabbers
+- xmodmap and xkbcomp changes reach XKB clients; XI2 raw key events
+- a regression suite that runs the real server in a VM and compares it with Xorg,
+  in CI
+
 - XDMCP session negotiation with a display manager, and a TCP listener —
   both optional Cargo build features, off by default; see
   [`docs/setup.md`](docs/setup.md)
@@ -49,9 +125,6 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 - multi-GPU: the render node is resolved on split display/render SoCs, and
   non-desktop connectors are ignored (touchbar on M2 macbook pro)
 - binary packages for aarch64 as well as x86_64
-
-### Previously
-
 - `starty` launcher (startx-style: display number picking, MIT-MAGIC-COOKIE-1, session teardown)
 - Present completions paced to the vblank, and the Present 1.4 acquire timeline honored
   (fixes free-running clients, fullscreen video, Plasma's spinner)
@@ -89,7 +162,7 @@ See [`docs/extensions.txt`](docs/extensions.txt) for a list of all supported/imp
 - binary releases for Fedora/Debian/Ubuntu/Alpine
 - FreeBSD now works
 - Display hotplug now works
-- xauth support (no xhost ACL support - not needed as we're unix socket only)
+- xauth support, and xhost for local clients (`+si:localuser:`, `+local:`); over TCP only the cookie admits
 - XINERAMA support
 - RANDR gamma correction (redshift)
 - direct mode VT switch
@@ -125,6 +198,7 @@ https://github.com/user-attachments/assets/dc266c55-e9ee-4649-a0c4-be3db2526713
 - bspwm/sxhkd
 - i3/fastcompmgr
 - enlightenment e16 + e27
+- CDE (dtwm)
 
 ## Hardware tested
 
@@ -169,6 +243,80 @@ sudo apk add --allow-untrusted ./yserver-*.apk   # signed with a per-build key
 ```
 
 See also `yserver(1)` and `starty(1)`.
+
+### macOS
+
+yserver runs in a window on macOS 26 or later on Apple Silicon, on Mesa's
+KosmicKrisp Vulkan driver. Dependencies from Homebrew:
+
+```sh
+brew install mesa vulkan-loader vulkan-tools shaderc libxkbcommon fontconfig freetype pkgconf
+```
+
+From a source checkout:
+
+```sh
+just macos-run                 # :1, 1280x800, log in yserver-mac.log
+just macos-run 2 1600x1000     # display, geometry (positional)
+just macos-bundle              # builds target/yserver.app
+```
+
+`target/yserver.app` uses the Homebrew libraries and the KosmicKrisp driver
+from the Homebrew prefix; nothing is bundled. Started from Finder it takes
+the lowest free display from `:1`, shows it in the window title
+(`yserver DISPLAY=:N`) and logs to `~/Library/Logs/yserver.log`.
+
+`--scale` sets how many screen pixels one X pixel covers: `auto` (the
+default; one X pixel per point, 2 on a Retina screen), `1` (full
+resolution) or `2`.
+
+`just macos-rootless` runs it rootless instead: no desktop window, and every
+X top-level window becomes its own Mac window.
+
+Text copied in X clients (CLIPBOARD) can be pasted in Mac apps, and the other
+way round. PRIMARY (select / middle-click) stays within X.
+
+Clients connect with the display number, e.g. with XQuartz's clients:
+
+```sh
+DISPLAY=:1 /opt/X11/bin/xterm
+```
+
+### Windows
+
+yserver runs on Windows 11 (x86_64 and aarch64) and needs a GPU driver
+with Vulkan 1.3. Portable zips (`yserver-<version>-windows-<arch>.zip`, x86_64
+and aarch64) are attached to each GitHub release from 1.9.0 on; nothing needs
+installing, the C runtime and libraries are linked in. The zip's `README.txt`
+covers it in full.
+
+Run `start-yserver.cmd`: it starts display `:0`, creates a cookie in
+`%LOCALAPPDATA%\yserver\Xauthority` on first use and prints it. Clients
+connect over TCP only. yserver's icon in the notification area opens Settings
+and quits it.
+
+- rootless (the default): every X top-level window is its own Windows window;
+  `--rooted` puts the whole X screen in one window instead
+- text copied in X clients (CLIPBOARD) can be pasted in Windows apps, and the
+  other way round
+- Scale works as on macOS: `auto` uses 1 X pixel per screen pixel up to 125%
+  and 2 from 150%
+
+From WSL2 (default NAT networking):
+
+```sh
+export DISPLAY=$(ip route show default | awk '{print $3}'):0
+export XAUTHORITY=/mnt/c/Users/<you>/AppData/Local/yserver/Xauthority
+xterm &
+```
+
+X11 forwarding with Windows' own ssh client works with `-Y`: the zip ships an
+`xauth.exe`; point `XAuthLocation` in `%USERPROFILE%\.ssh\config` at it and
+`set DISPLAY=127.0.0.1:0`. `-X` fails, because yserver has no SECURITY
+extension for an untrusted cookie.
+
+To build it yourself, `tools/windows/package.ps1` installs the C libraries
+with vcpkg, builds yserver and makes the zip.
 
 ## Regression coverage with xts5 and rendercheck
 

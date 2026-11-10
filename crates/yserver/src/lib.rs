@@ -1,32 +1,68 @@
+#[cfg(any(target_os = "macos", test))]
+pub mod app_bundle;
 pub mod clock;
+#[cfg(kms)]
 pub mod drm;
+#[cfg(kms)]
 pub mod input;
+#[cfg(kms)]
 pub mod input_thread;
+#[cfg(kms)]
 #[doc(hidden)]
 pub mod internal_probe;
 pub mod kms;
 pub mod launch;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(kms)]
 pub(crate) mod platform;
+#[cfg(kms)]
 pub mod present;
+pub(crate) mod rootless;
+pub(crate) mod scroll_v120;
+pub mod settings;
+// Only the macOS shell uses all of it (Windows: a rooted window without the
+// clipboard); elsewhere the window half is unused.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+pub(crate) mod surface;
 pub mod version;
+#[cfg(kms)]
 mod vt;
+#[cfg(wayland_host)]
+mod wayland;
+#[cfg(windows)]
+mod windows;
 
-use std::{fs, io, path::PathBuf, thread};
+#[cfg(kms)]
+pub mod vrr_exclusions;
 
+// `crate::vk_count!` call sites outside the render crate resolve through this.
+pub use yserver_render::vk_count;
+
+use std::io;
+#[cfg(unix)]
+use std::thread;
+#[cfg(kms)]
+use std::{fs, path::PathBuf};
+
+#[cfg(unix)]
 use nix::sys::signal::{SigSet, Signal};
 #[cfg(target_os = "linux")]
 use nix::sys::signal::{SigmaskHow, sigprocmask};
 #[cfg(target_os = "linux")]
 use nix::sys::signalfd::SignalFd;
 
+#[cfg(unix)]
+use yserver_core::core_loop::Message;
+use yserver_core::core_loop::{self, ResetPolicy};
+// Moved into core (`backend::install_backend_root_bindings`) so the
+// server-reset generation boundary can re-run the identical binding step
+// against a freshly constructed `ServerState`. Imported under its own name
+// here so this crate's call sites and test read as before.
+#[cfg(kms)]
 use yserver_core::{
-    // Moved into core (`backend::install_backend_root_bindings`) so the
-    // server-reset generation boundary can re-run the identical binding
-    // step against a freshly constructed `ServerState`. Imported under
-    // its own name here so this crate's call sites and test read as
-    // before.
     backend::{Backend, BackendTopology, install_backend_root_bindings},
-    core_loop::{self, Message, ResetPolicy, poll_tokens::ClientIdAllocator},
+    core_loop::poll_tokens::ClientIdAllocator,
 };
 
 /// Refuse to start when libinput's initial seat enumeration opened zero
@@ -39,6 +75,7 @@ use yserver_core::{
 /// real keyboard/mouse are permission-denied, yet a lone non-usable node (e.g. a
 /// HID "System Control" collection) can still open — that must not satisfy the
 /// guard.
+#[cfg(kms)]
 fn ensure_input_devices_opened(opened: usize) -> io::Result<()> {
     if opened == 0 {
         return Err(io::Error::other(
@@ -52,13 +89,20 @@ fn ensure_input_devices_opened(opened: usize) -> io::Result<()> {
 }
 
 /// What the startup path should do about input: spawn the input thread if a
-/// libinput context was created, or refuse to start if not.
+/// libinput context was created, or refuse to start if not. A rootless host's
+/// seat is the input of a server that has one, and libinput is not used.
+#[cfg(kms)]
 #[derive(Debug, PartialEq, Eq)]
 enum InputStartup {
     /// A live libinput context — spawn the input thread.
     DirectSpawn,
     /// No libinput context at all — refuse to start.
     AbortNoInput,
+    /// The host's seat is the input (the Wayland host): the host's window
+    /// system owns the devices, so no libinput context was made
+    /// ([`crate::kms::outputs::InputSource::HostSeat`]) and no input thread
+    /// starts.
+    HostSeat,
 }
 
 /// Decide the input-startup action. yserver is always Direct and requires
@@ -68,8 +112,11 @@ enum InputStartup {
 /// unavailable or every input device was permission-denied (not in the `input`
 /// group / not on the console). Extracted as a pure fn so the abort is
 /// unit-testable; `run()` itself is not.
-fn input_startup_action(has_input_ctx: bool) -> InputStartup {
-    if has_input_ctx {
+#[cfg(kms)]
+fn input_startup_action(has_input_ctx: bool, host_seat: bool) -> InputStartup {
+    if host_seat {
+        InputStartup::HostSeat
+    } else if has_input_ctx {
         InputStartup::DirectSpawn
     } else {
         InputStartup::AbortNoInput
@@ -84,7 +131,11 @@ fn input_startup_action(has_input_ctx: bool) -> InputStartup {
 /// and what makes the file cookies stop authorizing TCP clients. See
 /// `core_loop::auth::AuthState::new_with_xdmcp`.
 fn build_auth_state(opts: &launch::LaunchOptions) -> std::sync::Arc<core_loop::auth::AuthState> {
-    core_loop::auth::AuthState::new_with_xdmcp(opts.auth_file.clone(), opts.xdmcp.is_some())
+    core_loop::auth::AuthState::new_with(
+        opts.auth_file.clone(),
+        opts.xdmcp.is_some(),
+        opts.tcp_listen,
+    )
 }
 
 /// Validate TCP prerequisites before opening hardware or sockets, using the
@@ -112,7 +163,7 @@ fn validate_tcp_startup(
     // silently unix-only. `-nolisten tcp` (`opts.tcp_listen == false`) stays
     // accepted in this build — asking not to listen is satisfiable when the
     // binary cannot listen at all.
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     if opts.tcp_listen {
         return Err(io::Error::other(
             "this yserver was built without TCP support: -listen tcp needs the \
@@ -199,6 +250,7 @@ fn build_xdmcp_service(
     Ok(None)
 }
 
+#[cfg(unix)]
 fn bind_client_listeners(
     unix: std::os::unix::net::UnixListener,
     display: u16,
@@ -215,35 +267,92 @@ fn bind_client_listeners(
         auth.require_tcp_auth_at_startup()
             .map_err(io::Error::other)?;
         let port = launch::tcp_port(display).map_err(io::Error::other)?;
-        listeners.push(Listener::Tcp(bind_tcp_listener(port)?));
+        listeners.extend(bind_tcp_listeners(port)?.into_iter().map(Listener::Tcp));
     }
     Ok(listeners)
 }
 
-/// The one place a `tcp-transport` build actually opens a TCP socket.
+/// Windows has no Unix-domain listener, so TCP is its only transport.
+#[cfg(windows)]
+fn bind_client_listeners(
+    display: u16,
+    opts: &launch::LaunchOptions,
+    auth: &core_loop::auth::AuthState,
+) -> io::Result<Vec<yserver_core::transport::Listener>> {
+    if !opts.tcp_listen {
+        return Err(io::Error::other(
+            "Windows has no Unix-domain sockets: start with -listen tcp",
+        ));
+    }
+    auth.require_tcp_auth_at_startup()
+        .map_err(io::Error::other)?;
+    let port = launch::tcp_port(display).map_err(io::Error::other)?;
+    bind_tcp_listeners(port)?
+        .into_iter()
+        .map(yserver_core::transport::Listener::tcp)
+        .collect()
+}
+
+/// The one place a `tcp-transport` build actually opens TCP sockets.
 /// `Transport::Tcp` / `Listener::Tcp` stay compiled in every configuration —
 /// the type is `std` and costs nothing, and forking every `match` on
 /// `Transport` would buy no meaningful size win — so only the ABILITY to
-/// create the listener is gated here.
-#[cfg(feature = "tcp-transport")]
-fn bind_tcp_listener(port: u16) -> io::Result<std::net::TcpListener> {
-    let tcp =
-        std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port)).map_err(|err| {
-            io::Error::new(
-                err.kind(),
-                format!("cannot listen on TCP port {port}: {err}"),
-            )
-        })?;
-    log::info!("yserver: listening on TCP 0.0.0.0:{port}");
-    Ok(tcp)
+/// create the listeners is gated here.
+///
+/// `0.0.0.0:port`, then `[::]:port` with `IPV6_V6ONLY` as xtrans sets it
+/// (`Xtranssock.c` `SocketOpen`), so IPv4 peers keep plain IPv4 addresses.
+/// Like xtrans `MakeAllCOTSServerListeners`, `EADDRINUSE` on either is
+/// "server already running" and fatal; any other IPv6 failure (no IPv6 in
+/// the kernel) leaves an IPv4-only server, Xorg's default `PartialNetwork`.
+#[cfg(tcp_transport)]
+fn bind_tcp_listeners(port: u16) -> io::Result<Vec<std::net::TcpListener>> {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let v4 = SocketAddr::from((Ipv4Addr::UNSPECIFIED, port));
+    let v6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+    let cannot = |addr: SocketAddr, err: io::Error| {
+        io::Error::new(err.kind(), format!("cannot listen on TCP {addr}: {err}"))
+    };
+    let mut listeners = vec![bind_tcp_listener(v4).map_err(|err| cannot(v4, err))?];
+    match bind_tcp_listener(v6) {
+        Ok(listener) => {
+            listeners.push(listener);
+            log::info!("yserver: listening on TCP {v4} and {v6}");
+        }
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse => return Err(cannot(v6, err)),
+        Err(err) => {
+            log::warn!("yserver: no IPv6 TCP listener on {v6} ({err}); IPv4 only");
+            log::info!("yserver: listening on TCP {v4}");
+        }
+    }
+    Ok(listeners)
+}
+
+/// One listening socket; an IPv6 one accepts IPv6 only.
+#[cfg(tcp_transport)]
+fn bind_tcp_listener(addr: std::net::SocketAddr) -> io::Result<std::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    // As std's `TcpListener::bind` and xtrans do; on Windows it would let
+    // another process bind the same port.
+    #[cfg(unix)]
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    // std's `TcpListener::bind` backlog.
+    socket.listen(128)?;
+    Ok(socket.into())
 }
 
 /// The feature-off twin: `validate_tcp_startup` has already refused
 /// `-listen tcp` long before this point, before any hardware or sockets are
 /// touched. This is a second line of defence only, mirroring
 /// `build_xdmcp_service`'s feature-off twin above.
-#[cfg(not(feature = "tcp-transport"))]
-fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
+#[cfg(not(tcp_transport))]
+fn bind_tcp_listeners(_port: u16) -> io::Result<Vec<std::net::TcpListener>> {
     Err(io::Error::other(
         "this yserver was built without TCP support: -listen tcp needs the \
          `tcp-transport` build feature",
@@ -269,15 +378,64 @@ fn bind_tcp_listener(_port: u16) -> io::Result<std::net::TcpListener> {
 /// which is a log you can keep.
 pub const RESOURCE_TELEMETRY_TARGET: &str = "yserver::resources";
 
+/// Run the server on macOS.
+#[cfg(all(not(kms), target_os = "macos"))]
 pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    panic!("yserver only supports Linux and FreeBSD (DRM/KMS, libinput, evdev)");
+    let mode = launch::shell_mode(&opts, true).map_err(io::Error::other)?;
+    macos::run(opts, mode)
+}
+
+/// The settings stored in the user defaults.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn stored_settings() -> settings::Settings {
+    macos::stored_settings()
+}
+
+/// The settings stored in `%APPDATA%\yserver\settings.conf`.
+#[cfg(windows)]
+#[must_use]
+pub fn stored_settings() -> settings::Settings {
+    windows::stored_settings()
+}
+
+/// Run the server on Windows: in a window, in a window per top-level with
+/// `--rootless`, or headless with `--headless`.
+#[cfg(windows)]
+pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
+    let mode = launch::shell_mode(&opts, true).map_err(io::Error::other)?;
+    windows::run(opts, mode)
+}
+
+/// Run the server on a platform with neither KMS nor a window shell.
+#[cfg(all(not(kms), not(target_os = "macos"), not(windows)))]
+pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
+    launch::shell_mode(&opts, false).map_err(io::Error::other)?;
+    surface::server::run_headless(opts)
+}
+
+/// Run the server on the DRM/KMS platform: rootless on the Wayland
+/// compositor with `--rootless`, where the build has the Wayland host.
+#[cfg(kms)]
+pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
+    let mode = launch::shell_mode(&opts, cfg!(wayland_host)).map_err(io::Error::other)?;
+    if opts.headless {
+        // The surface platform with no surface: no DRM device, no input.
+        return surface::server::run_headless(opts);
+    }
+    if opts.geometry.is_some() {
+        log::warn!("yserver: --geometry is for --headless or platforms without KMS; ignored");
+    }
+    if opts.scale != launch::ScaleOption::Auto {
+        log::warn!("yserver: --scale is for platforms without KMS; ignored");
+    }
 
     // A dedicated target so the hardware recipes (which log at `warn` plus the
     // telemetry target) can keep the build hash in every log without enabling
     // the whole crate at `info`. A log without the hash cannot say which commit
     // it measured — that bit the 2026-09-03 z400 runs.
     log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
+    raise_open_files_limit();
 
     // Validate TCP's startup invariants before opening devices or sockets.
     let auth = build_auth_state(&opts);
@@ -372,6 +530,16 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                     s.queue_submit2,
                     s.begin_command_buffer,
                     s.end_command_buffer,
+                );
+                // Real submits by cause, thread CPU inside them, and the
+                // live allocation / idle pool counts they scale with (#214).
+                log::info!(
+                    "{}",
+                    crate::kms::vk::submit_stats::format_line(
+                        &crate::kms::vk::submit_stats::SUBMITS.snapshot_and_reset(),
+                        crate::kms::vk::mem_accounting::churn_snapshot().live_count(),
+                        crate::kms::vk::pixmap_pool::residency_snapshot().map_or(0, |r| r.entries),
+                    ),
                 );
                 // Submit attribution: which call sites drive
                 // queue_submit2. Sum should approximately equal
@@ -520,24 +688,25 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
                 // Absent (no `VK_EXT_memory_budget`, or Vulkan not up
                 // yet) the line is omitted rather than printed as
                 // zeros, which would read as "we use no memory".
-                // Live pool occupancy. The cumulative counters above
-                // cannot answer "how much is the pool holding right
-                // now" — entries leave only via takes_hit, so
-                // residency is a difference of two large numbers.
-                // The pool has no eviction and drains only at
-                // shutdown, so this is a high-water mark by
-                // construction; `nominal_bytes` is a FLOOR (real
-                // cost is mem_reqs.size per OPTIMAL-tiled image, each
-                // its own BO — there is no suballocator).
+                // Live pool occupancy, which the cumulative counters
+                // above cannot answer. `bytes` is the real allocation
+                // size the budget is enforced on; `nominal_bytes` is a
+                // FLOOR. The evicted totals are cumulative: budget
+                // evictions climbing under steady load mean the budget
+                // is below the working set.
                 if let Some(r) = crate::kms::vk::pixmap_pool::residency_snapshot() {
+                    let s = crate::kms::vk::pixmap_pool::telemetry_snapshot().unwrap_or_default();
                     log::info!(
                         target: RESOURCE_TELEMETRY_TARGET,
-                        "pixmap pool live: buckets={} empty_buckets={} entries={} \
-                         nominal_bytes_floor={:.1}MiB",
+                        "pixmap pool live: buckets={} entries={} bytes={:.1}MiB \
+                         nominal_bytes_floor={:.1}MiB evicted_budget_total={} \
+                         evicted_idle_total={}",
                         r.buckets,
-                        r.empty_buckets,
                         r.entries,
+                        r.bytes as f64 / (1024.0 * 1024.0),
                         r.nominal_bytes as f64 / (1024.0 * 1024.0),
+                        s.total_evicted_budget,
+                        s.total_evicted_idle,
                     );
                 }
                 // Per-process GPU engine time, from DRM fdinfo —
@@ -655,11 +824,20 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // would otherwise kill the whole session when the user hits Ctrl-C
     // inside an X client. Skipped silently when not on a Linux VC (pty
     // under SSH or a graphical terminal emulator).
-    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    let console_guard = crate::kms::console::ConsoleGuard::acquire(opts.vt)?;
-    #[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
-    let console_guard: Option<()> = None;
-    let device_paths = crate::platform::drm::resolve_default_kms_devices()?;
+    //
+    // A client of a Wayland compositor owns neither the console nor a card:
+    // the compositor has both, and the server runs on its renderer alone.
+    let wayland = mode == launch::ShellMode::Rootless;
+    let console_guard = if wayland {
+        None
+    } else {
+        crate::kms::console::ConsoleGuard::acquire(opts.vt)?
+    };
+    let device_paths = if wayland {
+        Vec::new()
+    } else {
+        crate::platform::drm::resolve_default_kms_devices()?
+    };
     if device_paths.is_empty() {
         log::info!("yserver: no DRM devices to open; starting zero-card headless");
     } else {
@@ -676,7 +854,31 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // Always Direct (self-managed DRM master + VT_PROCESS): open DRM +
     // libinput directly, arming VT_PROCESS when a controlling console is
     // present.
-    let mut backend = build_kms_backend(&device_paths, console_guard, opts.layout.clone())?;
+    // A host's seat is the input: no libinput context is made for it.
+    let input = if wayland {
+        crate::kms::outputs::InputSource::HostSeat
+    } else {
+        crate::kms::outputs::InputSource::Libinput
+    };
+    let mut backend = build_kms_backend(
+        &device_paths,
+        input,
+        console_guard,
+        opts.layout.clone(),
+        opts.vrr,
+    )?;
+    // The rootless Wayland host, which the root's size and the keymap come
+    // from: attached before the topology is read.
+    #[cfg(wayland_host)]
+    let wayland_host = if wayland {
+        let host = std::rc::Rc::new(std::cell::RefCell::new(wayland::WaylandHost::connect()?));
+        backend.attach_rootless_host(host.clone())?;
+        let (width, height) = backend.fb_dimensions();
+        log::info!("wayland: the root window is the compositor's screen, {width}x{height}");
+        Some(host)
+    } else {
+        None
+    };
     // One snapshot of everything `ServerState` needs from the live
     // backend — screen extent, RandR outputs/modes/providers, backend
     // capabilities. The server-reset boundary re-derives a generation
@@ -698,6 +900,18 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // saved press timestamps.
     crate::clock::init(state.start_instant);
     install_backend_root_bindings(&mut state, &backend);
+    yserver_core::core_loop::process_request::install_default_font(&mut state, &mut backend)?;
+    #[cfg(wayland_host)]
+    if let Some(host) = &wayland_host {
+        backend
+            .start_rootless(&mut state)
+            .map_err(|e| io::Error::other(format!("rootless: {e}")))?;
+        if let Some(name) = host.borrow().window_manager_name() {
+            log::info!("wayland: the window manager is {name}");
+            yserver_core::rootless::name_window_manager(&mut state, &mut backend, &name);
+        }
+        log::info!("yserver: rootless, on the Wayland compositor");
+    }
 
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir).map_err(|e| {
@@ -727,6 +941,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         launch::Resolution::AutoPick => {
             let (display, listener, socket_path) = launch::autopick(&socket_dir)?;
             (display, listener, None, socket_path)
+        }
+        launch::Resolution::FirstFree { first } => {
+            let (display, guard, listener, socket_path) =
+                launch::autopick_locked(&lock_dir, &socket_dir, first)?;
+            (display, listener, Some(guard), socket_path)
         }
     };
     log::info!("yserver: listening on unix socket DISPLAY=:{display}");
@@ -766,7 +985,11 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     // `SendContext::new()` failed — libinput unavailable, or every input
     // device was permission-denied — so we refuse to start below.
     let direct_input_ctx = backend.take_input_ctx();
-    match input_startup_action(direct_input_ctx.is_some()) {
+    match input_startup_action(direct_input_ctx.is_some(), wayland) {
+        InputStartup::HostSeat => {
+            debug_assert!(direct_input_ctx.is_none(), "a host seat opens no libinput");
+            log::info!("yserver: input comes from the host's seat; no libinput");
+        }
         InputStartup::AbortNoInput => {
             // libinput could not be set up at all (`SendContext::new()` failed
             // → `take_input_ctx()` is None). Refuse to start: a session with no
@@ -834,108 +1057,7 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
         }
     }
 
-    // signalfd → Message bridge. yserver-core deliberately doesn't
-    // depend on nix; a tiny thread wraps the SignalFd read so run_core
-    // only sees channel-side messages. SIGINT/SIGTERM map to
-    // `Shutdown`; SIGUSR1/SIGUSR2 map to VT release/acquire messages
-    // (a no-op when VT switching is not armed).
-    //
-    // SIGUSR1 carries three distinct, non-conflicting meanings here:
-    // (1) the *inherited disposition* read once at startup
-    // (`sigusr1_was_ignored` above) drives the readiness handshake
-    // *to the parent* DM (`launch::signal_ready`); (2) masked-and-
-    // signalfd-consumed *delivery to self* drives the VT release/
-    // acquire handshake; (3) we *send* SIGUSR1 outward to the parent
-    // at readiness. Disposition-in, delivery-to-self, and signal-out
-    // are separate.
-    let signal_sender = sender.clone_handle();
-    let signal_reset_policy = opts.reset_policy;
-    thread::Builder::new()
-        .name("yserver-signalfd".into())
-        .spawn(move || {
-            let signal_fd = signal_fd;
-            #[cfg(target_os = "linux")]
-            loop {
-                match signal_fd.read_signal() {
-                    Ok(Some(siginfo)) => {
-                        let signo = siginfo.ssi_signo as i32;
-                        if signo == nix::libc::SIGUSR1 {
-                            log::info!("yserver: received SIGUSR1, forwarding VT release");
-                            if signal_sender.send(Message::VtRelease).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        if signo == nix::libc::SIGUSR2 {
-                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
-                            if signal_sender.send(Message::VtAcquire).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        let (message, what) = signal_action(signo, signal_reset_policy);
-                        log::info!("yserver: received signal {signo}, requesting {what}");
-                        let stop = matches!(message, Message::Shutdown);
-                        if signal_sender.send(message).is_err() || stop {
-                            return;
-                        }
-                        continue;
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        log::warn!("yserver: signalfd read error: {err}");
-                        let _ = signal_sender.send(Message::Shutdown);
-                        return;
-                    }
-                }
-            }
-            #[cfg(target_os = "freebsd")]
-            {
-                use nix::sys::event::KEvent;
-                let mut events = [KEvent::new(
-                    0,
-                    nix::sys::event::EventFilter::EVFILT_SIGNAL,
-                    nix::sys::event::EvFlags::empty(),
-                    nix::sys::event::FilterFlag::empty(),
-                    0,
-                    0isize,
-                ); 4];
-                loop {
-                    let n = match signal_fd.kevent(&[], &mut events, None) {
-                        Ok(n) => n,
-                        Err(nix::errno::Errno::EINTR) => continue,
-                        Err(err) => {
-                            log::warn!("yserver: kevent signal read error: {err}");
-                            let _ = signal_sender.send(Message::Shutdown);
-                            return;
-                        }
-                    };
-                    for ev in &events[..n] {
-                        let signo = ev.ident() as i32;
-                        if signo == nix::libc::SIGUSR1 {
-                            log::info!("yserver: received SIGUSR1, forwarding VT release");
-                            if signal_sender.send(Message::VtRelease).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        if signo == nix::libc::SIGUSR2 {
-                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
-                            if signal_sender.send(Message::VtAcquire).is_err() {
-                                return;
-                            }
-                            continue;
-                        }
-                        let (message, what) = signal_action(signo, signal_reset_policy);
-                        log::info!("yserver: received signal {signo}, requesting {what}");
-                        let stop = matches!(message, Message::Shutdown);
-                        if signal_sender.send(message).is_err() || stop {
-                            return;
-                        }
-                    }
-                }
-            }
-        })?;
+    spawn_signal_thread(signal_fd, sender.clone_handle(), opts.reset_policy)?;
 
     // Readiness handshake: ServerState is fully constructed, the socket is
     // bound + chmod'd, and the lock is held — we can complete an initial X
@@ -1010,16 +1132,135 @@ pub fn run(opts: launch::LaunchOptions) -> io::Result<()> {
     result
 }
 
+/// signalfd → Message bridge. yserver-core deliberately doesn't
+/// depend on nix; a tiny thread wraps the SignalFd read so run_core
+/// only sees channel-side messages. SIGINT/SIGTERM map to
+/// `Shutdown`; SIGUSR1/SIGUSR2 map to VT release/acquire messages
+/// (a no-op when VT switching is not armed).
+///
+/// SIGUSR1 carries three distinct, non-conflicting meanings here:
+/// (1) the *inherited disposition* read once at startup
+/// (`sigusr1_was_ignored` in `run`) drives the readiness handshake
+/// *to the parent* DM (`launch::signal_ready`); (2) masked-and-
+/// signalfd-consumed *delivery to self* drives the VT release/
+/// acquire handshake; (3) we *send* SIGUSR1 outward to the parent
+/// at readiness. Disposition-in, delivery-to-self, and signal-out
+/// are separate.
+#[cfg(unix)]
+fn spawn_signal_thread(
+    signal_fd: SignalSource,
+    signal_sender: core_loop::CoreSender,
+    signal_reset_policy: ResetPolicy,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name("yserver-signalfd".into())
+        .spawn(move || {
+            let signal_fd = signal_fd;
+            #[cfg(target_os = "linux")]
+            loop {
+                match signal_fd.read_signal() {
+                    Ok(Some(siginfo)) => {
+                        let signo = siginfo.ssi_signo as i32;
+                        if signo == drawable_dump_signal() {
+                            log::info!("drawable dump requested by signal");
+                            if signal_sender.send(Message::DumpDrawables).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        if signo == nix::libc::SIGUSR1 {
+                            log::info!("yserver: received SIGUSR1, forwarding VT release");
+                            if signal_sender.send(Message::VtRelease).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        if signo == nix::libc::SIGUSR2 {
+                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
+                            if signal_sender.send(Message::VtAcquire).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let (message, what) = signal_action(signo, signal_reset_policy);
+                        log::info!("yserver: received signal {signo}, requesting {what}");
+                        let stop = matches!(message, Message::Shutdown);
+                        if signal_sender.send(message).is_err() || stop {
+                            return;
+                        }
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        log::warn!("yserver: signalfd read error: {err}");
+                        let _ = signal_sender.send(Message::Shutdown);
+                        return;
+                    }
+                }
+            }
+            #[cfg(kqueue)]
+            {
+                use nix::sys::event::KEvent;
+                let mut events = [KEvent::new(
+                    0,
+                    nix::sys::event::EventFilter::EVFILT_SIGNAL,
+                    nix::sys::event::EvFlags::empty(),
+                    nix::sys::event::FilterFlag::empty(),
+                    0,
+                    0isize,
+                ); 4];
+                loop {
+                    let n = match signal_fd.kevent(&[], &mut events, None) {
+                        Ok(n) => n,
+                        Err(nix::errno::Errno::EINTR) => continue,
+                        Err(err) => {
+                            log::warn!("yserver: kevent signal read error: {err}");
+                            let _ = signal_sender.send(Message::Shutdown);
+                            return;
+                        }
+                    };
+                    for ev in &events[..n] {
+                        let signo = ev.ident() as i32;
+                        if signo == nix::libc::SIGUSR1 {
+                            log::info!("yserver: received SIGUSR1, forwarding VT release");
+                            if signal_sender.send(Message::VtRelease).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        if signo == nix::libc::SIGUSR2 {
+                            log::info!("yserver: received SIGUSR2, forwarding VT acquire");
+                            if signal_sender.send(Message::VtAcquire).is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                        let (message, what) = signal_action(signo, signal_reset_policy);
+                        log::info!("yserver: received signal {signo}, requesting {what}");
+                        let stop = matches!(message, Message::Shutdown);
+                        if signal_sender.send(message).is_err() || stop {
+                            return;
+                        }
+                    }
+                }
+            }
+        })?;
+    Ok(())
+}
+
 /// Build a `KmsBackend`. yserver is always Direct — self-managed DRM master
 /// with VT_PROCESS — so this opens DRM + libinput directly, arming VT_PROCESS
 /// when a real controlling console is present. (libseat/logind session
 /// management was removed; the Direct model is the sole seat model.)
+#[cfg(kms)]
 fn build_kms_backend(
     device_paths: &[std::path::PathBuf],
+    input: crate::kms::outputs::InputSource,
     console_guard: crate::kms::ConsoleGuardOpt,
     layout: Option<String>,
+    vrr_mode: crate::launch::VrrMode,
 ) -> io::Result<crate::kms::render::KmsBackend> {
-    crate::kms::render::KmsBackend::open(device_paths, console_guard, layout)
+    crate::kms::render::KmsBackend::open(device_paths, input, console_guard, layout, vrr_mode)
 }
 
 /// Map a delivered signal to the core-loop message it requests, plus a
@@ -1037,7 +1278,7 @@ fn build_kms_backend(
 /// SIGINT/SIGTERM and anything else still map to `Shutdown` under every
 /// policy. SIGUSR1/SIGUSR2 never reach here — the signalfd loops handle
 /// the VT handshake before calling this.
-#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "linux", kqueue))]
 fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
     if signo == nix::libc::SIGHUP && policy != ResetPolicy::NoReset {
         return (Message::ResetRequested, "a server reset");
@@ -1045,8 +1286,86 @@ fn signal_action(signo: i32, policy: ResetPolicy) -> (Message, &'static str) {
     (Message::Shutdown, "shutdown")
 }
 
+/// `SIGRTMIN+3` requests the drawable dump the Ctrl+Alt+F12 hotkey does
+/// (`kill -RTMIN+3 $(pidof yserver)`), for sessions where a client reacts to
+/// the modifiers.
+/// Every client, DRM device and the probe helper's inherited slots (fds 198,
+/// 199 and copies from 256) need descriptors. OpenBSD's daemon login class,
+/// which a display manager runs as, starts at 128; raise the soft limit to
+/// Linux's usual 1024, capped by the hard limit.
+#[cfg(kms)]
+fn raise_open_files_limit() {
+    const WANTED: libc::rlim_t = 1024;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit writes one rlimit into the stack-local struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0
+        || limit.rlim_cur >= WANTED
+    {
+        return;
+    }
+    let from = limit.rlim_cur;
+    limit.rlim_cur = WANTED.min(limit.rlim_max);
+    // SAFETY: setrlimit reads the struct; raising the soft limit no higher
+    // than the hard one needs no privilege.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const limit) } == 0 {
+        log::info!(
+            "yserver: open-files limit raised from {from} to {}",
+            limit.rlim_cur
+        );
+    } else {
+        log::warn!(
+            "yserver: cannot raise the open-files limit from {from}: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
+/// TODO(windows): Ctrl+C and console close should request `Shutdown`
+/// (`SetConsoleCtrlHandler`); until then nothing watches for them.
+#[cfg(windows)]
+struct SignalSource;
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn block_termination_signals() -> io::Result<SignalSource> {
+    Ok(SignalSource)
+}
+
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+fn spawn_signal_thread(
+    _signal_source: SignalSource,
+    _signal_sender: core_loop::CoreSender,
+    _signal_reset_policy: ResetPolicy,
+) -> io::Result<()> {
+    Ok(())
+}
+
+/// What the signal thread reads signals from.
+#[cfg(target_os = "linux")]
+type SignalSource = SignalFd;
+#[cfg(kqueue)]
+type SignalSource = nix::sys::event::Kqueue;
+
+#[cfg(target_os = "linux")]
+fn drawable_dump_signal() -> i32 {
+    nix::libc::SIGRTMIN() + 3
+}
+
 #[cfg(target_os = "linux")]
 fn block_termination_signals() -> io::Result<SignalFd> {
+    let mask = signalfd_mask();
+    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
+        .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
+    SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))
+}
+
+/// The signals the signalfd thread consumes; all are blocked process-wide.
+#[cfg(target_os = "linux")]
+fn signalfd_mask() -> SigSet {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGINT);
     mask.add(Signal::SIGTERM);
@@ -1063,14 +1382,19 @@ fn block_termination_signals() -> io::Result<SignalFd> {
     mask.add(Signal::SIGUSR1);
     // SIGUSR2 → VT acquire. Same blocking rationale as SIGUSR1.
     mask.add(Signal::SIGUSR2);
-    sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None)
-        .map_err(|err| io::Error::other(format!("sigprocmask SIG_BLOCK: {err}")))?;
-    SignalFd::new(&mask).map_err(|err| io::Error::other(format!("signalfd: {err}")))
+    // SIGRTMIN+3 → drawable dump; its default action would terminate us.
+    let mut raw = *mask.as_ref();
+    // SAFETY: `raw` is an initialised sigset and the signal number is a
+    // valid real-time signal.
+    unsafe {
+        nix::libc::sigaddset(&raw mut raw, drawable_dump_signal());
+        SigSet::from_sigset_t_unchecked(raw)
+    }
 }
 
-/// FreeBSD: ignore the same signals and return a kqueue fd with
+/// kqueue platforms: ignore the same signals and return a kqueue fd with
 /// EVFILT_SIGNAL filters registered.
-#[cfg(target_os = "freebsd")]
+#[cfg(kqueue)]
 fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     use nix::sys::{
         event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue},
@@ -1144,21 +1468,44 @@ fn block_termination_signals() -> io::Result<nix::sys::event::Kqueue> {
     Ok(kq)
 }
 
-#[cfg(all(test, feature = "tcp-transport"))]
+#[cfg(all(test, tcp_transport))]
 mod tcp_tests;
 
 #[cfg(test)]
 mod tests {
+    #[cfg(kms)]
     use super::{
-        InputStartup, Message, ResetPolicy, build_auth_state, build_xdmcp_service,
-        ensure_input_devices_opened, input_startup_action, install_backend_root_bindings, launch,
-        signal_action, validate_tcp_startup,
+        InputStartup, ensure_input_devices_opened, input_startup_action,
+        install_backend_root_bindings,
     };
+    use super::{
+        Message, ResetPolicy, build_auth_state, build_xdmcp_service, launch, signal_action,
+        validate_tcp_startup,
+    };
+    #[cfg(kms)]
     use yserver_core::{
         backend::Backend,
         resources::{ARGB_COLORMAP, ARGB_VISUAL, ROOT_VISUAL, ROOT_WINDOW},
         server::ServerState,
     };
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn signalfd_consumes_the_drawable_dump_signal_and_the_vt_signals() {
+        let mask = super::signalfd_mask();
+        let dump = super::drawable_dump_signal();
+        assert_eq!(dump, nix::libc::SIGRTMIN() + 3);
+        for signo in [
+            dump,
+            nix::libc::SIGUSR1,
+            nix::libc::SIGUSR2,
+            nix::libc::SIGTERM,
+        ] {
+            // SAFETY: `mask` holds an initialised sigset.
+            let member = unsafe { nix::libc::sigismember(mask.as_ref(), signo) };
+            assert_eq!(member, 1, "signal {signo} not in the signalfd mask");
+        }
+    }
 
     #[test]
     fn sighup_still_shuts_down_under_the_default_policy() {
@@ -1255,7 +1602,7 @@ mod tests {
     /// test asserting only that it errored would pass just as well if
     /// `-listen` had degraded to "unknown option", which is the failure this
     /// step exists to prevent.
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     #[test]
     fn a_build_without_tcp_transport_refuses_listen_tcp_at_startup_validation() {
         let opts = launch::parse_args([":7", "-listen", "tcp"].into_iter().map(String::from))
@@ -1286,7 +1633,7 @@ mod tests {
     /// `-nolisten tcp` asks not to listen, which a build lacking
     /// `tcp-transport` can always satisfy — it must not be swept up in the
     /// refusal above.
-    #[cfg(not(feature = "tcp-transport"))]
+    #[cfg(not(tcp_transport))]
     #[test]
     fn a_build_without_tcp_transport_still_accepts_nolisten_tcp() {
         let opts = launch::parse_args([":7", "-nolisten", "tcp"].into_iter().map(String::from))
@@ -1315,6 +1662,7 @@ mod tests {
         }
     }
 
+    #[cfg(kms)]
     #[test]
     fn install_backend_root_bindings_sets_root_host_xid_and_visuals() {
         let mut state = ServerState::new();
@@ -1344,6 +1692,7 @@ mod tests {
         );
     }
 
+    #[cfg(kms)]
     #[test]
     fn ensure_input_devices_opened_rejects_zero_with_actionable_message() {
         let err = ensure_input_devices_opened(0).expect_err("zero devices must abort startup");
@@ -1360,24 +1709,39 @@ mod tests {
         );
     }
 
+    #[cfg(kms)]
     #[test]
     fn ensure_input_devices_opened_accepts_one_or_more() {
         assert!(ensure_input_devices_opened(1).is_ok());
         assert!(ensure_input_devices_opened(8).is_ok());
     }
 
+    #[cfg(kms)]
     #[test]
     fn direct_mode_without_input_ctx_aborts_startup() {
         // Regression: always-Direct with a failed libinput setup
         // (`SendContext::new()` Err → `take_input_ctx()` None) must abort,
         // not fall through to a dead session that can't be zapped. This is
         // the gap the `opened == 0` guard did NOT cover.
-        assert_eq!(input_startup_action(false), InputStartup::AbortNoInput);
+        assert_eq!(
+            input_startup_action(false, false),
+            InputStartup::AbortNoInput
+        );
     }
 
+    #[cfg(kms)]
     #[test]
     fn with_input_ctx_spawns_input_thread() {
-        assert_eq!(input_startup_action(true), InputStartup::DirectSpawn);
+        assert_eq!(input_startup_action(true, false), InputStartup::DirectSpawn);
+    }
+
+    /// A rootless host's seat is the input: no libinput thread, whether or
+    /// not a context opened, and no refusal for want of devices.
+    #[cfg(kms)]
+    #[test]
+    fn a_host_seat_takes_the_place_of_libinput() {
+        assert_eq!(input_startup_action(true, true), InputStartup::HostSeat);
+        assert_eq!(input_startup_action(false, true), InputStartup::HostSeat);
     }
 
     // TCP-only behaviour of `validate_tcp_startup` (auth-file requirement,
@@ -1385,7 +1749,7 @@ mod tests {
     // built-without-TCP refusal fires first. Per the design's test-gating
     // rule, a test is gated by the narrowest feature whose behaviour it
     // asserts.
-    #[cfg(feature = "tcp-transport")]
+    #[cfg(tcp_transport)]
     #[test]
     fn listen_tcp_without_auth_is_rejected_before_startup() {
         let opts = crate::launch::parse_args(["-listen".into(), "tcp".into()]).unwrap();
@@ -1419,7 +1783,11 @@ mod tests {
         // check authorizes nobody.
         assert!(matches!(
             auth.check(
-                yserver_core::core_loop::auth::AuthTransport::Tcp,
+                &yserver_core::peer::PeerIdentity {
+                    transport: yserver_core::core_loop::auth::AuthTransport::Tcp,
+                    addr: None,
+                    cred: None,
+                },
                 yserver_core::core_loop::generation::Generation::default(),
                 yserver_core::xauth::MIT_MAGIC_COOKIE.as_bytes(),
                 &[0u8; 16],
@@ -1428,7 +1796,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "tcp-transport")]
+    #[cfg(tcp_transport)]
     #[test]
     fn tcp_startup_port_validation_accepts_65535_and_rejects_overflow() {
         let path = std::env::temp_dir().join(format!(

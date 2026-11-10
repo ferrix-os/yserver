@@ -1,0 +1,8 @@
+# max<TAB>pattern, for font-list-probe.c on misc + the alias dir font-list.sh writes.
+10	zz-alias-*
+3	zz-alias-*
+1	zz-alias-g*
+10	zz-alias-fixed
+10	ZZ-ALIAS-CASE
+10	zz-alias-loop
+10	zz-alias-pattern

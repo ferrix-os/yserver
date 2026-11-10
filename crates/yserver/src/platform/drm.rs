@@ -7,7 +7,7 @@
 //! `crate::drm::modeset`.
 
 use std::{
-    fmt, fs,
+    fs,
     io::{self, ErrorKind},
     os::{
         fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd},
@@ -18,30 +18,17 @@ use std::{
 
 use ::drm::control::{Device as _, connector};
 
-pub(crate) use crate::drm::modeset::{
-    ConnectorProbe, ConnectorSnapshotProbe, Mode, ModeIdentity, Output, connector_is_non_desktop,
-    discover_output_for_connector, discover_outputs, probe_connector_snapshots, probe_connectors,
+pub(crate) use crate::{
+    drm::modeset::{
+        ConnectorProbe, ConnectorSnapshotProbe, Mode, ModeIdentity, Output,
+        connector_is_non_desktop, discover_output_for_connector, discover_outputs,
+        probe_connector_snapshots, probe_connectors,
+    },
+    kms::vk::device::DrmDeviceKey,
 };
 
 const DRM_DIR: &str = "/dev/dri";
 pub(crate) const RENDER_NODE_ENV: &str = "YSERVER_DRI_RENDER_NODE";
-
-/// Stable kernel identity of one DRM device node.
-///
-/// This is the node's `st_rdev` major/minor pair, matching the identity
-/// exported by `VK_EXT_physical_device_drm`; unlike `cardN`, it is suitable as
-/// a join key for later multi-device PRIME topology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct DrmDeviceKey {
-    pub(crate) major: u32,
-    pub(crate) minor: u32,
-}
-
-impl fmt::Display for DrmDeviceKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.major, self.minor)
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DrmNodeKind {
@@ -254,6 +241,11 @@ pub(crate) fn primary_device_key_from_fd(fd: BorrowedFd<'_>) -> io::Result<DrmDe
     device_key_from_fd(fd)
 }
 
+/// Every render node in `/dev/dri`.
+pub(crate) fn render_nodes() -> io::Result<Vec<DrmNode>> {
+    enumerate_nodes("renderD", DrmNodeKind::Render)
+}
+
 pub(crate) fn render_node_for_primary(primary: DrmDeviceKey) -> io::Result<Option<DrmNode>> {
     #[cfg(target_os = "linux")]
     if let Some(path) = super::drm_linux::render_node_path_for_primary(primary)? {
@@ -261,6 +253,10 @@ pub(crate) fn render_node_for_primary(primary: DrmDeviceKey) -> io::Result<Optio
     }
 
     let candidates = enumerate_nodes("renderD", DrmNodeKind::Render)?;
+    #[cfg(target_os = "openbsd")]
+    if let Some(node) = paired_render_node(&candidates, primary) {
+        return Ok(Some(node));
+    }
     let primary_parent = device_parent_for(primary);
     let resolved: Vec<(DrmNode, Option<PathBuf>)> = candidates
         .into_iter()
@@ -270,6 +266,18 @@ pub(crate) fn render_node_for_primary(primary: DrmDeviceKey) -> io::Result<Optio
         })
         .collect();
     select_render_node(&resolved, primary_parent.as_deref(), primary)
+}
+
+/// OpenBSD pairs card N (minor N) with renderD(128+N) (minor 128+N). Its
+/// static `/dev/dri` holds nodes for absent units too, so there is never a
+/// lone render node to fall back on.
+#[cfg_attr(not(target_os = "openbsd"), allow(dead_code))]
+fn paired_render_node(candidates: &[DrmNode], primary: DrmDeviceKey) -> Option<DrmNode> {
+    let render = DrmDeviceKey {
+        major: primary.major,
+        minor: primary.minor.checked_add(128)?,
+    };
+    candidates.iter().find(|node| node.key == render).cloned()
 }
 
 fn select_render_node(
@@ -351,7 +359,7 @@ fn node_for_path(path: PathBuf, kind: DrmNodeKind) -> io::Result<DrmNode> {
     let metadata = fs::metadata(&path)?;
     Ok(DrmNode {
         path,
-        key: device_key_from_rdev(metadata.rdev()),
+        key: device_key_from_rdev(dev_t_from_std(metadata.rdev())),
         kind,
     })
 }
@@ -390,6 +398,13 @@ fn device_key_from_fd(fd: BorrowedFd<'_>) -> io::Result<DrmDeviceKey> {
         return Err(io::Error::last_os_error());
     }
     Ok(device_key_from_rdev(stat.st_rdev))
+}
+
+/// std widens `st_rdev` to `u64`; narrow it back to the `dev_t` it came
+/// from (`i32` on OpenBSD).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn dev_t_from_std(rdev: u64) -> libc::dev_t {
+    rdev as libc::dev_t
 }
 
 fn device_key_from_rdev(rdev: libc::dev_t) -> DrmDeviceKey {
@@ -619,6 +634,25 @@ mod tests {
     }
 
     #[test]
+    fn paired_render_node_is_the_card_minor_plus_128() {
+        // OpenBSD's static /dev/dri: card0..3 = minors 0..3, renderD128..131
+        // = minors 128..131.
+        let candidates: Vec<DrmNode> = (128..132)
+            .map(|minor| node(&format!("/dev/dri/renderD{minor}"), minor))
+            .collect();
+        let card = |minor| DrmDeviceKey { major: 226, minor };
+        assert_eq!(
+            paired_render_node(&candidates, card(0)).map(|node| node.path),
+            Some(PathBuf::from("/dev/dri/renderD128"))
+        );
+        assert_eq!(
+            paired_render_node(&candidates, card(1)).map(|node| node.path),
+            Some(PathBuf::from("/dev/dri/renderD129"))
+        );
+        assert_eq!(paired_render_node(&candidates, card(4)), None);
+    }
+
+    #[test]
     fn render_selection_prefers_exact_sibling() {
         let candidates = [
             (
@@ -719,7 +753,7 @@ mod tests {
         let metadata = file.metadata().unwrap();
         assert_eq!(
             device_key_from_fd(file.as_fd()).unwrap(),
-            device_key_from_rdev(metadata.rdev())
+            device_key_from_rdev(dev_t_from_std(metadata.rdev()))
         );
     }
 

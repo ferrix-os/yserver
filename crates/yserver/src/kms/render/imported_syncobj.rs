@@ -25,11 +25,20 @@ use std::{
 
 use ::drm::control::{Device as DrmControlDevice, syncobj};
 
+/// Operations needed by the Present acquire-wait path. Kept behind a trait
+/// so the Backend can drive imported DRM syncobjs and deterministic test
+/// timelines through the same wait entries.
+pub(crate) trait PresentSyncobj: yserver_core::backend::SyncobjHandle {
+    fn timeline_value(&self) -> std::io::Result<u64>;
+    fn signaled_eventfd(&self, value: u64) -> std::io::Result<OwnedFd>;
+}
+
 #[cfg(all(target_os = "linux", target_env = "musl"))]
 type SyncobjIoctlReq = libc::c_int;
 #[cfg(any(
     all(target_os = "linux", not(target_env = "musl")),
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "openbsd"
 ))]
 type SyncobjIoctlReq = libc::c_ulong;
 
@@ -117,6 +126,7 @@ impl ImportedSyncobj {
     /// Register a non-blocking kernel notification for a timeline point.
     /// Unchanged in behaviour from the previous `OwnedSemaphore` version —
     /// that method already went through DRM.
+    #[cfg(eventfd)]
     pub(crate) fn signaled_eventfd(&self, value: u64) -> std::io::Result<OwnedFd> {
         use nix::sys::eventfd::{EfdFlags, EventFd};
 
@@ -126,6 +136,13 @@ impl ImportedSyncobj {
         self.drm
             .syncobj_eventfd(self.handle, value, event.as_fd(), false)?;
         Ok(event.into())
+    }
+
+    /// No eventfd on this platform; [`eventfd_supported`] reports false, so
+    /// callers poll instead.
+    #[cfg(not(eventfd))]
+    pub(crate) fn signaled_eventfd(&self, _value: u64) -> std::io::Result<OwnedFd> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
 }
 
@@ -142,6 +159,7 @@ impl ImportedSyncobj {
 ///
 /// Mirrors the shape of `eventfd_fires_on_the_registered_point` below, which
 /// passes on Linux: a fresh syncobj, a future timeline point, no wait.
+#[cfg(eventfd)]
 pub(crate) fn eventfd_supported(drm: &Arc<crate::drm::Device>) -> bool {
     use nix::sys::eventfd::{EfdFlags, EventFd};
 
@@ -155,6 +173,11 @@ pub(crate) fn eventfd_supported(drm: &Arc<crate::drm::Device>) -> bool {
         log::warn!("destroy probe syncobj failed: {e}");
     }
     supported
+}
+
+#[cfg(not(eventfd))]
+pub(crate) fn eventfd_supported(_drm: &Arc<crate::drm::Device>) -> bool {
+    false
 }
 
 impl std::fmt::Debug for ImportedSyncobj {
@@ -206,6 +229,16 @@ impl yserver_core::backend::SyncobjHandle for ImportedSyncobj {
             (Ok(()), Err(e)) => Err(e),
             (Ok(()), Ok(())) => Ok(()),
         }
+    }
+}
+
+impl PresentSyncobj for ImportedSyncobj {
+    fn timeline_value(&self) -> std::io::Result<u64> {
+        ImportedSyncobj::timeline_value(self)
+    }
+
+    fn signaled_eventfd(&self, value: u64) -> std::io::Result<OwnedFd> {
+        ImportedSyncobj::signaled_eventfd(self, value)
     }
 }
 

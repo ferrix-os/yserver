@@ -1,0 +1,62 @@
+name: Bug report
+description: Something renders wrong, crashes, or behaves differently from Xorg
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Include what you expected instead. For visual problems, a photo or video helps.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The applications and commands involved, and how often it happens.
+      placeholder: |
+        1. Start the session with `starty`
+        2. Open ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: xorg
+    attributes:
+      label: Does the same setup work on Xorg?
+      options:
+        - "Yes, it only fails on yserver"
+        - "No, it also fails on Xorg"
+        - "Not tested"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: yserver version
+      description: The output of `yserver --version`, or the commit you built.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Leave out what does not apply.
+      value: |
+        OS and kernel:
+        GPU and driver version:
+        Monitors (count, resolution, refresh rate):
+        Desktop or window manager:
+        Compositor:
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server log
+      description: |
+        Run `RUST_LOG=debug starty`, reproduce the problem, exit, then attach `~/.local/state/yserver/yserver.log`. See [docs/setup.md](https://github.com/joske/yserver/blob/master/docs/setup.md) for other ways to capture it.
+
+        On macOS, run `just macos-run 1 1280x800 debug` and attach `yserver-mac.log`. The app started from Finder logs to `~/Library/Logs/yserver.log`.
+
+        Drag the file here rather than pasting it, and check it first for anything you do not want public.

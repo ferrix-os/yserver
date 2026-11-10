@@ -16,7 +16,7 @@ use std::{
         fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     rc::Rc,
     thread,
@@ -818,7 +818,7 @@ impl ProbeHelperSupervisor {
         // PR_SET_PDEATHSIG.
         let supervisor_pid = unsafe { libc::getpid() };
 
-        let mut command = Command::new(&self.executable);
+        let mut command = probe_helper_command(&self.executable);
         command
             .arg(REEXEC_ARG)
             .stdin(Stdio::null())
@@ -844,6 +844,12 @@ impl ProbeHelperSupervisor {
         supervise_exchange(child, parent_control, request, self.watchdog)
             .map_err(ProbeHelperRunError::ChildStartedUncertain)
     }
+}
+
+fn probe_helper_command(executable: &Path) -> Command {
+    let mut command = Command::new(executable);
+    command.env_remove("DISPLAY");
+    command
 }
 
 /// Called by the `yserver` binary before normal argument parsing.
@@ -1365,6 +1371,28 @@ mod tests {
     }
 
     #[test]
+    fn helper_command_removes_display_and_inherits_other_environment() {
+        // Mutation: dropping `.env_remove("DISPLAY")` must fail the removal assertion.
+        let mut command = probe_helper_command(std::path::Path::new("/usr/bin/env"));
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == OsStr::new("DISPLAY") && value.is_none())
+        );
+
+        let inherited_path = env::var_os("PATH").expect("test process PATH");
+        let output = command.output().expect("run environment probe child");
+        assert!(output.status.success());
+        let expected_path = [b"PATH=".as_slice(), inherited_path.as_encoded_bytes()].concat();
+        assert!(
+            output
+                .stdout
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == expected_path)
+        );
+    }
+
+    #[test]
     fn wire_selectors_round_trip_platform_uuid_pairs_and_copied_sink_identity() {
         let wire_selector = selector(0x23);
         let platform_selector: VulkanDeviceSelector = wire_selector.into();
@@ -1409,7 +1437,7 @@ mod tests {
     #[test]
     fn supervisor_classifies_post_spawn_exchange_failure_as_uncertain() {
         let supervisor = ProbeHelperSupervisor {
-            executable: PathBuf::from("/bin/true"),
+            executable: PathBuf::from("/usr/bin/true"),
             watchdog: Duration::from_secs(1),
         };
         let kms = File::open("/dev/null").expect("open inert KMS fixture");
@@ -1417,10 +1445,10 @@ mod tests {
             .run(kms.as_fd(), request(22, true))
             .expect_err("non-helper child must fail its protocol exchange");
 
-        assert!(matches!(
-            &error,
-            ProbeHelperRunError::ChildStartedUncertain(_)
-        ));
+        assert!(
+            matches!(&error, ProbeHelperRunError::ChildStartedUncertain(_)),
+            "expected post-spawn exchange failure, got {error:?}"
+        );
         assert!(matches!(
             error.kind(),
             io::ErrorKind::BrokenPipe
@@ -1433,7 +1461,7 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn pdeathsig_parent_race_check_rejects_a_stale_parent() {
-        let mut command = Command::new("/bin/true");
+        let mut command = Command::new("/usr/bin/true");
         // SAFETY: the production helper performs only the documented prctl and
         // getppid syscalls; -1 cannot equal a real parent PID.
         unsafe {

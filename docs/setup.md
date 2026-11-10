@@ -22,9 +22,14 @@ the example configs referenced below.
   Alpine and AUR ones deliberately do not, since the right one is
   hardware-specific — install it yourself there (`mesa-vulkan-ati` or
   `mesa-vulkan-intel` on Alpine, `vulkan-radeon` or `vulkan-intel` on Arch).
-- Linux with atomic KMS/DRM, or FreeBSD.
+- Linux with atomic KMS/DRM, FreeBSD, or OpenBSD.
 - Access to `/dev/dri/*` and `/dev/input/event*` — see
   [Device access](#device-access).
+- For `--vrr all` on NVIDIA, Mesa's
+  `/usr/share/drirc.d/00-mesa-defaults.conf` application list is required:
+  install `mesa` on Arch/Alpine, `libgl1-mesa-dri` on Debian/Ubuntu,
+  `mesa-dri-drivers` on Fedora, `mesa-dri` on FreeBSD, or `media-libs/mesa`
+  on Gentoo.
 
 ## Build from source
 
@@ -51,9 +56,38 @@ apk add gcc musl-dev fontconfig-dev freetype-dev libxshmfence-dev libxkbcommon-d
 
 ### FreeBSD
 
+Run as root:
+
 ```sh
-doas pkg install -y shaderc fontconfig libudev-devd scdoc GhostBSD-bzip2-dev GhostBSD-zlib-dev
+pkg install just pkgconf shaderc fontconfig freetype2 libudev-devd libinput \
+  libxkbcommon libxshmfence libdrm mesa-libs vulkan-loader scdoc
 ```
+
+Install a recent stable Rust toolchain too (`pkg install rust` provides the
+FreeBSD-packaged toolchain).
+
+For Intel or AMD GPUs, install `mesa-dri` for the Vulkan driver and
+`drm-kmod` for the kernel driver, then configure the appropriate kernel
+module as described in the
+[FreeBSD graphics guide](https://docs.freebsd.org/en/books/handbook/x11/).
+`mesa-libs` alone does not provide the Vulkan GPU driver. Use the appropriate
+NVIDIA driver packages for NVIDIA hardware instead.
+
+### OpenBSD
+
+Install the X sets (Mesa's Vulkan drivers, libgbm, fontconfig and
+libxshmfence come from there), then as root:
+
+```sh
+pkg_add rust git just shaderc vulkan-loader libinput-openbsd libudev-openbsd \
+  libxkbcommon scdoc
+```
+
+rustc needs more memory than the default data size limit allows. Raise
+`datasize-cur` (and `datasize-max` if it is lower) for your login class in
+`/etc/login.conf`, e.g. `:datasize-cur=8G:` under `staff`, and log in
+again. Run `cap_mkdb /etc/login.conf` first if `/etc/login.conf.db`
+exists.
 
 Then build and install:
 
@@ -72,25 +106,28 @@ just install-local
 
 ### Optional build features
 
-Two capabilities are compiled in only when asked for:
+Three capabilities are compiled in only when asked for:
 
 | Feature         | Enables                                                         |
 | --------------- | --------------------------------------------------------------- |
 | `tcp-transport` | `-listen tcp`, the TCP listener                                 |
 | `xdmcp`         | `-query`, `-indirect` and `-broadcast`; implies `tcp-transport` |
+| `wayland`       | `--rootless` under a Wayland compositor (Linux only)            |
 
 ```sh
 cargo build --release --bin yserver --features tcp-transport
 cargo build --release --bin yserver --features xdmcp
+cargo build --release --bin yserver --features wayland
 ```
 
-They are off for two different reasons. Listening on TCP widens the
+They are off for different reasons. Listening on TCP widens the
 server's exposure, so it should be an affirmative decision by whoever
 builds the binary — a stronger position than the runtime `-nolisten tcp`
 convention, because the capability is absent rather than merely switched
 off. XDMCP is niche: most deployments never negotiate a session with a
 display manager, and it is several thousand lines that would otherwise
-ship unused.
+ship unused. The Wayland host is for a server started inside a Wayland
+session, and a build that does not ask for it pulls in no Wayland crates.
 
 A build without a feature does not silently ignore the options it covers.
 It exits at startup with a message naming the feature. `-nolisten tcp`
@@ -99,14 +136,15 @@ adjusting.
 
 `yserver --version` ends with the set that was compiled in, as
 `features=[tcp-transport,xdmcp]`, `features=[tcp-transport]` or
-`features=[]`.
+`features=[]`; `wayland` is listed between the two.
 
 `just install-local` builds with neither. To install a build that has
 them, run the `cargo build` above in place of the plain one, then
 `just man` and `just install` as shown earlier.
 
-To run a session you also need `xauth` and `mcookie` at runtime —
-`xorg-xauth` and `util-linux` respectively.
+To run a session you also need `xauth` at runtime (`xorg-xauth`).
+`starty` uses `mcookie` (`util-linux`) when present and reads
+`/dev/urandom` otherwise.
 
 Packagers: see [Packaging](#packaging).
 
@@ -141,6 +179,20 @@ conventionally `video` and `operator`; check with `ls -l` as above. The
 Console takeover is implemented on FreeBSD `vt(4)` consoles too, so
 `Ctrl-C` in an X client is shielded from the kernel's console signal
 handling the same way it is on Linux VTs.
+
+### OpenBSD
+
+Log in on the first console, `ttyC0`: the default `/etc/fbtab` hands the
+keyboard, the mouse and the first GPU (`/dev/dri/card0`,
+`/dev/dri/renderD128`) to whoever logs in there. With more than one GPU,
+add the other cards' nodes to that line.
+
+Alternatively make the devices group-accessible to `wheel` (your user must
+be a member):
+
+```sh
+chmod 660 /dev/wskbd* /dev/wsmouse* /dev/dri/*
+```
 
 ## The X11 socket directory
 
@@ -185,6 +237,10 @@ sudo install -m644 /usr/local/share/doc/yserver/examples/lightdm-99-yserver.conf
 sudo systemctl restart lightdm
 ```
 
+On FreeBSD the drop-in goes in `/usr/local/etc/lightdm/lightdm.conf.d/`
+and lightdm restarts with `service lightdm restart`. OpenBSD has no
+lightdm package; its display manager is xenodm.
+
 The greeter appears, you log in, and lightdm's PAM stack unlocks the login
 keyring as usual.
 
@@ -202,7 +258,47 @@ console and run:
 starty                 # runs ~/.xinitrc (or /etc/X11/xinit/xinitrc)
 starty bspwm           # ...or a WM resolved via PATH, no xinitrc needed
 starty bspwm -c ~/rc   # ...with arguments
+starty -- --vrr        # pass --vrr to yserver with the xinitrc session
+starty bspwm -- --vrr  # pass --vrr to yserver with bspwm
 ```
+
+Server arguments go after `--`; arguments before it remain the client and its
+arguments. `--vrr` is off by default. It enables VRR for windows that set
+`_VARIABLE_REFRESH`, on outputs whose monitor reports VRR support. Each
+output decides on its own: several monitors can run VRR at once, each with its
+own fullscreen client, while the others keep their fixed refresh. NVIDIA
+proprietary clients do not set `_VARIABLE_REFRESH`; on NVIDIA (`nvidia-drm`),
+`--vrr all` enables VRR for every directly scanned-out client window instead,
+except applications that the NVIDIA or Mesa application lists, or the
+client's environment, exclude.
+
+### Direct scanout with a desktop compositor
+
+Direct scanout, and therefore VRR, needs a compositing desktop to unredirect
+fullscreen windows. On Cinnamon, set
+`org.cinnamon.muffin unredirect-fullscreen-windows` to `true` in System
+Settings → General → “disable compositing for full-screen windows”. This
+setting is off by default; with it off, Muffin composites the game and the
+monitor stays at its maximum refresh rate.
+
+Cinnamon has a known limitation, measured on 2026-10-27 and also seen on
+Xorg: a system-tray icon (for example Steam's, which is present whenever a
+game is launched through Steam) creates an override-redirect window stacked
+above the fullscreen game. Muffin then does not unredirect the game, so VRR
+stays off ([upstream issue #12687](https://github.com/linuxmint/cinnamon/issues/12687)).
+A desktop without a compositor, such as i3, is unaffected. Direct scanout is
+per output, so a client covering exactly one monitor can scan out there,
+whatever the other monitors' refresh rates, while they keep composing at their
+own. A Present selecting another
+monitor's CRTC is composed. A whole-screen window can use grouped direct
+scanout when all outputs share the primary device and refresh rates within
+0.5%. Tearing has one direct owner at a time and may belong to a fullscreen
+client on one monitor while other monitors are on. A second client asking to
+tear stays direct with synchronized flips until the current owner releases
+tearing. A paused owner keeps tearing. VRR is per monitor: each output with a
+capable connector uses VRR while its own fullscreen client scans out directly
+and asks for it, so several monitors can use VRR at once; others keep their
+fixed refresh.
 
 It picks the lowest free display, mints a per-session
 MIT-MAGIC-COOKIE-1 (a server copy plus an entry in `~/.Xauthority`),
@@ -244,10 +340,12 @@ every interface, not only loopback. `-listen tcp` refuses to start without a
 `-auth` file containing a usable MIT-MAGIC-COOKIE-1, because the alternative
 would be an unauthenticated X server on the network.
 
-**There is no host-based access control.** `xhost` is not implemented, so the
-cookie is the entire boundary and there is no way to restrict which hosts may
-connect. The wire protocol is unencrypted, keystrokes included. Read the
-SECURITY section of `yserver(1)` before exposing a display this way.
+**Over TCP the cookie is the entire boundary.** `xhost` entries never admit a
+TCP client: `xhost +somehost` and even `xhost +` let no one in without the
+cookie (Xorg would). `xhost` only applies to the local socket, where
+`xhost +si:localuser:<user>` lets that user's clients in without a cookie. The
+wire protocol is unencrypted, keystrokes included. Read the SECURITY section of
+`yserver(1)` before exposing a display this way.
 
 For a client on another machine, the cookie has to be keyed to how that client
 names the display:
@@ -419,7 +517,7 @@ in the ELF headers:
 | Vulkan loader | `libvulkan.so.1` is dlopened at runtime                       | `vulkan-icd-loader`, `vulkan-loader`                                         |
 | A Vulkan ICD  | runtime driver, not linked                                    | `mesa-vulkan-drivers` — _recommends_, since the NVIDIA driver also qualifies |
 | `xauth`       | `starty` execs it                                             | `xorg-xauth`, `xauth`                                                        |
-| `mcookie`     | `starty` execs it                                             | `util-linux`                                                                 |
+| `mcookie`     | `starty` execs it if present (else reads `/dev/urandom`)      | `util-linux` — _recommends_                                                  |
 | XKB data      | keymap rules read at runtime                                  | `xkeyboard-config`                                                           |
 | X core fonts  | _recommends_ only — a fontless system falls back to built-ins | `xorg-fonts-misc`, `xfonts-base`                                             |
 

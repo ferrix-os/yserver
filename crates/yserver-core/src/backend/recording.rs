@@ -17,7 +17,11 @@
 //! `nested::handle_request`'s ChangeWindowAttributes path on
 //! ROOT_WINDOW pokes the container).
 
-use std::{io, sync::Mutex};
+use std::{
+    collections::{HashSet, VecDeque},
+    io,
+    sync::Mutex,
+};
 
 use yserver_protocol::x11::{ClipRectangles, FontMetrics, ResourceId, glx, xfixes};
 
@@ -34,12 +38,22 @@ use crate::{
 /// assert against `Vec<RecordedCall>` snapshots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecordedCall {
+    /// The backend input-session cleanup hook ran at a generation boundary.
+    ResetInputSession,
     /// A key event handed to `on_host_input`; `repeat` distinguishes
     /// `HostInputEvent::KeyRepeat` from device `HostInputEvent::Key`.
     HostKey {
         keycode: u8,
         pressed: bool,
         repeat: bool,
+    },
+    /// Pointer motion or a button handed to `on_host_input`; `button` 0 is
+    /// a motion to `(x, y)`.
+    HostPointer {
+        x: i32,
+        y: i32,
+        button: u16,
+        pressed: bool,
     },
     CreateSubwindow {
         parent: u32,
@@ -55,6 +69,10 @@ pub enum RecordedCall {
     MapSubwindow(u32),
     UnmapSubwindow(u32),
     RealizeWindowStorage(u32),
+    /// `realize_window_storage` with the background paint inhibited.
+    RealizeWindowStorageUnpainted(u32),
+    /// `realize_window_storage` with the background paint left to the core.
+    RealizeWindowStorageDeferred(u32),
     ReleaseWindowStorage(u32),
     ConfigureSubwindow {
         host_xid: u32,
@@ -85,6 +103,8 @@ pub enum RecordedCall {
         host_xid: u32,
     },
     UnregisterHostWindow(u32),
+    /// `retire_overlay_window`: the COW's backend step of a destroy.
+    RetireOverlayWindow,
     CreatePixmap {
         depth: u8,
         width: u16,
@@ -96,9 +116,28 @@ pub enum RecordedCall {
     OpenFont(String),
     CloseFont(u32),
     Ping,
+    XkbProxy {
+        minor: u8,
+    },
+    QueryPointer,
     ReleaseRedirectedBacking(u32),
     RetainBackingStorage(u32),
     DropBackingStorage(u32),
+    PaintWindowBorderRects {
+        host_xid: u32,
+        rects: Vec<yserver_protocol::x11::xfixes::RegionRect>,
+    },
+    ReallocateRedirectedBacking {
+        host_window: u32,
+        old: u32,
+        width: u16,
+        height: u16,
+        depth: u8,
+    },
+    MoveSubwindowsForGravity {
+        moves: Vec<(u32, i16, i16)>,
+        carry_from: Option<u32>,
+    },
     AllocateRedirectedBacking {
         host_window: u32,
         width: u16,
@@ -126,6 +165,47 @@ pub enum RecordedCall {
     RenderCreatePicture {
         host_drawable: AnyHandle,
         host_pic: u32,
+        value_mask: u32,
+        values: Vec<u8>,
+    },
+    RenderChangePicture {
+        host_pic: u32,
+        body: Vec<u8>,
+    },
+    RenderCreateGlyphSet {
+        ynest_format: u32,
+    },
+    RenderFreeGlyphSet {
+        host_gs: u32,
+    },
+    RenderAddGlyphs {
+        host_gs: u32,
+        body_tail: Vec<u8>,
+    },
+    RenderFreeGlyphs {
+        host_gs: u32,
+        glyph_ids: Vec<u8>,
+    },
+    RenderCreateCursor {
+        host_src_pic: u32,
+        x: u16,
+        y: u16,
+    },
+    CreateAnimCursor {
+        frames: Vec<(u32, u32)>,
+    },
+    RenderCompositeGlyphs {
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        mask_fmt: u32,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: Vec<u8>,
+        x_off: i16,
+        y_off: i16,
     },
     RenderFreePicture {
         host_pic: u32,
@@ -137,10 +217,45 @@ pub enum RecordedCall {
     RenderFillRectangles {
         host_dst: u32,
     },
+    RenderFormatForYnestId {
+        format: u32,
+    },
+    RenderTrapezoids {
+        host_src: u32,
+        host_dst: u32,
+    },
+    RenderTriangles {
+        minor: u8,
+        host_src: u32,
+        host_dst: u32,
+    },
+    RenderCreateSolidFill {
+        color: [u8; 8],
+    },
+    RenderCreateLinearGradient {
+        picture: Option<u32>,
+    },
+    RenderCreateRadialGradient {
+        picture: Option<u32>,
+    },
+    RenderSetPictureClipRectangles {
+        host_pic: u32,
+    },
+    RenderSetPictureFilter {
+        host_pic: u32,
+    },
+    RenderSetPictureTransform {
+        host_pic: u32,
+    },
     CopyPlane {
         src_host_xid: u32,
         dst_host_xid: u32,
         plane: u32,
+    },
+    PolyText8 {
+        host_xid: u32,
+        foreground: u32,
+        body: Vec<u8>,
     },
     PaintWindowBackgroundRect {
         host_xid: u32,
@@ -154,6 +269,7 @@ pub enum RecordedCall {
         new_host_xid: u32,
     },
     SetCursorHidden(bool),
+    FreeCursor(u32),
     DefineCursor {
         host_window_xid: u32,
         cursor_host_xid: u32,
@@ -167,6 +283,28 @@ pub enum RecordedCall {
     SetProviderOutputSource {
         provider: u32,
         source_provider: Option<u32>,
+    },
+    Dri3Open {
+        drawable: u32,
+    },
+    Dri3ImportPixmap,
+    Dri3ExportPixmapBuffers {
+        host_xid: u32,
+    },
+    Dri3SupportedModifiers {
+        window: u32,
+    },
+    Dri3FenceFromFd {
+        fence: u32,
+    },
+    Dri3FdFromFence {
+        fence: u32,
+    },
+    Dri3ImportSyncobj {
+        syncobj: u32,
+    },
+    Dri3FreeSyncobj {
+        syncobj: u32,
     },
     ApplyCrtcConfig {
         output_id: u32,
@@ -204,6 +342,14 @@ pub enum RecordedCall {
         height: u16,
     },
     ApplyClipState(ClipState),
+    /// `poly_fill_rectangle(host_xid, ..)` called.
+    PolyFillRectangle {
+        host_xid: u32,
+    },
+    /// `poly_point(host_xid, ..)` called.
+    PolyPoint {
+        host_xid: u32,
+    },
     PutImage {
         host_xid: u32,
         depth: u8,
@@ -231,6 +377,8 @@ pub enum RecordedCall {
     /// can pin this running strictly after `maybe_composite` (the KMS gate
     /// this arm hides behind only clears post-compose).
     ArmPresentCompletionIdleVblanks,
+    /// `on_rootless_events()` called with a non-empty batch.
+    RootlessEvents(Vec<crate::rootless::RootlessEvent>),
 }
 
 type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
@@ -239,10 +387,20 @@ type GammaTriplet = (Vec<u16>, Vec<u16>, Vec<u16>);
 /// counter so create-then-destroy round trips read back the same xid.
 pub struct RecordingBackend {
     pub calls: Mutex<Vec<RecordedCall>>,
+    /// Number of `get_image` calls, kept separate from the general call log
+    /// so tests can assert denied readbacks without changing existing log snapshots.
+    pub get_image_calls: usize,
     /// Queued "the sprite now shows this cursor" report handed out by
     /// `take_displayed_cursor_change`. Tests set it to stand in for a KMS
     /// sprite change.
     pub displayed_cursor_change: Option<crate::backend::DisplayedCursor>,
+    /// Canned active cursor image returned by `get_active_cursor_image`.
+    /// Defaults to `None`, matching backends without a sprite snapshot.
+    pub active_cursor_image: Option<crate::backend::ActiveCursorImage>,
+    /// Cursor handles retained by a test backend after `free_cursor`.
+    pub alive_cursors: HashSet<u32>,
+    /// What `displayed_cursor_hidden` answers.
+    pub displayed_cursor_hidden: bool,
     next_handle: Mutex<u32>,
     fake_window_id: u32,
     fake_root_visual_xid: u32,
@@ -261,6 +419,8 @@ pub struct RecordingBackend {
     pub scanout_render_completion_count: std::sync::atomic::AtomicU32,
     /// Stable test-owned fd inventory returned by `poll_fds`.
     poll_sources: Vec<(std::os::fd::RawFd, crate::backend::BackendFdKind)>,
+    /// A host display connection's output, flushed as a rootless host's is.
+    pub host_display_out: Option<HostDisplayOut>,
     /// Optional test notification sent after a DRM fd is dispatched,
     /// allowing a test thread to wait without timing-dependent sleeps.
     page_flip_ready_tx: Option<crossbeam_channel::Sender<std::os::fd::RawFd>>,
@@ -271,18 +431,23 @@ pub struct RecordingBackend {
     /// page-flip ever occurs (project_reclamation_starvation_leak).
     pub before_block_count: std::sync::atomic::AtomicU32,
     /// COW: whether the backend currently owns a materialized overlay.
-    /// A plain bool, not a count — core owns the claim list and this
-    /// backend is only ever driven on the 0 → 1 and 1 → 0 edges. Plain
+    /// A plain bool, not a count — core owns the claim list. Plain
     /// `bool` not `AtomicBool` — `Backend` methods take `&mut self`, so
     /// the test thread already has exclusive access.
     pub cow_materialized: bool,
     /// Failure injection: `get_overlay_window` returns `Err` instead of
     /// materializing, so tests can drive the claim-rollback path.
     pub cow_materialize_fails: bool,
-    /// Failure injection: `release_overlay_window` returns `Err` with the
+    /// Failure injection: `prepare_overlay_release` returns `Err` with the
     /// overlay left up, modelling `KmsBackend`'s
-    /// `materialize_direct_shadow_for_unflip` failing on the 1 → 0 edge.
+    /// `materialize_direct_shadow_for_unflip` failing.
     pub cow_teardown_fails: bool,
+    /// `retire_overlay_window` defers, as `KmsBackend` does behind direct
+    /// scanout: the COW stays materialized with `cow_release_deferred` set
+    /// until a test clears it or `get_overlay_window` re-adopts it.
+    pub cow_release_defers: bool,
+    /// A retirement deferred by `cow_release_defers` is outstanding.
+    pub cow_release_deferred: bool,
     /// Phase 2 (reparent reconciliation): lets tests opt in to
     /// claiming `supports_redirect_activation = true` so the
     /// production reconciliation block in `handle_reparent_window`
@@ -317,6 +482,10 @@ pub struct RecordingBackend {
     /// coincidental default matching elsewhere) set it to something
     /// else first.
     pub glx_vendor_names: &'static str,
+    /// Result returned by `picture_client_clip_rects`, including the
+    /// distinction between an unavailable query and an unset clip.
+    pub picture_client_clip_rects_result:
+        Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>>,
     /// When set, `set_dpms_power` returns Err; tests assert the
     /// transition helper advances state anyway.
     pub dpms_set_returns_err: bool,
@@ -328,11 +497,23 @@ pub struct RecordingBackend {
     /// Test controls and observations for asynchronous CRTC configuration.
     /// `None` preserves the synchronous `apply_crtc_config` path.
     pub pending_crtc_config: Option<CrtcConfigToken>,
+    /// When set, a synchronous `apply_crtc_config` reports a change and the
+    /// following `refresh_randr_state_set_time` installs it into
+    /// `state.randr`, carrying client-owned state as the KMS rebuild does.
+    pub apply_crtc_configs: bool,
+    applied_crtc_config: Option<(u32, Option<ModeSpec>, i32, i32)>,
     pub ready_crtc_configs: Vec<CrtcConfigToken>,
     pub crtc_config_results:
         std::collections::HashMap<CrtcConfigToken, Result<bool, io::ErrorKind>>,
     pub finished_crtc_configs: Vec<CrtcConfigToken>,
     pub cancelled_crtc_configs: Vec<CrtcConfigToken>,
+    /// When set, the next DRI3 export begins deferred under this token.
+    pub pending_dri3_export: Option<crate::backend::Dri3ExportToken>,
+    pub ready_dri3_exports: Vec<crate::backend::Dri3ExportToken>,
+    pub finished_dri3_exports: Vec<crate::backend::Dri3ExportToken>,
+    pub released_dri3_exports: Vec<crate::backend::Dri3ExportToken>,
+    /// Deferred exports that finish with an error.
+    pub failed_dri3_exports: Vec<crate::backend::Dri3ExportToken>,
     /// Startup input-probe model. Each inner `Vec` is one "dispatch
     /// round" the fake libinput would yield; `probe_input_devices`
     /// consumes the front round per iteration and seeds the registry,
@@ -350,6 +531,8 @@ pub struct RecordingBackend {
     pub warped_to: Option<(i32, i32)>,
     /// In-memory per-RANDR-CRTC gamma LUT for unit tests (size 256).
     pub gamma: std::cell::RefCell<std::collections::HashMap<u32, GammaTriplet>>,
+    /// The VidMode gamma table last handed to `set_vidmode_gamma`.
+    pub vidmode_gamma: Option<crate::backend::gamma::VidModeGammaTable>,
     /// Active RMLVO `[rules, model, layout, variant, options]` returned by
     /// `current_xkb_rules_names`. `None` (the default) models a backend
     /// without a real keymap; tests that exercise `_XKB_RULES_NAMES`
@@ -388,6 +571,8 @@ pub struct RecordingBackend {
     /// `(xid, triggered)` of each shared-memory fence `dri3_destroy_fence`
     /// unmapped, with its in-memory state at unmap time.
     pub destroyed_shm_fences: Vec<(u32, bool)>,
+    /// `dri3_fence_from_fd` fails, as for a fd that isn't an xshmfence.
+    pub refuse_fence_fds: bool,
     /// `(syncobj_xid, value)` passed to `dri3_signal_syncobj`, in call
     /// order — Task 8: lets a `PixmapSynced` supersession/copy-failure
     /// release be asserted the same way `triggered_dri3_fences` covers
@@ -478,18 +663,11 @@ pub struct RecordingBackend {
     /// Task 7: canned return for `present_scanout_blackout`. Default
     /// `false` matches the trait default.
     pub present_scanout_blackout: bool,
-    /// Controls what `arm_present_absolute_vblank` returns. `None`
-    /// (default) mimics a real always-succeeds arm: covers every target
-    /// it's given. `Some(Ok(n))` / `Some(Err(kind))` let a test pin the
-    /// `Ok(0)` / `Err` idle_fallback paths (spec §msc-due future-target
-    /// rung 1).
-    pub arm_present_absolute_vblank_result: Option<Result<usize, io::ErrorKind>>,
-    /// `targets` recorded per `arm_present_absolute_vblank` call, in call
-    /// order, so a test can assert exactly what was armed — the `-1` from
-    /// `eff` is core-side (Task 7), so this should read `eff - 1`, never
-    /// the raw `effective_target_msc`.
-    pub armed_absolute_vblank_targets: Vec<Vec<u64>>,
-    pub armed_absolute_vblank_crtcs: Vec<u32>,
+    /// Controls what `arm_present_shared_wake` returns. `None` (default)
+    /// mimics an available tagged next-vblank arm.
+    pub arm_present_shared_wake_result: Option<Result<bool, io::ErrorKind>>,
+    /// CRTC IDs passed to `arm_present_shared_wake`, in call order.
+    pub armed_shared_wake_crtcs: Vec<u32>,
     /// Domain-qualified calls made by the two idle-arm paths.
     pub armed_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
     pub armed_completion_idle_vblank_targets: Vec<(u32, Vec<u64>)>,
@@ -500,9 +678,20 @@ pub struct RecordingBackend {
     /// `execute_present_pixmap_copy_or_reroute`'s failure arm. Default
     /// `false` matches today's always-succeeds behavior.
     pub fail_copy_area: bool,
+    /// When `true`, `fill_rectangle` records the call but returns `Err`.
+    pub fail_fill_rectangle: bool,
+    /// Failure injection for GLX pbuffer backing allocation tests.
+    pub create_pixmap_fails: bool,
+    /// Failure injection for the rollback path of MIT-SHM CreatePixmap.
+    pub free_pixmap_fails: bool,
+    /// The next `open_font` records its call and returns this error kind.
+    /// Used to drive reset's fatal default-font reinstall boundary.
+    pub fail_open_font: Option<io::ErrorKind>,
     /// Canned direct-Present result plus observed candidates. A successful
     /// result lets request-layer tests prove M2b bypasses Copy entirely.
     pub present_direct_result: bool,
+    /// `reallocate_redirected_backing` fails (after recording the call).
+    pub reallocate_fails: bool,
     pub present_direct_candidates: Vec<PresentScanoutCandidate>,
     /// `(event, dst_host_xid)` passed to `enqueue_present_completion`, in call order.
     pub enqueued_present_completions: Vec<(CompletedPresentEvent, u32)>,
@@ -518,11 +707,48 @@ pub struct RecordingBackend {
     /// one per pending Present scrapped by same-target supersession.
     /// Lets a test assert exactly one call per victim.
     pub present_skip_count: u32,
-    /// `(device_node, change)` pairs passed to `apply_device_config`, in
-    /// call order, so xinput property-write tests can assert exactly what
-    /// reached the backend (the trait's default impl is a no-op and
-    /// doesn't record anything).
-    pub applied_device_configs: Vec<(String, crate::xinput::libinput_props::DeviceConfigChange)>,
+    /// Source/change pairs passed to `start_device_config`, in call order.
+    pub started_device_configs: Vec<(
+        crate::xinput::InputSourceId,
+        crate::xinput::libinput_props::DeviceConfigChange,
+    )>,
+    /// Shared cancellation handles passed with submitted input commands.
+    pub device_config_cancel_tokens: Vec<crate::xinput::libinput_props::DeviceConfigCancelToken>,
+    /// Results returned by successive `start_device_config` calls. Empty
+    /// means each setting is confirmed synchronously.
+    pub device_config_start_results: VecDeque<
+        Result<
+            crate::xinput::libinput_props::DeviceConfigStart,
+            crate::xinput::libinput_props::DeviceConfigError,
+        >,
+    >,
+    /// Whether this recording backend should exercise VT lifecycle dispatch.
+    pub vt_switching_armed: bool,
+    /// `on_platform_event` calls seen.
+    pub platform_events: usize,
+    /// The last `note_client_count`, shared so a test can watch a core
+    /// loop running on another thread.
+    pub client_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Returned by `glx_available`.
+    pub glx_available: bool,
+    /// Let request-path tests create a glyphset without a host renderer.
+    pub render_create_glyphset_returns_handle: bool,
+    /// Whether the test backend simulates queueing the input pause barrier.
+    pub vt_release_pause_queued: bool,
+    /// Set when the release has crossed the test backend's yield boundary.
+    pub vt_release_finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Test probe: capture output already written when the VT release finishes.
+    #[cfg(test)]
+    pub vt_release_probe_client: Option<u32>,
+    /// Whether the probe client had reply bytes written before release finished.
+    #[cfg(test)]
+    pub vt_release_wire_visible_before_finish: bool,
+    /// Test probe: source whose config inventory value is sampled at release.
+    #[cfg(test)]
+    pub vt_release_probe_source: Option<crate::xinput::InputSourceId>,
+    /// The probe source's inventory accel speed observed at release finish.
+    #[cfg(test)]
+    pub vt_release_inventory_accel_before_finish: Option<f32>,
 }
 
 impl Default for RecordingBackend {
@@ -535,7 +761,11 @@ impl RecordingBackend {
     pub fn new() -> Self {
         Self {
             calls: Mutex::new(Vec::new()),
+            get_image_calls: 0,
             displayed_cursor_change: None,
+            active_cursor_image: None,
+            alive_cursors: HashSet::new(),
+            displayed_cursor_hidden: false,
             next_handle: Mutex::new(0x0001_0000),
             fake_window_id: 0x0000_0100,
             fake_root_visual_xid: 0x0000_0021,
@@ -544,12 +774,15 @@ impl RecordingBackend {
             page_flip_fds: Mutex::new(Vec::new()),
             scanout_render_completion_count: std::sync::atomic::AtomicU32::new(0),
             poll_sources: Vec::new(),
+            host_display_out: None,
             page_flip_ready_tx: None,
             scanout_render_completion_tx: None,
             before_block_count: std::sync::atomic::AtomicU32::new(0),
             cow_materialized: false,
             cow_materialize_fails: false,
             cow_teardown_fails: false,
+            cow_release_defers: false,
+            cow_release_deferred: false,
             redirect_activation_supported: false,
             composite_opcode: None,
             query_pointer_mask: 0,
@@ -559,18 +792,27 @@ impl RecordingBackend {
             randr_modes: Vec::new(),
             randr_providers: Vec::new(),
             glx_vendor_names: glx::VENDOR_NAMES,
+            picture_client_clip_rects_result: None,
             dpms_set_returns_err: false,
             provider_output_source_changed: true,
             provider_output_source_error: None,
             pending_crtc_config: None,
+            apply_crtc_configs: false,
+            applied_crtc_config: None,
             ready_crtc_configs: Vec::new(),
             crtc_config_results: std::collections::HashMap::new(),
             finished_crtc_configs: Vec::new(),
             cancelled_crtc_configs: Vec::new(),
+            pending_dri3_export: None,
+            ready_dri3_exports: Vec::new(),
+            finished_dri3_exports: Vec::new(),
+            released_dri3_exports: Vec::new(),
+            failed_dri3_exports: Vec::new(),
             probe_rounds: std::collections::VecDeque::new(),
             probe_rounds_run: std::cell::Cell::new(0),
             warped_to: None,
             gamma: std::cell::RefCell::new(std::collections::HashMap::new()),
+            vidmode_gamma: None,
             xkb_rules_names: None,
             keymap_rmlvo_result: None,
             kbd_by_name_result: None,
@@ -585,6 +827,7 @@ impl RecordingBackend {
             triggered_dri3_fences: Vec::new(),
             shm_fences: std::collections::HashMap::new(),
             destroyed_shm_fences: Vec::new(),
+            refuse_fence_fds: false,
             signalled_dri3_syncobjs: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             dri3_syncobj_owners: std::collections::HashMap::new(),
             dri3_caps: crate::backend::Dri3Caps::unsupported(),
@@ -608,19 +851,40 @@ impl RecordingBackend {
             present_absolute_vblank_arm_supported: false,
             present_absolute_vblank_arm_supported_by_crtc: std::collections::HashMap::new(),
             present_scanout_blackout: false,
-            arm_present_absolute_vblank_result: None,
-            armed_absolute_vblank_targets: Vec::new(),
-            armed_absolute_vblank_crtcs: Vec::new(),
+            arm_present_shared_wake_result: None,
+            armed_shared_wake_crtcs: Vec::new(),
             armed_idle_vblank_targets: Vec::new(),
             armed_completion_idle_vblank_targets: Vec::new(),
             arm_idle_vblanks_result: None,
             fail_copy_area: false,
+            fail_fill_rectangle: false,
+            create_pixmap_fails: false,
+            free_pixmap_fails: false,
+            fail_open_font: None,
             present_direct_result: false,
+            reallocate_fails: false,
             present_direct_candidates: Vec::new(),
             enqueued_present_completions: Vec::new(),
             arm_present_syncobj_wait_result: None,
             present_skip_count: 0,
-            applied_device_configs: Vec::new(),
+            started_device_configs: Vec::new(),
+            device_config_cancel_tokens: Vec::new(),
+            device_config_start_results: VecDeque::new(),
+            vt_switching_armed: false,
+            platform_events: 0,
+            client_count: std::sync::Arc::default(),
+            glx_available: true,
+            render_create_glyphset_returns_handle: false,
+            vt_release_pause_queued: false,
+            vt_release_finished: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            vt_release_probe_client: None,
+            #[cfg(test)]
+            vt_release_wire_visible_before_finish: false,
+            #[cfg(test)]
+            vt_release_probe_source: None,
+            #[cfg(test)]
+            vt_release_inventory_accel_before_finish: None,
         }
     }
 
@@ -739,11 +1003,71 @@ impl crate::backend::SyncobjHandle for RecordingSyncobjHandle {
 }
 
 impl Backend for RecordingBackend {
+    fn displayed_cursor_hidden(&self) -> bool {
+        self.displayed_cursor_hidden
+    }
+
     // State accessors — return fixed sentinels so the call sites that
     // need a real number get a real number; record nothing.
 
     fn window_id(&self) -> u32 {
         self.fake_window_id
+    }
+
+    fn vt_switching_armed(&self) -> bool {
+        self.vt_switching_armed
+    }
+
+    fn on_platform_event(&mut self, _state: &mut crate::server::ServerState) {
+        self.platform_events += 1;
+    }
+
+    fn on_rootless_events(
+        &mut self,
+        _state: &crate::server::ServerState,
+        events: &[crate::rootless::RootlessEvent],
+    ) {
+        self.record(RecordedCall::RootlessEvents(events.to_vec()));
+    }
+
+    fn note_client_count(&mut self, count: usize) {
+        self.client_count
+            .store(count, std::sync::atomic::Ordering::Release);
+    }
+
+    fn begin_vt_release(&mut self) -> bool {
+        self.vt_release_pause_queued
+    }
+
+    fn finish_vt_release(
+        &mut self,
+        state: &mut crate::server::ServerState,
+        input_inventory: &crate::core_loop::input_inventory::InputInventory,
+    ) {
+        #[cfg(test)]
+        {
+            self.vt_release_wire_visible_before_finish = self
+                .vt_release_probe_client
+                .and_then(|client_id| state.clients.get(&client_id))
+                .and_then(|client| {
+                    let writer = client.writer.lock().ok()?;
+                    match &*writer {
+                        crate::transport::Transport::Capture(bytes) => {
+                            Some(!bytes.lock().ok()?.is_empty())
+                        }
+                        _ => None,
+                    }
+                })
+                .unwrap_or(false);
+            self.vt_release_inventory_accel_before_finish = self
+                .vt_release_probe_source
+                .and_then(|source| input_inventory.get(source))
+                .map(|entry| entry.config.accel.current);
+        }
+        #[cfg(not(test))]
+        let _ = (state, input_inventory);
+        self.vt_release_finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn root_visual_xid(&self) -> u32 {
@@ -795,6 +1119,60 @@ impl Backend for RecordingBackend {
         self.released_present_sources.push(pin_id);
     }
 
+    fn dri3_open(&mut self, drawable: u32) -> std::io::Result<crate::fd::OwnedFd> {
+        self.record(RecordedCall::Dri3Open { drawable });
+        Err(std::io::Error::other("DRI3 unsupported on this backend"))
+    }
+
+    fn dri3_import_pixmap(
+        &mut self,
+        _fd: crate::fd::OwnedFd,
+        _width: u16,
+        _height: u16,
+        _stride: u32,
+        _offset: u32,
+        _modifier: crate::backend::Dri3ImportModifier,
+        _depth: u8,
+        _bpp: u8,
+    ) -> std::io::Result<PixmapHandle> {
+        self.record(RecordedCall::Dri3ImportPixmap);
+        Err(std::io::Error::other(
+            "DRI3 import unsupported on this backend",
+        ))
+    }
+
+    fn dri3_supported_modifiers(&self, window: u32, _depth: u8, _bpp: u8) -> (Vec<u64>, Vec<u64>) {
+        self.record(RecordedCall::Dri3SupportedModifiers { window });
+        (vec![0], vec![0])
+    }
+
+    fn dri3_export_pixmap_buffers(
+        &mut self,
+        host_xid: u32,
+    ) -> std::io::Result<crate::backend::Dri3PixmapExport> {
+        self.record(RecordedCall::Dri3ExportPixmapBuffers { host_xid });
+        Err(std::io::Error::other(
+            "DRI3 BuffersFromPixmap unsupported on this backend",
+        ))
+    }
+
+    fn dri3_fence_from_fd(
+        &mut self,
+        fence_xid: u32,
+        _fd: crate::fd::OwnedFd,
+    ) -> std::io::Result<()> {
+        self.record(RecordedCall::Dri3FenceFromFd { fence: fence_xid });
+        if self.refuse_fence_fds {
+            return Err(std::io::Error::other("not an xshmfence"));
+        }
+        Ok(())
+    }
+
+    fn dri3_fd_from_fence(&mut self, fence_xid: u32) -> std::io::Result<crate::fd::OwnedFd> {
+        self.record(RecordedCall::Dri3FdFromFence { fence: fence_xid });
+        Err(std::io::Error::other("DRI3 FDFromFence unsupported"))
+    }
+
     fn dri3_trigger_fence(&mut self, fence_xid: u32) -> std::io::Result<()> {
         self.triggered_dri3_fences.push(fence_xid);
         if let Some(triggered) = self.shm_fences.get_mut(&fence_xid) {
@@ -832,12 +1210,19 @@ impl Backend for RecordingBackend {
         self.dri3_caps
     }
 
+    fn glx_available(&self) -> bool {
+        self.glx_available
+    }
+
     fn dri3_import_syncobj(
         &mut self,
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
         _fd: std::os::fd::OwnedFd,
     ) -> std::io::Result<()> {
+        self.record(RecordedCall::Dri3ImportSyncobj {
+            syncobj: syncobj_xid,
+        });
         if self.dri3_syncobj_owners.contains_key(&syncobj_xid) {
             return Err(std::io::Error::other(format!(
                 "DRI3 ImportSyncobj: syncobj 0x{syncobj_xid:x} already imported"
@@ -857,6 +1242,9 @@ impl Backend for RecordingBackend {
         client_id: yserver_protocol::x11::ClientId,
         syncobj_xid: u32,
     ) -> std::io::Result<()> {
+        self.record(RecordedCall::Dri3FreeSyncobj {
+            syncobj: syncobj_xid,
+        });
         // Mirror the wire split Xorg gets from dixLookupResourceByType:
         // unknown -> BadValue (io::Error::other), not the owner -> BadAccess
         // (PermissionDenied). The handler maps the error kind to the code.
@@ -894,14 +1282,20 @@ impl Backend for RecordingBackend {
             .is_some_and(|(owner, _)| *owner == client_id)
     }
 
-    fn apply_device_config(
+    fn start_device_config(
         &mut self,
-        device_node: &str,
+        source: crate::xinput::InputSourceId,
         change: crate::xinput::libinput_props::DeviceConfigChange,
-    ) -> Result<(), crate::xinput::libinput_props::DeviceConfigError> {
-        self.applied_device_configs
-            .push((device_node.to_owned(), change));
-        Ok(())
+        cancel: crate::xinput::libinput_props::DeviceConfigCancelToken,
+    ) -> Result<
+        crate::xinput::libinput_props::DeviceConfigStart,
+        crate::xinput::libinput_props::DeviceConfigError,
+    > {
+        self.started_device_configs.push((source, change));
+        self.device_config_cancel_tokens.push(cancel);
+        self.device_config_start_results.pop_front().unwrap_or(Ok(
+            crate::xinput::libinput_props::DeviceConfigStart::Applied,
+        ))
     }
 
     fn signal_present_wake(&mut self, present_id: u64) {
@@ -958,12 +1352,11 @@ impl Backend for RecordingBackend {
             .unwrap_or(self.present_absolute_vblank_arm_supported)
     }
 
-    fn arm_present_absolute_vblank(&mut self, crtc_id: u32, targets: &[u64]) -> io::Result<usize> {
-        self.armed_absolute_vblank_crtcs.push(crtc_id);
-        self.armed_absolute_vblank_targets.push(targets.to_vec());
-        match self.arm_present_absolute_vblank_result {
-            None => Ok(targets.len()),
-            Some(Ok(n)) => Ok(n),
+    fn arm_present_shared_wake(&mut self, crtc_id: u32) -> io::Result<bool> {
+        self.armed_shared_wake_crtcs.push(crtc_id);
+        match self.arm_present_shared_wake_result {
+            None => Ok(true),
+            Some(Ok(armed)) => Ok(armed),
             Some(Err(kind)) => Err(io::Error::from(kind)),
         }
     }
@@ -1067,6 +1460,12 @@ impl Backend for RecordingBackend {
         None
     }
 
+    fn set_locked_mods(&mut self, affect: u8, values: u8) {
+        let (_, base, latched, locked) = self.xkb_mods;
+        let locked = (locked & !affect) | values;
+        self.xkb_mods = (base | latched | locked, base, latched, locked);
+    }
+
     fn current_xkb_mods(&self) -> (u8, u8, u8, u8) {
         self.xkb_mods
     }
@@ -1102,13 +1501,18 @@ impl Backend for RecordingBackend {
         self.redirect_activation_supported
     }
 
-    fn render_format_for_ynest_id(&self, _ynest_fmt: u32) -> Option<u32> {
+    fn render_format_for_ynest_id(&self, ynest_fmt: u32) -> Option<u32> {
+        self.record(RecordedCall::RenderFormatForYnestId { format: ynest_fmt });
         None
     }
 
     fn ping(&mut self, _origin: Option<OriginContext>) -> io::Result<()> {
         self.record(RecordedCall::Ping);
         Ok(())
+    }
+
+    fn reset_input_session(&mut self, _old_state: &mut crate::server::ServerState) {
+        self.record(RecordedCall::ResetInputSession);
     }
 
     fn on_host_input(
@@ -1120,6 +1524,26 @@ impl Backend for RecordingBackend {
         let (key, repeat) = match ev {
             HostInputEvent::Key(key) => (key, false),
             HostInputEvent::KeyRepeat(key) => (key, true),
+            HostInputEvent::PointerMotion { x, y, .. } => {
+                self.record(RecordedCall::HostPointer {
+                    x,
+                    y,
+                    button: 0,
+                    pressed: false,
+                });
+                return;
+            }
+            HostInputEvent::PointerButton {
+                button, pressed, ..
+            } => {
+                self.record(RecordedCall::HostPointer {
+                    x: 0,
+                    y: 0,
+                    button,
+                    pressed,
+                });
+                return;
+            }
             _ => return,
         };
         self.record(RecordedCall::HostKey {
@@ -1153,6 +1577,22 @@ impl Backend for RecordingBackend {
     fn before_block(&mut self) {
         self.before_block_count
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(out) = self.host_display_out.as_mut() {
+            out.flush();
+        }
+    }
+
+    fn on_host_display_ready(&mut self, _state: &mut crate::server::ServerState) -> bool {
+        if let Some(out) = self.host_display_out.as_mut() {
+            out.flush();
+        }
+        true
+    }
+
+    fn host_display_wants_writable(&self) -> bool {
+        self.host_display_out
+            .as_ref()
+            .is_some_and(|out| !out.pending.is_empty())
     }
 
     fn set_provider_output_source(
@@ -1190,7 +1630,57 @@ impl Backend for RecordingBackend {
             x,
             y,
         });
-        Ok(false)
+        if self.apply_crtc_configs {
+            self.applied_crtc_config = Some((output_id, mode, x, y));
+        }
+        Ok(self.apply_crtc_configs)
+    }
+
+    fn refresh_randr_state_set_time(
+        &mut self,
+        state: &mut crate::server::ServerState,
+        set_time: u32,
+    ) {
+        let Some((output_id, mode, x, y)) = self.applied_crtc_config.take() else {
+            return;
+        };
+        let prev = &state.randr;
+        let mut outputs = prev.outputs.clone();
+        if let Some(output) = outputs.iter_mut().find(|o| o.output_id == output_id) {
+            let resolved = mode.and_then(|m| {
+                prev.mode_table.iter().find(|t| {
+                    output.mode_ids.contains(&t.mode_id)
+                        && (t.width, t.height, t.vrefresh) == (m.width, m.height, m.vrefresh)
+                })
+            });
+            // An off KMS output reports mode 0 at 0,0 with no size.
+            let (mode_id, width, height, vrefresh) =
+                resolved.map_or((0, 0, 0, 0), |m| (m.mode_id, m.width, m.height, m.vrefresh));
+            let (x, y) = if resolved.is_some() { (x, y) } else { (0, 0) };
+            output.mode_id = mode_id;
+            output.width = width;
+            output.height = height;
+            output.vrefresh = vrefresh;
+            output.x = i16::try_from(x).unwrap_or(i16::MAX);
+            output.y = i16::try_from(y).unwrap_or(i16::MAX);
+        }
+        let screen = (
+            prev.screen_width,
+            prev.screen_height,
+            prev.width_mm,
+            prev.height_mm,
+        );
+        let transforms = prev.crtc_transforms();
+        let mode_table = prev.mode_table.clone();
+        state.randr =
+            crate::randr::RandrState::from_outputs_with_modes(set_time, outputs, mode_table);
+        state.randr.restore_crtc_transforms(transforms);
+        (
+            state.randr.screen_width,
+            state.randr.screen_height,
+            state.randr.width_mm,
+            state.randr.height_mm,
+        ) = screen;
     }
 
     fn begin_crtc_config(
@@ -1233,6 +1723,47 @@ impl Backend for RecordingBackend {
         self.crtc_config_results.remove(&token);
     }
 
+    fn dri3_begin_export_pixmap_buffers(
+        &mut self,
+        host_xid: u32,
+    ) -> io::Result<crate::backend::Dri3ExportBegin> {
+        match self.pending_dri3_export.take() {
+            Some(token) => Ok(crate::backend::Dri3ExportBegin::Pending(token)),
+            None => self
+                .dri3_export_pixmap_buffers(host_xid)
+                .map(crate::backend::Dri3ExportBegin::Ready),
+        }
+    }
+
+    fn drain_ready_dri3_exports(&mut self) -> Vec<crate::backend::Dri3ExportToken> {
+        std::mem::take(&mut self.ready_dri3_exports)
+    }
+
+    fn finish_dri3_export(
+        &mut self,
+        token: crate::backend::Dri3ExportToken,
+    ) -> io::Result<crate::backend::Dri3PixmapExport> {
+        self.finished_dri3_exports.push(token);
+        if self.failed_dri3_exports.contains(&token) {
+            return Err(io::Error::other("scripted deferred export failure"));
+        }
+        Ok(crate::backend::Dri3PixmapExport {
+            size: 64 * 4 * 16,
+            width: 64,
+            height: 16,
+            stride: 64 * 4,
+            offset: 0,
+            depth: 24,
+            bpp: 32,
+            modifier: 0,
+            fd: std::fs::File::open("/dev/null")?.into(),
+        })
+    }
+
+    fn release_dri3_export(&mut self, token: crate::backend::Dri3ExportToken) {
+        self.released_dri3_exports.push(token);
+    }
+
     fn set_crtc_gamma(
         &mut self,
         crtc: u32,
@@ -1252,6 +1783,14 @@ impl Backend for RecordingBackend {
         }
         let ramp = crate::backend::gamma::identity_ramp(256);
         (ramp.clone(), ramp.clone(), ramp)
+    }
+
+    fn set_vidmode_gamma(
+        &mut self,
+        table: Option<&crate::backend::gamma::VidModeGammaTable>,
+    ) -> io::Result<()> {
+        self.vidmode_gamma = table.cloned();
+        Ok(())
     }
 
     fn probe_input_devices(&mut self, state: &mut crate::server::ServerState) -> usize {
@@ -1278,7 +1817,7 @@ impl Backend for RecordingBackend {
             empty_rounds = 0;
             for info in batch {
                 seeded += 1;
-                state.xi_seed_touchpad(&info);
+                state.xi_register_source(&info);
             }
         }
         self.probe_rounds_run.set(rounds_run);
@@ -1349,8 +1888,19 @@ impl Backend for RecordingBackend {
         &mut self,
         _origin: Option<OriginContext>,
         host_xid: u32,
+        background: crate::backend::RealizeBackground,
     ) -> io::Result<()> {
-        self.record(RecordedCall::RealizeWindowStorage(host_xid));
+        self.record(match background {
+            crate::backend::RealizeBackground::Paint => {
+                RecordedCall::RealizeWindowStorage(host_xid)
+            }
+            crate::backend::RealizeBackground::Deferred => {
+                RecordedCall::RealizeWindowStorageDeferred(host_xid)
+            }
+            crate::backend::RealizeBackground::Inhibited => {
+                RecordedCall::RealizeWindowStorageUnpainted(host_xid)
+            }
+        });
         Ok(())
     }
 
@@ -1480,6 +2030,55 @@ impl Backend for RecordingBackend {
         Ok(())
     }
 
+    fn reallocate_redirected_backing(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_window: WindowHandle,
+        old: PixmapHandle,
+        width: u16,
+        height: u16,
+        depth: u8,
+    ) -> io::Result<PixmapHandle> {
+        self.record(RecordedCall::ReallocateRedirectedBacking {
+            host_window: host_window.as_raw(),
+            old: old.as_raw(),
+            width,
+            height,
+            depth,
+        });
+        if self.reallocate_fails {
+            return Err(io::Error::other("reallocate_fails"));
+        }
+        let xid = self.allocate_handle();
+        Ok(PixmapHandle::from_raw_panicking(xid))
+    }
+
+    fn paint_window_border_rects(
+        &mut self,
+        _origin: Option<OriginContext>,
+        host_xid: u32,
+        rects: &[yserver_protocol::x11::xfixes::RegionRect],
+    ) -> io::Result<()> {
+        self.record(RecordedCall::PaintWindowBorderRects {
+            host_xid,
+            rects: rects.to_vec(),
+        });
+        Ok(())
+    }
+
+    fn move_subwindows_for_gravity(
+        &mut self,
+        _origin: Option<OriginContext>,
+        moves: &[(u32, i16, i16)],
+        carry_from: Option<PixmapHandle>,
+    ) -> io::Result<()> {
+        self.record(RecordedCall::MoveSubwindowsForGravity {
+            moves: moves.to_vec(),
+            carry_from: carry_from.map(PixmapHandle::as_raw),
+        });
+        Ok(())
+    }
+
     fn retain_backing_storage(
         &mut self,
         _origin: Option<OriginContext>,
@@ -1543,17 +2142,24 @@ impl Backend for RecordingBackend {
         width: u16,
         height: u16,
     ) -> io::Result<PixmapHandle> {
-        let xid = self.allocate_handle();
-        self.live_pixmaps.insert(xid);
         self.record(RecordedCall::CreatePixmap {
             depth,
             width,
             height,
         });
+        if self.create_pixmap_fails {
+            return Err(io::Error::other("create_pixmap failure injected"));
+        }
+        let xid = self.allocate_handle();
+        self.live_pixmaps.insert(xid);
         Ok(PixmapHandle::from_raw_panicking(xid))
     }
 
     fn free_pixmap(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        if self.free_pixmap_fails {
+            self.record(RecordedCall::FreePixmap(host_xid));
+            return Err(io::Error::other("free_pixmap failure injected"));
+        }
         self.live_pixmaps.remove(&host_xid);
         self.record(RecordedCall::FreePixmap(host_xid));
         Ok(())
@@ -1564,8 +2170,11 @@ impl Backend for RecordingBackend {
         _origin: Option<OriginContext>,
         name: &str,
     ) -> io::Result<(FontHandle, FontMetrics)> {
-        let xid = self.allocate_handle();
         self.record(RecordedCall::OpenFont(name.to_string()));
+        if let Some(kind) = self.fail_open_font.take() {
+            return Err(io::Error::from(kind));
+        }
+        let xid = self.allocate_handle();
         // FontMetrics is private to the protocol crate; return a Default-ish
         // value via Default::default(). If FontMetrics has no Default we fall
         // back to a zero-initialised one in the unimplemented branch below.
@@ -1589,6 +2198,20 @@ impl Backend for RecordingBackend {
     ) -> io::Result<CursorHandle> {
         let xid = self.allocate_handle();
         Ok(CursorHandle::from_raw_panicking(xid))
+    }
+
+    fn create_anim_cursor(
+        &mut self,
+        _origin: Option<OriginContext>,
+        frames: &[(CursorHandle, u32)],
+    ) -> io::Result<Option<CursorHandle>> {
+        self.record(RecordedCall::CreateAnimCursor {
+            frames: frames
+                .iter()
+                .map(|(cursor, delay)| (cursor.as_raw(), *delay))
+                .collect(),
+        });
+        Ok(None)
     }
 
     fn create_glyph_cursor(
@@ -1618,6 +2241,15 @@ impl Backend for RecordingBackend {
             back,
         });
         Ok(())
+    }
+
+    fn free_cursor(&mut self, _origin: Option<OriginContext>, host_xid: u32) -> io::Result<()> {
+        self.record(RecordedCall::FreeCursor(host_xid));
+        Ok(())
+    }
+
+    fn cursor_alive(&self, host_xid: u32) -> bool {
+        self.alive_cursors.contains(&host_xid)
     }
 
     fn define_cursor(
@@ -1819,6 +2451,7 @@ impl Backend for RecordingBackend {
         _height: u16,
         _plane_mask: u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        self.get_image_calls += 1;
         Ok(None)
     }
 
@@ -1866,21 +2499,23 @@ impl Backend for RecordingBackend {
     fn poly_point(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
+        host_xid: u32,
         _foreground: u32,
         _coordinate_mode: u8,
         _points: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: poly_point")
+        self.record(RecordedCall::PolyPoint { host_xid });
+        Ok(())
     }
 
     fn poly_fill_rectangle(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
+        host_xid: u32,
         _foreground: u32,
         _rectangles: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::PolyFillRectangle { host_xid });
         Ok(())
     }
 
@@ -1927,17 +2562,25 @@ impl Backend for RecordingBackend {
             width,
             height,
         });
+        if self.fail_fill_rectangle {
+            return Err(io::Error::other("fill_rectangle failure injected"));
+        }
         Ok(())
     }
 
     fn poly_text8(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_xid: u32,
-        _foreground: u32,
-        _body: &[u8],
+        host_xid: u32,
+        foreground: u32,
+        body: &[u8],
     ) -> io::Result<()> {
-        unimplemented!("RecordingBackend: poly_text8")
+        self.record(RecordedCall::PolyText8 {
+            host_xid,
+            foreground,
+            body: body.to_vec(),
+        });
+        Ok(())
     }
 
     fn poly_text16(
@@ -1974,16 +2617,15 @@ impl Backend for RecordingBackend {
         unimplemented!("RecordingBackend: image_text16")
     }
 
-    // RENDER — Picture create/free and the Composite/FillRectangles paints are recorded;
-    // the rest are no-ops.
+    // RENDER — methods that these request paths use are recorded.
 
     fn render_create_picture(
         &mut self,
         _origin: Option<OriginContext>,
         host_drawable: AnyHandle,
         _ynest_format: u32,
-        _value_mask: u32,
-        _values: &[u8],
+        value_mask: u32,
+        values: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
         if self.render_create_picture_fails {
             return Ok(None);
@@ -1992,6 +2634,8 @@ impl Backend for RecordingBackend {
         self.record(RecordedCall::RenderCreatePicture {
             host_drawable,
             host_pic,
+            value_mask,
+            values: values.to_vec(),
         });
         Ok(PictureHandle::from_raw(host_pic))
     }
@@ -1999,9 +2643,13 @@ impl Backend for RecordingBackend {
     fn render_change_picture(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
-        _body: &[u8],
+        host_pic: u32,
+        body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderChangePicture {
+            host_pic,
+            body: body.to_vec(),
+        });
         Ok(())
     }
 
@@ -2017,34 +2665,46 @@ impl Backend for RecordingBackend {
     fn render_create_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _ynest_format: u32,
+        ynest_format: u32,
     ) -> io::Result<Option<GlyphSetHandle>> {
-        Ok(None)
+        self.record(RecordedCall::RenderCreateGlyphSet { ynest_format });
+        Ok(self
+            .render_create_glyphset_returns_handle
+            .then(|| GlyphSetHandle::from_raw_panicking(self.allocate_handle())))
     }
 
     fn render_free_glyphset(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
+        host_gs: u32,
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFreeGlyphSet { host_gs });
         Ok(())
     }
 
     fn render_add_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _body_tail: &[u8],
+        host_gs: u32,
+        body_tail: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderAddGlyphs {
+            host_gs,
+            body_tail: body_tail.to_vec(),
+        });
         Ok(())
     }
 
     fn render_free_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_gs: u32,
-        _glyph_ids: &[u8],
+        host_gs: u32,
+        glyph_ids: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderFreeGlyphs {
+            host_gs,
+            glyph_ids: glyph_ids.to_vec(),
+        });
         Ok(())
     }
 
@@ -2071,18 +2731,31 @@ impl Backend for RecordingBackend {
     fn render_composite_glyphs(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
-        _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
-        _mask_fmt: u32,
-        _host_gs: u32,
-        _src_x: i16,
-        _src_y: i16,
-        _items: &[u8],
-        _x_off: i16,
-        _y_off: i16,
+        minor: u8,
+        op: u8,
+        host_src: u32,
+        host_dst: u32,
+        mask_fmt: u32,
+        host_gs: u32,
+        src_x: i16,
+        src_y: i16,
+        items: &[u8],
+        x_off: i16,
+        y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderCompositeGlyphs {
+            minor,
+            op,
+            host_src,
+            host_dst,
+            mask_fmt,
+            host_gs,
+            src_x,
+            src_y,
+            items: items.to_vec(),
+            x_off,
+            y_off,
+        });
         Ok(self.render_return_region.clone())
     }
 
@@ -2104,8 +2777,8 @@ impl Backend for RecordingBackend {
         &mut self,
         _origin: Option<OriginContext>,
         _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        host_src: u32,
+        host_dst: u32,
         _host_mask_format: u32,
         _src_x: i16,
         _src_y: i16,
@@ -2113,16 +2786,17 @@ impl Backend for RecordingBackend {
         _x_off: i16,
         _y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderTrapezoids { host_src, host_dst });
         Ok(self.render_return_region.clone())
     }
 
     fn render_triangles_op(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
+        minor: u8,
         _op: u8,
-        _host_src: u32,
-        _host_dst: u32,
+        host_src: u32,
+        host_dst: u32,
         _host_mask_format: u32,
         _src_x: i16,
         _src_y: i16,
@@ -2130,67 +2804,99 @@ impl Backend for RecordingBackend {
         _x_off: i16,
         _y_off: i16,
     ) -> io::Result<Vec<xfixes::RegionRect>> {
+        self.record(RecordedCall::RenderTriangles {
+            minor,
+            host_src,
+            host_dst,
+        });
         Ok(self.render_return_region.clone())
     }
 
     fn render_create_solid_fill(
         &mut self,
         _origin: Option<OriginContext>,
-        _color: [u8; 8],
+        color: [u8; 8],
     ) -> io::Result<Option<PictureHandle>> {
+        self.record(RecordedCall::RenderCreateSolidFill { color });
         Ok(None)
     }
 
     fn render_create_linear_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
+        self.record(RecordedCall::RenderCreateLinearGradient {
+            picture: body
+                .get(..4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        });
         Ok(None)
     }
 
     fn render_create_radial_gradient(
         &mut self,
         _origin: Option<OriginContext>,
-        _body: &[u8],
+        body: &[u8],
     ) -> io::Result<Option<PictureHandle>> {
+        self.record(RecordedCall::RenderCreateRadialGradient {
+            picture: body
+                .get(..4)
+                .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])),
+        });
         Ok(None)
     }
 
     fn render_create_cursor(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_src_pic: PictureHandle,
-        _x: u16,
-        _y: u16,
+        host_src_pic: PictureHandle,
+        x: u16,
+        y: u16,
     ) -> io::Result<Option<CursorHandle>> {
+        self.record(RecordedCall::RenderCreateCursor {
+            host_src_pic: host_src_pic.as_raw(),
+            x,
+            y,
+        });
         Ok(None)
     }
 
     fn render_set_picture_clip_rectangles(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderSetPictureClipRectangles { host_pic });
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn picture_client_clip_rects(
+        &mut self,
+        _host_pic: u32,
+    ) -> Option<Option<Vec<yserver_protocol::x11::xfixes::RegionRect>>> {
+        self.picture_client_clip_rects_result.clone()
     }
 
     fn render_set_picture_filter(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderSetPictureFilter { host_pic });
         Ok(())
     }
 
     fn render_set_picture_transform(
         &mut self,
         _origin: Option<OriginContext>,
-        _host_pic: u32,
+        host_pic: u32,
         _body: &[u8],
     ) -> io::Result<()> {
+        self.record(RecordedCall::RenderSetPictureTransform { host_pic });
         Ok(())
     }
 
@@ -2201,10 +2907,11 @@ impl Backend for RecordingBackend {
     fn xkb_proxy(
         &mut self,
         _origin: Option<OriginContext>,
-        _minor: u8,
+        minor: u8,
         _body: &[u8],
         _intern_atom: &mut dyn FnMut(&str) -> u32,
     ) -> io::Result<Option<Vec<u8>>> {
+        self.record(RecordedCall::XkbProxy { minor });
         Ok(None)
     }
 
@@ -2227,6 +2934,10 @@ impl Backend for RecordingBackend {
 
     fn take_displayed_cursor_change(&mut self) -> Option<crate::backend::DisplayedCursor> {
         self.displayed_cursor_change.take()
+    }
+
+    fn get_active_cursor_image(&self) -> Option<crate::backend::ActiveCursorImage> {
+        self.active_cursor_image.clone()
     }
 
     fn set_shape_rectangles(
@@ -2262,6 +2973,7 @@ impl Backend for RecordingBackend {
     }
 
     fn query_pointer(&mut self, _origin: Option<OriginContext>) -> io::Result<PointerPosition> {
+        self.record(RecordedCall::QueryPointer);
         Ok(PointerPosition {
             same_screen: true,
             win_x: 0,
@@ -2315,12 +3027,17 @@ impl Backend for RecordingBackend {
         Ok((0, Vec::new()))
     }
 
-    /// COW materialize edge (core 0 → 1). Core guarantees no COW is live
-    /// when this runs, so it is an unconditional materialize.
+    /// COW materialize: core calls this only with no core COW record, so
+    /// a live COW here must be a deferred retirement, which is re-adopted.
     fn get_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if self.cow_materialize_fails {
             return Err(io::Error::other("test-injected COW materialize failure"));
         }
+        assert!(
+            !self.cow_materialized || self.cow_release_deferred,
+            "get_overlay_window with a live, undeferred COW: core and backend drifted"
+        );
+        self.cow_release_deferred = false;
         self.cow_materialized = true;
         Ok(true)
     }
@@ -2337,19 +3054,28 @@ impl Backend for RecordingBackend {
         }
     }
 
-    /// COW teardown edge (core 1 → 0). Always a final teardown; clears
-    /// `cow_materialized` so `cow_host_xid` reverts to `None`. On
-    /// injected failure the overlay stays up, as `KmsBackend`'s does when
-    /// the unflip shadow cannot be allocated.
-    fn release_overlay_window(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
+    /// The fallible half of the COW teardown. On injected failure the
+    /// overlay stays up, as `KmsBackend`'s does when the unflip shadow
+    /// cannot be made.
+    fn prepare_overlay_release(&mut self, _origin: Option<OriginContext>) -> io::Result<bool> {
         if !self.cow_materialized {
             return Ok(false);
         }
         if self.cow_teardown_fails {
             return Err(io::Error::other("test-injected COW teardown failure"));
         }
-        self.cow_materialized = false;
         Ok(true)
+    }
+
+    /// Retire now (`cow_host_xid` reverts to `None`), or defer when
+    /// `cow_release_defers` is set.
+    fn retire_overlay_window(&mut self, _origin: Option<OriginContext>) {
+        self.record(RecordedCall::RetireOverlayWindow);
+        if self.cow_release_defers {
+            self.cow_release_deferred = true;
+        } else {
+            self.cow_materialized = false;
+        }
     }
 
     fn dpms_capable(&self) -> bool {
@@ -2407,6 +3133,34 @@ impl Backend for RecordingBackend {
         // RecordingBackend has no real GPU storage; report not-exportable.
         // Tests assert on the recorded call, not the return value.
         false
+    }
+}
+
+/// A rootless host's display connection, for loop tests: what is `pending`
+/// goes to `stream` (non-blocking) as far as it takes at each flush, before
+/// the loop blocks and when the connection is ready, as a host's flush does.
+#[derive(Debug)]
+pub struct HostDisplayOut {
+    pub stream: std::os::unix::net::UnixStream,
+    pub pending: Vec<u8>,
+    /// Flushes so far.
+    pub flushes: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+impl HostDisplayOut {
+    fn flush(&mut self) {
+        use std::io::Write as _;
+        self.flushes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        while !self.pending.is_empty() {
+            match self.stream.write(&self.pending) {
+                Ok(n) => {
+                    self.pending.drain(..n);
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
     }
 }
 

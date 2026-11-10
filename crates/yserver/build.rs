@@ -1,19 +1,6 @@
-//! Compile GLSL shaders under `src/kms/vk/shaders/` into SPIR-V
-//! binaries written to `OUT_DIR`. Source files use the conventional
-//! suffixes `.vert.glsl` / `.frag.glsl` (and `.comp.glsl` if/when
-//! compute shaders show up); the matching `.spv` output preserves
-//! the stage suffix so consumers can `include_bytes!()` them by
-//! name.
-//!
-//! Phase 4.1.3.4 introduced the first GLSL shaders (the per-window
-//! composite-pass quad shader); 4.1.4.6 will add a much larger set
-//! of RENDER pipelines (FixedBlend / ShaderRMW). The build-time
-//! glslc invocation scales by adding more files in the shaders
-//! directory — no code changes here.
-//!
-//! Requires `glslc` (from `vulkan-tools` / shaderc) on PATH. If
-//! it's missing, the build fails with a clear error rather than
-//! producing a half-broken binary.
+//! Emit the `kms` cfg alias and stamp the build with the git commit for
+//! `--version`. The GLSL shaders are compiled by `yserver-render`'s build
+//! script.
 
 use std::{
     env,
@@ -24,73 +11,85 @@ use std::{
 fn main() {
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    embed_windows_icon();
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let os = target_os.as_str();
+    // `cfg(kms)`: the DRM/KMS platform (and its libinput/VT stack) builds.
+    emit_cfg("kms", matches!(os, "linux" | "freebsd" | "openbsd"));
+    // The readiness API the platform's loops wait on.
+    emit_cfg("epoll", os == "linux");
+    emit_cfg("kqueue", matches!(os, "freebsd" | "openbsd" | "macos"));
+    // `eventfd(2)`, which DRM syncobj notification needs.
+    emit_cfg("eventfd", matches!(os, "linux" | "freebsd"));
+    // `cfg(tcp_transport)`: TCP can be listened on. The feature everywhere,
+    // and always on Windows, where TCP is the only transport.
+    emit_cfg(
+        "tcp_transport",
+        env::var_os("CARGO_FEATURE_TCP_TRANSPORT").is_some() || os == "windows",
+    );
+    // `cfg(wayland_host)`: the rootless Wayland host (`src/wayland/`)
+    // builds: the feature, on Linux, where its dependencies are.
+    emit_cfg(
+        "wayland_host",
+        env::var_os("CARGO_FEATURE_WAYLAND").is_some() && os == "linux",
+    );
+    // The `xkbcommon` crate links `-lxkbcommon` without a search path, and
+    // neither Homebrew's lib dir (macOS) nor vcpkg's (Windows) is on the
+    // linker's default path.
+    if target_os == "macos" {
+        emit_pkg_config_link_search("xkbcommon");
+        emit_homebrew_prefix();
+    }
+    if target_os == "windows" {
+        emit_pkg_config_link_search("xkbcommon");
+    }
 
     // Stamp the build with the git commit for `--version`. Best-effort:
     // a tarball / crates.io build (no `.git`, or no `git` on PATH) falls
     // back to "unknown".
     emit_git_commit(&manifest_dir);
+}
 
-    let shaders_src = manifest_dir.join("src/kms/vk/shaders");
-
-    println!("cargo:rerun-if-changed={}", shaders_src.display());
-    println!("cargo:rerun-if-env-changed=GLSLC");
-
-    let glslc = env::var_os("GLSLC")
-        .map(PathBuf::from)
-        .or_else(|| {
-            // Try PATH lookup. We avoid the `which` crate to keep
-            // build deps zero — this is a one-shot lookup.
-            env::var_os("PATH").and_then(|paths| {
-                env::split_paths(&paths)
-                    .map(|d| d.join("glslc"))
-                    .find(|p| p.is_file())
-            })
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "glslc not found on PATH. Install vulkan-tools / shaderc, or set the GLSLC env \
-                 var to the binary path. (Used to compile yserver's per-window composite \
-                 shaders to SPIR-V.)"
-            );
-        });
-
-    // Iterate top-level .glsl files (no recursion needed yet).
-    let read_dir = std::fs::read_dir(&shaders_src).unwrap_or_else(|e| {
-        panic!(
-            "cannot read shader sources at {}: {e}",
-            shaders_src.display()
-        )
-    });
-    let mut compiled = 0usize;
-    for entry in read_dir {
-        let entry = entry.expect("read shaders dir");
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("glsl") {
-            continue;
-        }
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or_else(|| panic!("shader path missing stem: {}", path.display()));
-        // The stem is e.g. "composite.vert"; the stage is the inner
-        // extension. Pass it explicitly to glslc via -fshader-stage
-        // so glslc doesn't need to infer from path.
-        let stage = stem
-            .rsplit_once('.')
-            .map(|(_, s)| s)
-            .unwrap_or_else(|| panic!("shader stem missing stage suffix: {stem}"));
-
-        let out_path = out_dir.join(format!("{stem}.spv"));
-        compile_shader(&glslc, &path, &out_path, stage);
-        compiled += 1;
+fn emit_cfg(name: &str, enabled: bool) {
+    println!("cargo::rustc-check-cfg=cfg({name})");
+    if enabled {
+        println!("cargo::rustc-cfg={name}");
     }
-    if compiled == 0 {
-        panic!(
-            "no .glsl shader sources found under {} — build.rs would silently produce no \
-             SPIR-V outputs. Either add a shader or remove build.rs.",
-            shaders_src.display()
-        );
+}
+
+/// Add `lib`'s pkg-config `libdir` as a native link search path. `libdir`
+/// rather than `--libs-only-L`: pkgconf drops `-L` for its system dirs.
+fn emit_pkg_config_link_search(lib: &str) {
+    println!("cargo::rerun-if-env-changed=PKG_CONFIG_PATH");
+    println!("cargo::rerun-if-env-changed=PKG_CONFIG");
+    // `PKG_CONFIG` names the binary, as for the `pkg-config` crate: vcpkg's
+    // is `pkgconf.exe`, off PATH.
+    let pkg_config = env::var_os("PKG_CONFIG").unwrap_or_else(|| "pkg-config".into());
+    let Ok(output) = Command::new(pkg_config)
+        .args(["--variable=libdir", lib])
+        .output()
+    else {
+        println!("cargo::warning=pkg-config not found; cannot locate {lib}");
+        return;
+    };
+    let libdir = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if libdir.is_empty() {
+        println!("cargo::warning=pkg-config has no libdir for {lib}");
+    } else {
+        println!("cargo::rustc-link-search=native={libdir}");
+    }
+}
+
+/// Emit `YSERVER_HOMEBREW_PREFIX` (`brew --prefix`), where `app_bundle`
+/// looks for the Vulkan ICD first. Absent without `brew`.
+fn emit_homebrew_prefix() {
+    let Ok(output) = Command::new("brew").arg("--prefix").output() else {
+        return;
+    };
+    let prefix = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if output.status.success() && !prefix.is_empty() {
+        println!("cargo::rustc-env=YSERVER_HOMEBREW_PREFIX={prefix}");
     }
 }
 
@@ -169,21 +168,16 @@ fn git_status(dir: &Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-fn compile_shader(glslc: &Path, src: &Path, dst: &Path, stage: &str) {
-    let status = Command::new(glslc)
-        .arg(format!("-fshader-stage={stage}"))
-        .arg("--target-env=vulkan1.3")
-        .arg("-O") // size+perf optimisation; debug-friendly enough
-        .arg("-o")
-        .arg(dst)
-        .arg(src)
-        .status()
-        .unwrap_or_else(|e| panic!("failed to spawn glslc on {}: {e}", src.display()));
-    if !status.success() {
-        panic!(
-            "glslc failed (exit {:?}) on {} — see build log for diagnostics",
-            status.code(),
-            src.display()
-        );
+/// yserver.exe's icon resource (`yserver.rc`), on windows-msvc; rc.exe
+/// comes with the MSVC Build Tools.
+fn embed_windows_icon() {
+    #[cfg(windows)]
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo::rerun-if-changed=yserver.rc");
+        println!("cargo::rerun-if-changed=../../assets/yserver.ico");
+        println!("cargo::rerun-if-changed=yserver.exe.manifest");
+        embed_resource::compile_for("yserver.rc", ["yserver"], embed_resource::NONE)
+            .manifest_required()
+            .expect("the icon resource");
     }
 }

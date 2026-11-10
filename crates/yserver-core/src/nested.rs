@@ -4,6 +4,7 @@
 // glue, region/shape ops). The legacy `handle_client`/`handle_request`
 // path was deleted in H1.
 
+#[cfg(unix)]
 use std::{
     fs,
     io::{self, ErrorKind},
@@ -11,10 +12,13 @@ use std::{
     path::PathBuf,
 };
 
+#[cfg(unix)]
 use log::{error, info};
 use yserver_protocol::x11::{ResourceId, shape as x11shape, xfixes as x11xfixes};
 
-use crate::{host_x11::HostX11Backend, server::ServerState};
+#[cfg(unix)]
+use crate::host_x11::HostX11Backend;
+use crate::{region::Region, server::ServerState};
 
 // Extension error-code bases. INVARIANT: each extension's reserved range
 // `[first_error, first_error + error_count)` must NOT overlap any other
@@ -24,7 +28,7 @@ use crate::{host_x11::HostX11Backend, server::ServerState};
 // Current allocation (error counts in parens):
 //   RANDR 147 (5) · RENDER 152 (5) · XInput 157 (5) · [host XKB 162 (1)]
 //   · XFIXES 163 (1) · SYNC 164 (3) · DAMAGE 167 (1) · MIT-SHM 168 (1)
-//   · GLX 169 (13, →181) · XFree86-VidMode 182 (7, →188).
+//   · GLX 169 (13, →181) · XFree86-VidMode 182 (7, →188) · RECORD 189 (1).
 //   SHAPE/Composite/Present/DPMS/screensaver: 0.
 // Do NOT pack these 1 apart — a multi-error extension (RENDER=5, GLX=13)
 // would then overlap its neighbours.
@@ -35,6 +39,7 @@ const RANDR_FIRST_ERROR: u8 = 147;
 const RENDER_MAJOR_OPCODE: u8 = 133;
 const RENDER_FIRST_EVENT: u8 = 0;
 pub(crate) const RENDER_FIRST_ERROR: u8 = 152;
+pub(crate) const RENDER_BAD_GLYPHSET_ERROR: u8 = RENDER_FIRST_ERROR + 3;
 
 const GE_MAJOR_OPCODE: u8 = 138;
 
@@ -109,6 +114,9 @@ pub(crate) const X_RESOURCE_MAJOR_OPCODE: u8 = 149;
 pub(crate) const XF86VIDMODE_MAJOR_OPCODE: u8 = 153;
 pub(crate) const XF86VIDMODE_FIRST_ERROR: u8 = 182;
 
+pub(crate) const RECORD_MAJOR_OPCODE: u8 = 154;
+pub(crate) const RECORD_FIRST_ERROR: u8 = 189;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtensionAvailability {
     Always,
@@ -119,6 +127,10 @@ pub(crate) enum ExtensionAvailability {
     /// backend has no real caps yet). Task 11 will narrow this to the
     /// real capability check.
     Dri3,
+    /// GLX — gated on `Backend::glx_available()`.
+    Glx,
+    /// MIT-SHM — its segments are SysV shm or passed fds, so Unix only.
+    Unix,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -282,7 +294,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         first_event: MIT_SHM_FIRST_EVENT,
         event_count: 1, // ShmCompletion=0
         first_error: MIT_SHM_FIRST_ERROR,
-        availability: ExtensionAvailability::Always,
+        availability: ExtensionAvailability::Unix,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },
     ExtensionMetadata {
@@ -309,7 +321,7 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         first_event: GLX_FIRST_EVENT,
         event_count: 2, // PbufferClobber=0, BufferSwapComplete=1
         first_error: GLX_FIRST_ERROR,
-        availability: ExtensionAvailability::Always,
+        availability: ExtensionAvailability::Glx,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },
     ExtensionMetadata {
@@ -339,8 +351,18 @@ pub(crate) const EXTENSIONS: &[ExtensionMetadata] = &[
         availability: ExtensionAvailability::Always,
         unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
     },
+    ExtensionMetadata {
+        name: "RECORD",
+        major_opcode: RECORD_MAJOR_OPCODE,
+        first_event: 0,
+        event_count: 0,
+        first_error: RECORD_FIRST_ERROR, // 1 error: BadContext
+        availability: ExtensionAvailability::Always,
+        unsupported_minor_policy: UnsupportedMinorPolicy::HandledInline,
+    },
 ];
 
+#[cfg(unix)]
 pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
     let socket_dir = PathBuf::from("/tmp/.X11-unix");
     fs::create_dir_all(&socket_dir)?;
@@ -392,6 +414,7 @@ pub fn run(display: u16, width: u16, height: u16) -> io::Result<()> {
     // push host visual / colormap xids into the resource table so that
     // CreateWindow forwarding can translate our visual ids to host ones.
     crate::backend::install_backend_root_bindings(&mut state, &backend);
+    crate::core_loop::process_request::install_default_font(&mut state, &mut backend)?;
 
     let (poll, sender, rx) = crate::core_loop::sender::channel()?;
     let allocator = crate::core_loop::poll_tokens::ClientIdAllocator::new();
@@ -479,6 +502,72 @@ where
         idx += 1;
     }
     Some(out)
+}
+
+/// Translate the glyphset XID in each inline-switch item in a
+/// `CompositeGlyphs{8,16,32}` stream. Incomplete item tails are left untouched
+/// because the renderer stops before consuming them.
+pub(crate) fn composite_glyphs_translate_glyphsets<F>(
+    minor: u8,
+    items: &[u8],
+    mut translate: F,
+) -> Vec<u8>
+where
+    F: FnMut(u32) -> Option<u32>,
+{
+    let mut out = items.to_vec();
+    composite_glyphs_visit_switches(minor, items, |pos, xid| {
+        if let Some(host_xid) = translate(xid) {
+            out[pos + 8..pos + 12].copy_from_slice(&host_xid.to_le_bytes());
+        }
+        true
+    });
+    out
+}
+
+fn composite_glyphs_visit_switches<F>(minor: u8, items: &[u8], mut visit: F)
+where
+    F: FnMut(usize, u32) -> bool,
+{
+    let id_size = match minor {
+        23 => 1,
+        24 => 2,
+        25 => 4,
+        _ => return,
+    };
+    let mut pos = 0usize;
+    while pos + 8 <= items.len() {
+        let count = items[pos];
+        if count == u8::MAX {
+            let switch_end = pos + 12;
+            if switch_end > items.len() {
+                break;
+            }
+
+            // Mirrors Xorg render/render.c:1152: after the 8-byte header,
+            // it looks up the XID only when buffer + sizeof(GlyphSet) < end.
+            // Thus an XID ending exactly at the stream end is not checked.
+            if switch_end < items.len() {
+                let xid = u32::from_le_bytes(
+                    items[pos + 8..switch_end]
+                        .try_into()
+                        .expect("glyphset XID is four bytes"),
+                );
+                if !visit(pos, xid) {
+                    return;
+                }
+            }
+            pos = switch_end;
+            continue;
+        }
+
+        let payload_bytes = usize::from(count) * id_size;
+        let padded_payload_bytes = (payload_bytes + 3) & !3;
+        if pos + 8 + padded_payload_bytes > items.len() {
+            break;
+        }
+        pos += 8 + padded_payload_bytes;
+    }
 }
 
 pub(crate) fn normalize_region_rects(
@@ -615,6 +704,7 @@ pub(crate) fn intersect_regions(
 /// area from each new source rect before appending it. That is enough
 /// for the compositor/shape workloads here, which only ever feed us
 /// normalized region lists.
+#[cfg(test)]
 pub(crate) fn union_regions(
     current: &[x11xfixes::RegionRect],
     source: &[x11xfixes::RegionRect],
@@ -706,26 +796,6 @@ pub(crate) fn subtract_regions(
     normalize_region_rects(result)
 }
 
-pub(crate) fn translate_region(rects: &mut [x11xfixes::RegionRect], dx: i16, dy: i16) {
-    for rect in rects {
-        rect.x = rect.x.saturating_add(dx);
-        rect.y = rect.y.saturating_add(dy);
-    }
-}
-
-/// Handle `GetAtomName` (opcode 17). Atom IDs in our protocol stream can come
-/// from host-proxied replies (notably the `FONTPROP` atoms inside
-/// `ListFontsWithInfo`), so a client can legitimately ask us about an atom
-/// we never interned ourselves. Fall back to the host before returning
-pub(crate) fn offset_rects(
-    mut rects: Vec<x11xfixes::RegionRect>,
-    dx: i16,
-    dy: i16,
-) -> Vec<x11xfixes::RegionRect> {
-    translate_region(&mut rects, dx, dy);
-    normalize_region_rects(rects)
-}
-
 pub(crate) fn default_shape_rect(
     server: &ServerState,
     window: ResourceId,
@@ -777,8 +847,27 @@ pub(crate) fn shape_rects_for(
     server
         .shape_windows
         .get(&window)
-        .and_then(|state| state.rects(kind).cloned())
+        .and_then(|state| state.rects(kind))
         .unwrap_or_else(|| normalize_region_rects(vec![default_shape_rect(server, window, kind)]))
+}
+
+/// `window`'s shape region of `kind` as set, `None` while unset.
+pub(crate) fn shape_region(server: &ServerState, window: ResourceId, kind: u8) -> Option<&Region> {
+    server
+        .shape_windows
+        .get(&window)
+        .and_then(|state| state.region(kind))
+}
+
+/// `window`'s shape region of `kind`, its default while unset.
+pub(crate) fn shape_region_or_default(
+    server: &ServerState,
+    window: ResourceId,
+    kind: u8,
+) -> Region {
+    shape_region(server, window, kind)
+        .cloned()
+        .unwrap_or_else(|| Region::rect(default_shape_rect(server, window, kind)))
 }
 
 pub(crate) fn shape_mask_source_rects(
@@ -871,45 +960,74 @@ pub(crate) fn shape_kind_is_set(server: &ServerState, window: ResourceId, kind: 
     server
         .shape_windows
         .get(&window)
-        .and_then(|state| state.rects(kind))
+        .and_then(|state| state.region(kind))
         .is_some()
 }
 
+/// Xorg's `RegionOperate` (`Xext/shape.c`): `source` combined into the
+/// current shape, `None` while the window is unshaped. On an unshaped
+/// window Union changes nothing, Intersect takes the source, Subtract
+/// starts from the default shape and Invert gives the empty region; on a
+/// shaped one Invert is the source minus the current shape. The result is
+/// `None` when the window stays unshaped.
 pub(crate) fn apply_shape_op(
-    current: Vec<x11xfixes::RegionRect>,
-    source: Vec<x11xfixes::RegionRect>,
+    current: Option<&Region>,
+    default: impl FnOnce() -> Region,
+    source: Region,
     op: u8,
-) -> Vec<x11xfixes::RegionRect> {
-    match op {
-        x11shape::OP_SET => normalize_region_rects(source),
-        x11shape::OP_UNION => union_regions(&current, &source),
-        x11shape::OP_INTERSECT => intersect_regions(&current, &source),
-        x11shape::OP_SUBTRACT => subtract_regions(&current, &source),
-        x11shape::OP_INVERT => normalize_region_rects(source),
-        _ => current,
+) -> Option<Region> {
+    match (op, current) {
+        (x11shape::OP_SET, _) | (x11shape::OP_INTERSECT, None) => Some(source),
+        (x11shape::OP_UNION, Some(cur)) => Some(cur.union(&source)),
+        (x11shape::OP_INTERSECT, Some(cur)) => Some(cur.intersect(&source)),
+        (x11shape::OP_SUBTRACT, Some(cur)) => Some(cur.subtract(&source)),
+        (x11shape::OP_SUBTRACT, None) => Some(default().subtract(&source)),
+        (x11shape::OP_INVERT, Some(cur)) => Some(source.subtract(cur)),
+        (x11shape::OP_INVERT, None) => Some(Region::default()),
+        (_, cur) => cur.cloned(),
     }
 }
 
-/// Store `rects` as `window`'s shape region for `kind`. Returns `true`
-/// iff the stored region actually changed — callers gate ShapeNotify
-/// emission on this so a no-op re-set (e.g. a WM re-asserting an
-/// unchanged shape) doesn't spam events, matching Xorg's
-/// `Xext/shape.c` which only notifies on a real change.
+/// Tests: store arbitrary `rects` (normalised) as `window`'s shape of
+/// `kind`; `true` iff it changed.
+#[cfg(test)]
 pub(crate) fn set_shape_rects(
     server: &mut ServerState,
     window: ResourceId,
     kind: u8,
     rects: Vec<x11xfixes::RegionRect>,
 ) -> bool {
-    let normalized = normalize_region_rects(rects);
-    let state = server.shape_windows.entry(window).or_default();
-    if let Some(slot) = state.rects_mut(kind) {
-        let changed = slot.as_deref() != Some(normalized.as_slice());
-        *slot = Some(normalized);
-        changed
-    } else {
-        false
+    if !matches!(
+        kind,
+        x11shape::KIND_BOUNDING | x11shape::KIND_CLIP | x11shape::KIND_INPUT
+    ) {
+        return false;
     }
+    set_shape_region(server, window, kind, Region::from_rects(&rects))
+}
+
+/// Store `region` as `window`'s shape of `kind`. Returns `true` iff the
+/// stored region actually changed — callers gate ShapeNotify emission on
+/// this so a no-op re-set (e.g. a WM re-asserting an unchanged shape)
+/// doesn't spam events.
+pub(crate) fn set_shape_region(
+    server: &mut ServerState,
+    window: ResourceId,
+    kind: u8,
+    region: Region,
+) -> bool {
+    if !matches!(
+        kind,
+        x11shape::KIND_BOUNDING | x11shape::KIND_CLIP | x11shape::KIND_INPUT
+    ) {
+        return false;
+    }
+    let state = server.shape_windows.entry(window).or_default();
+    let changed = state.region(kind) != Some(&region);
+    if changed {
+        state.set_region(kind, Some(region));
+    }
+    changed
 }
 
 /// Resolve `window`'s host XID and current per-kind rect list, then forward
@@ -929,12 +1047,9 @@ pub(crate) fn clear_shape_rects(server: &mut ServerState, window: ResourceId, ki
     let Some(state) = server.shape_windows.get_mut(&window) else {
         return false;
     };
-    let Some(slot) = state.rects_mut(kind) else {
-        return false;
-    };
-    let changed = slot.is_some();
-    *slot = None;
-    if state.bounding.is_none() && state.clip.is_none() && state.input.is_none() {
+    let changed = state.region(kind).is_some();
+    state.set_region(kind, None);
+    if state.is_unshaped() {
         server.shape_windows.remove(&window);
     }
     changed
@@ -1022,6 +1137,17 @@ mod tests {
         assert_eq!(ext.major_opcode, 153);
         assert_eq!(ext.first_event, 0);
         assert_eq!(ext.first_error, 182);
+    }
+
+    #[test]
+    fn record_is_advertised_with_its_error() {
+        let ext = EXTENSIONS
+            .iter()
+            .find(|ext| ext.name == "RECORD")
+            .expect("RECORD in EXTENSIONS");
+        assert_eq!(ext.major_opcode, 154);
+        assert_eq!(ext.first_event, 0);
+        assert_eq!(ext.first_error, 189);
     }
 
     mod render {
@@ -1185,8 +1311,7 @@ mod tests {
     mod xfixes_ops {
         use super::super::{
             clear_shape_rects, intersect_regions, normalize_region_rects, region_extents,
-            shape_kind_is_set, shape_mask_source_rects, shape_rects_for, translate_region,
-            union_regions,
+            shape_kind_is_set, shape_mask_source_rects, shape_rects_for, union_regions,
         };
         use crate::{resources::ROOT_WINDOW, server::ServerState};
         use yserver_protocol::x11::{
@@ -1290,21 +1415,6 @@ mod tests {
         }
 
         #[test]
-        fn translate_shifts_coords() {
-            let mut rects = vec![r(10, 20, 5, 5)];
-            translate_region(&mut rects, 3, -5);
-            assert_eq!(rects[0], r(13, 15, 5, 5));
-        }
-
-        #[test]
-        fn translate_saturates_at_bounds() {
-            let mut rects = vec![r(i16::MAX, i16::MIN, 1, 1)];
-            translate_region(&mut rects, 100, -100);
-            assert_eq!(rects[0].x, i16::MAX);
-            assert_eq!(rects[0].y, i16::MIN);
-        }
-
-        #[test]
         fn shape_mask_source_uses_pixmap_geometry() {
             let mut server = ServerState::new();
             let pixmap = ResourceId(0x200);
@@ -1329,7 +1439,11 @@ mod tests {
         fn clear_shape_rects_reverts_to_default_region() {
             let mut server = ServerState::new();
             let window = ROOT_WINDOW;
-            server.shape_windows.entry(window).or_default().bounding = Some(vec![r(1, 2, 3, 4)]);
+            server
+                .shape_windows
+                .entry(window)
+                .or_default()
+                .set_rects(shape::KIND_BOUNDING, Some(vec![r(1, 2, 3, 4)]));
 
             assert!(shape_kind_is_set(&server, window, shape::KIND_BOUNDING));
             clear_shape_rects(&mut server, window, shape::KIND_BOUNDING);
@@ -1429,7 +1543,7 @@ mod tests {
 
         use crate::{
             backend::recording::RecordingBackend,
-            core_loop::run::handle_host_container_resize,
+            core_loop::{host_screen_resized, run::handle_host_container_resize},
             host_x11::HostConfigureEvent,
             resources::ROOT_WINDOW,
             server::{ClientState, ServerState},
@@ -1444,6 +1558,7 @@ mod tests {
             state.clients.insert(
                 1,
                 ClientState {
+                    admission: crate::access::Admission::Internal,
                     writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(writer_local))),
                     byte_order: ClientByteOrder::LittleEndian,
                     last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1456,11 +1571,16 @@ mod tests {
                     xi1_event_classes: HashSet::new(),
                     xi1_window_event_classes: HashMap::new(),
                     outbound: std::collections::VecDeque::new(),
+                    outbound_fds: Default::default(),
                     watching_writable: false,
+                    write_failed: false,
+                    gone: false,
                     focused_window: crate::resources::ROOT_WINDOW,
                     reader_control: None,
                     is_local: true,
                     fd_passing: true,
+                    internal: false,
+                    peer: crate::peer::PeerIdentity::unknown_unix(),
                 },
             );
             (state, reader_remote)
@@ -1522,6 +1642,82 @@ mod tests {
             let height = u16::from_le_bytes(buf[22..24].try_into().unwrap());
             assert_eq!(width, 1024);
             assert_eq!(height, 768);
+        }
+
+        /// After `--fb 1600x900` over a 1024x768 output, a host resize to
+        /// 1600x900 moves the output only: no root ConfigureNotify, one
+        /// ScreenChangeNotify, one CrtcChangeNotify (codex round 2).
+        #[test]
+        fn host_screen_resized_to_the_screen_size_moves_only_the_output() {
+            let (mut state, mut reader) = server_with_root_listener();
+            let mut backend = RecordingBackend::new();
+            reader.set_nonblocking(true).expect("set non-blocking");
+            let events = |reader: &mut UnixStream| {
+                let mut buf = [0u8; 4096];
+                let n = reader.read(&mut buf).unwrap_or(0);
+                buf[..n]
+                    .chunks_exact(32)
+                    .map(|ev| (ev[0] & 0x7f, ev[1]))
+                    .collect::<Vec<_>>()
+            };
+            host_screen_resized(&mut state, &mut backend, 1024, 768);
+            state.randr.set_logical_size(1600, 900, 423, 238);
+            if let Some(root) = state.resources.window_mut(ROOT_WINDOW) {
+                (root.width, root.height) = (1600, 900);
+            }
+            // RRSelectInput(root, ScreenChange | CrtcChange)
+            state.randr_select_masks.insert((1, ROOT_WINDOW), 0x3);
+            events(&mut reader);
+
+            host_screen_resized(&mut state, &mut backend, 1600, 900);
+            let output = state.randr.outputs.first().expect("one output");
+            assert_eq!((output.width, output.height), (1600, 900));
+            assert_eq!(
+                (
+                    state.randr.screen_width,
+                    state.randr.screen_height,
+                    state.randr.width_mm,
+                    state.randr.height_mm
+                ),
+                (1600, 900, 423, 238),
+                "the screen is untouched"
+            );
+            // (type, byte 1): ScreenChangeNotify (rotation Rotate_0),
+            // RRNotify subcode CrtcChange.
+            assert_eq!(events(&mut reader), [(89, 1), (90, 0)]);
+        }
+
+        #[test]
+        fn host_screen_resized_moves_the_output_and_ignores_no_ops() {
+            let (mut state, mut reader) = server_with_root_listener();
+            let mut backend = RecordingBackend::new();
+            reader.set_nonblocking(true).expect("set non-blocking");
+            let pending = |reader: &mut UnixStream| {
+                let mut buf = [0u8; 4096];
+                reader.read(&mut buf).map_or(0, |n| n / 32)
+            };
+
+            host_screen_resized(&mut state, &mut backend, 1024, 768);
+            assert_eq!(
+                (state.randr.screen_width, state.randr.screen_height),
+                (1024, 768)
+            );
+            let output = state.randr.outputs.first().expect("one output");
+            assert_eq!((output.width, output.height), (1024, 768));
+            let crtc = state
+                .randr
+                .crtc_info(output.crtc_id, 0)
+                .expect("the output's crtc");
+            assert_eq!((crtc.width, crtc.height), (1024, 768));
+            assert_eq!(pending(&mut reader), 1, "one root ConfigureNotify");
+
+            host_screen_resized(&mut state, &mut backend, 1024, 768);
+            host_screen_resized(&mut state, &mut backend, 0, 768);
+            assert_eq!(pending(&mut reader), 0, "same or zero size: no events");
+            assert_eq!(
+                (state.randr.screen_width, state.randr.screen_height),
+                (1024, 768)
+            );
         }
     }
 }

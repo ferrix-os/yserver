@@ -6,7 +6,7 @@ starty - start yserver on a free display and run a session
 
 # SYNOPSIS
 
-*starty* [_client_ [_client_args_...]]
+*starty* [_client_ [_client_args_...]] [-- _server_args_...]
 
 # DESCRIPTION
 
@@ -16,7 +16,8 @@ server down when the session exits.
 
 With no _client_, it runs _~/.xinitrc_, falling back to
 _/etc/X11/xinit/xinitrc_. With a _client_, it resolves it via *PATH* and
-runs it with the given arguments, no xinitrc needed.
+runs it with the given arguments, no xinitrc needed. Arguments after the
+first *--* are passed to *yserver*(1).
 
 It must be run from a virtual console. *yserver* drives KMS directly and
 needs a real controlling console, so *starty* refuses to run from a
@@ -34,7 +35,8 @@ readiness handshake would never reach the display manager.
 # OPERATION
 
 . Scan _/tmp/.X11-unix/_ and pick the lowest free display number.
-. Mint an MIT-MAGIC-COOKIE-1 with *mcookie*(1).
+. Mint an MIT-MAGIC-COOKIE-1 with *mcookie*(1), or from _/dev/urandom_
+  where there is no *mcookie*.
 . Write the cookie to an unguessable temporary file and pass it to the
   server as *-auth*. This is the server's copy, used only to validate
   connecting clients.
@@ -57,6 +59,12 @@ sockets.
 
 *-h*, *--help*
 	Print usage and exit.
+
+*--* _server_args_...
+	Pass the remaining arguments to *yserver*(1). For example,
+	*starty -- --vrr* runs the default xinitrc with VRR enabled, while
+	*starty bspwm -- --vrr all* starts *bspwm* and requests VRR with
+	application exclusions.
 
 # ENVIRONMENT
 
@@ -81,14 +89,15 @@ _$XDG_STATE_HOME/yserver/session.log_
 
 # REQUIREMENTS
 
-*xauth*(1) and *mcookie*(1) must be on *PATH*, along with *yserver*(1).
+*xauth*(1) must be on *PATH*, along with *yserver*(1). *mcookie*(1) is
+used when present.
 
 # PLATFORM NOTES
 
-Works on Linux virtual consoles (_/dev/ttyN_) and FreeBSD *vt*(4)
-consoles (_/dev/ttyvN_). Console takeover — which stops the kernel from
-turning *Ctrl-C* in an X client into a signal that kills the whole
-session — is implemented on both.
+Works on Linux virtual consoles (_/dev/ttyN_), FreeBSD *vt*(4) consoles
+(_/dev/ttyvN_) and OpenBSD *wscons*(4) consoles (_/dev/ttyCN_). Console
+takeover — which stops the kernel from turning *Ctrl-C* in an X client
+into a signal that kills the whole session — is implemented on all three.
 
 # SEE ALSO
 

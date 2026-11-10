@@ -38,6 +38,7 @@ use yserver_protocol::x11::{
 
 use crate::kms::{
     cpu_types::{PictTransform, Rectangle16, Repeat},
+    font_index::{FontPattern, FontTable, LoweredName, TableEntry},
     xkb_desc::XkbDesc,
 };
 
@@ -160,24 +161,48 @@ fn locked_real_mods(state: &xkbcommon::xkb::State, keymap: &xkbcommon::xkb::Keym
         .fold(0u8, |mask, (bit, _)| mask | (1 << bit))
 }
 
+/// The real modifiers releasing the `held` keys unlocks in `state` (which
+/// it consumes: the keys end up released).
+fn release_unlocks(
+    state: &mut xkbcommon::xkb::State,
+    keymap: &xkbcommon::xkb::Keymap,
+    held: &[u8],
+) -> u8 {
+    held.iter().fold(0, |unlocked, &kc| {
+        let before = locked_real_mods(state, keymap);
+        state.update_key(
+            xkbcommon::xkb::Keycode::new(u32::from(kc)),
+            xkbcommon::xkb::KeyDirection::Up,
+        );
+        unlocked | (before & !locked_real_mods(state, keymap))
+    })
+}
+
+/// The real modifiers a press of `kc` locks in a fresh state of `keymap`.
+fn press_locks(keymap: &xkbcommon::xkb::Keymap, kc: u8) -> u8 {
+    let mut probe = fresh_state(keymap);
+    probe.update_key(
+        xkbcommon::xkb::Keycode::new(u32::from(kc)),
+        xkbcommon::xkb::KeyDirection::Down,
+    );
+    locked_real_mods(&probe, keymap)
+}
+
 fn press_release_key(state: &mut xkbcommon::xkb::State, kc: u8) {
     let key = xkbcommon::xkb::Keycode::new(u32::from(kc));
     state.update_key(key, xkbcommon::xkb::KeyDirection::Down);
     state.update_key(key, xkbcommon::xkb::KeyDirection::Up);
 }
 
-/// Lock the real modifiers `target` in a fresh `state` of `keymap` by pressing
-/// and releasing the keymap's own lock keys; returns the bits no key could
-/// lock.
+/// Lock the real modifiers `target` in `state` of `keymap` by pressing and
+/// releasing the keymap's own lock keys; returns the bits no key could lock.
 ///
-/// Why replay and not `update_mask`: xkbcommon documents `update_mask` as the
-/// lossy client-side entry point that "must not be used to update the server
-/// state" and must not be mixed with `update_key`, which drives this state for
-/// every real key event afterwards. Its server-side counterpart for
-/// out-of-band lock changes, `xkb_state_update_latched_locked`, needs
-/// libxkbcommon 1.8 and isn't exposed by the `xkbcommon` crate. A replay only
-/// goes through `update_key`, so the state reaches the locks by the keymap's
-/// own `LockMods` actions and the real lock keys still unlock afterwards.
+/// The replay reaches the locks through `update_key` and the keymap's own
+/// `LockMods` actions. XkbLatchLockState locks with `update_mask` instead
+/// (`backend_keyboard_set_locked_mods`), which libxkbcommon documents as not
+/// to be mixed with `update_key`; the KMS test
+/// `latch_lock_numlock_keeps_held_shift_and_physical_key_unlocks` pins the
+/// held-key and physical-unlock behaviour that relies on.
 ///
 /// Candidates come from probing every keycode on a scratch state: a key
 /// qualifies when a press+release locks only real modifiers we want and
@@ -228,7 +253,7 @@ fn cooking_keymap_for(
     keymap: xkbcommon::xkb::Keymap,
     rmlvo: &XkbRmlvo,
 ) -> (XkbDesc, String, xkbcommon::xkb::Keymap) {
-    let mut desc = match XkbDesc::from_keymap(&keymap) {
+    let mut desc = match XkbDesc::from_keymap(&keymap, ctx) {
         Ok(desc) => desc,
         Err(e) => {
             log::error!("xkb: can't read the keymap back ({e}); an empty description");
@@ -364,51 +389,129 @@ pub(crate) struct FontState {
 /// back through `open_font`, so the LFWI metrics path can return real
 /// FreeType metrics for any name we hand out.
 /// One font-path directory: parsed `fonts.dir` (+ optional
-/// `fonts.alias`). Names are kept verbatim (matching is
-/// case-insensitive per the X11 spec).
+/// `fonts.alias`), as libXfont's fontfile FPE keeps it: names lowered and
+/// sorted into two tables (`FontFileReadDirectory`).
 #[derive(Debug, Clone)]
 pub(crate) struct FontDir {
-    /// fonts.dir entries in file order: (font name, glyph file path).
-    pub(crate) entries: Vec<(String, std::path::PathBuf)>,
-    /// fonts.alias entries: (alias, target font name or pattern).
-    pub(crate) aliases: Vec<(String, String)>,
+    /// libXfont's `nonScalable` table: the fonts.dir names that are not a
+    /// scalable XLFD, and the aliases.
+    pub(crate) non_scalable: FontTable<DirEntry>,
+    /// libXfont's `scalable` table: fonts.dir XLFDs without a pixel or
+    /// point size (`-0-0-`), as mkfontscale writes for outline fonts.
+    pub(crate) scalable: FontTable<DirEntry>,
+}
+
+/// What a [`FontDir`] name stands for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DirEntry {
+    /// A fonts.dir entry: its glyph file.
+    File(std::path::PathBuf),
+    /// A fonts.alias entry: the font name or pattern it stands for,
+    /// lowered as libXfont stores it.
+    Alias(String),
+}
+
+/// Whether a fonts.dir name goes to libXfont's `scalable` table: an XLFD
+/// (14 dashes) whose size fields parse (`FontParseXLFDName`'s `GetInt`:
+/// digits, empty or `*`) and whose pixel and point sizes are both unset.
+fn is_scalable_xlfd(name: &str) -> bool {
+    let f: Vec<&str> = name.split('-').collect();
+    if f.len() != 15 {
+        return false;
+    }
+    let int = |s: &str| -> Option<i64> {
+        match s {
+            "*" => Some(-1),
+            _ if s.bytes().all(|c| c.is_ascii_digit()) => Some(
+                s.bytes()
+                    .fold(0i64, |v, c| v.saturating_mul(10) + i64::from(c - b'0')),
+            ),
+            _ => None,
+        }
+    };
+    let (Some(px), Some(pt)) = (int(f[7]), int(f[8])) else {
+        return false;
+    };
+    [9, 10, 12].iter().all(|&i| int(f[i]).is_some()) && px <= 0 && pt <= 0
 }
 
 impl FontDir {
-    /// Parse `<dir>/fonts.dir` (required) and `<dir>/fonts.alias`
-    /// (optional). fonts.dir: first line = entry count, then
-    /// `<file> <name>` per line (name may contain spaces — split at
-    /// the FIRST space). fonts.alias: `<alias> <name>` with optional
-    /// double quotes around either; `!` starts a comment line.
+    /// Parse `<dir>/fonts.dir` and `<dir>/fonts.alias`, either of which
+    /// may be missing but not both: libXfont's `FontFileReadDirectory`
+    /// takes a directory of aliases alone, as CDE's
+    /// `/usr/dt/etc/cde/fontaliases` is. fonts.dir: first line = entry count, then
+    /// `<file> <name>` per line (the file name ends at the first blank,
+    /// the font name is the rest of the line). fonts.alias: `<alias> <name>` with optional
+    /// double quotes around either; `!` starts a comment line; an alias
+    /// naming itself is dropped (`FontFileAddFontAlias`).
     pub(crate) fn load(dir: &std::path::Path) -> io::Result<Self> {
-        let dir_listing = std::fs::read_to_string(dir.join("fonts.dir"))?;
-        let mut entries = Vec::new();
+        let dir_listing = match std::fs::read_to_string(dir.join("fonts.dir")) {
+            Ok(text) => Some(text),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        };
+        let alias_text = std::fs::read_to_string(dir.join("fonts.alias")).ok();
+        if dir_listing.is_none() && alias_text.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "neither fonts.dir nor fonts.alias",
+            ));
+        }
+        let dir_listing = dir_listing.unwrap_or_default();
+        let mut non_scalable = Vec::new();
+        let mut scalable = Vec::new();
         for line in dir_listing.lines().skip(1) {
             let line = line.trim_end();
-            if let Some((file, name)) = line.split_once(' ') {
+            if let Some((file, name)) = line.split_once(char::is_whitespace) {
+                let name = name.trim_start();
                 if file.is_empty() || name.is_empty() {
                     continue;
                 }
-                entries.push((name.to_string(), dir.join(file)));
+                let entry = (name.to_string(), DirEntry::File(dir.join(file)));
+                if is_scalable_xlfd(name) {
+                    scalable.push(entry);
+                } else {
+                    non_scalable.push(entry);
+                }
             }
         }
-        let mut aliases = Vec::new();
-        if let Ok(alias_text) = std::fs::read_to_string(dir.join("fonts.alias")) {
+        if let Some(alias_text) = alias_text {
             for line in alias_text.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('!') {
                     continue;
                 }
-                let (alias, rest) = match split_alias_token(line) {
-                    Some(pair) => pair,
-                    None => continue,
+                let Some((alias, rest)) = split_alias_token(line) else {
+                    continue;
                 };
                 if let Some((target, _)) = split_alias_token(rest) {
-                    aliases.push((alias.to_string(), target.to_string()));
+                    if alias == target {
+                        continue;
+                    }
+                    let target = LoweredName::new(target);
+                    non_scalable.push((
+                        alias.to_string(),
+                        DirEntry::Alias(String::from_utf8_lossy(&target.bytes).into_owned()),
+                    ));
                 }
             }
         }
-        Ok(Self { entries, aliases })
+        Ok(Self {
+            non_scalable: FontTable::new(non_scalable),
+            scalable: FontTable::new(scalable),
+        })
+    }
+
+    /// The names `pattern` matches, in the order libXfont lists them
+    /// (`_FontFileListFonts`): the `nonScalable` table, then the
+    /// `scalable` one, each in `strcmpn` order.
+    pub(crate) fn matching<'a>(
+        &'a self,
+        pattern: &'a FontPattern,
+    ) -> impl Iterator<Item = &'a TableEntry<DirEntry>> + 'a {
+        self.non_scalable
+            .matching(pattern)
+            .chain(self.scalable.matching(pattern))
     }
 }
 
@@ -431,23 +534,8 @@ fn split_alias_token(s: &str) -> Option<(&str, &str)> {
     }
 }
 
-/// Case-insensitive `*`/`?` glob for X11 font name patterns.
-/// Greedy backtracking matcher — font names and patterns are short.
-pub(crate) fn font_pattern_matches(pattern: &str, name: &str) -> bool {
-    let p: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
-    let n: Vec<char> = name.to_ascii_lowercase().chars().collect();
-    fn rec(p: &[char], n: &[char]) -> bool {
-        match p.first() {
-            None => n.is_empty(),
-            Some('*') => (0..=n.len()).any(|k| rec(&p[1..], &n[k..])),
-            Some('?') => !n.is_empty() && rec(&p[1..], &n[1..]),
-            Some(c) => n.first() == Some(c) && rec(&p[1..], &n[1..]),
-        }
-    }
-    rec(&p, &n)
-}
-
 /// Resolution outcome for a font name against the font path.
+#[derive(Debug, Clone)]
 pub(crate) enum FontResolution {
     /// Matched a fonts.dir entry: open this file. `entry_name` is the
     /// matched fonts.dir name (used for XLFD-derived sizing of
@@ -468,9 +556,12 @@ pub(crate) enum FontResolution {
 
 /// A core font compiled into the server, serving the `built-ins`
 /// font-path element the way libXfont2's built-in FPE does.
+#[derive(Debug)]
 pub(crate) struct EmbeddedFont {
     /// The bare font name clients ask for (`OpenFont` / `fonts.dir` key).
     pub(crate) name: &'static str,
+    /// Further names it answers to.
+    pub(crate) aliases: &'static [&'static str],
     /// PCF file contents.
     pub(crate) bytes: &'static [u8],
 }
@@ -490,34 +581,141 @@ pub(crate) struct EmbeddedFont {
 /// `fixed` is deliberately absent: it is ordinary text, so fontconfig's
 /// substitution is a reasonable (if not byte-faithful) stand-in, and clients
 /// already depend on that behaviour.
+///
+/// `fixed`: libXfont2's built-in FPE serves `fixed` and `6x13` as aliases of
+/// its embedded `6x13-ISO8859-1.pcf`, so Xorg answers them, and CDE's
+/// dthello and friends start, on a host with no core font packages. A
+/// fontconfig face has other metrics (10 wide, not 6).
 pub(crate) static EMBEDDED_FONTS: &[EmbeddedFont] = &[
     EmbeddedFont {
         name: "cursor",
+        aliases: &[],
         bytes: include_bytes!("../../fonts/cursor.pcf"),
     },
     EmbeddedFont {
         name: "nil2",
+        aliases: &[],
         bytes: include_bytes!("../../fonts/nil2.pcf"),
     },
+    EmbeddedFont {
+        name: XORG_BUILTIN_FIXED,
+        aliases: &[
+            "fixed",
+            "6x13",
+            "-misc-fixed-medium-r-semicondensed--13-100-100-100-c-60-iso8859-1",
+            "-misc-fixed-medium-r-semicondensed--0-0-75-75-c-0-iso8859-1",
+        ],
+        bytes: include_bytes!("../../fonts/6x13-ISO8859-1.pcf"),
+    },
+];
+
+/// The XLFD of libXfont2's built-in `fixed`.
+pub(crate) const XORG_BUILTIN_FIXED: &str =
+    "-misc-fixed-medium-r-semicondensed--13-120-75-75-c-60-iso8859-1";
+
+/// What `ListFonts` finds in Xorg's `built-ins` element, in its order
+/// (measured on Xorg 21.1 with the path set to `built-ins` alone; the
+/// 100-dpi and 0-0 names are its bitmap scaler's).
+pub(crate) const XORG_BUILTIN_NAMES: &[&str] = &[
+    "-misc-fixed-medium-r-semicondensed--13-100-100-100-c-60-iso8859-1",
+    XORG_BUILTIN_FIXED,
+    "6x13",
+    "cursor",
+    "fixed",
+    "-misc-fixed-medium-r-semicondensed--0-0-75-75-c-0-iso8859-1",
 ];
 
 /// The embedded font `name` refers to, if any (case-insensitive, as
 /// X font names are).
 pub(crate) fn embedded_font(name: &str) -> Option<&'static EmbeddedFont> {
-    EMBEDDED_FONTS
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(name))
+    EMBEDDED_FONTS.iter().find(|f| {
+        f.name.eq_ignore_ascii_case(name) || f.aliases.iter().any(|a| a.eq_ignore_ascii_case(name))
+    })
 }
 
 pub(crate) struct FontLoader {
     pub(crate) library: freetype::Library,
+    #[cfg(not(windows))]
     pub(crate) fc: fontconfig::Fontconfig,
-    pub(crate) catalog: Vec<String>,
+    #[cfg(windows)]
+    pub(crate) fc: super::font_scan::FontScan,
+    pub(crate) catalog: FontTable<()>,
+    /// `XORG_BUILTIN_NAMES`, lowered for matching.
+    builtin_keys: Vec<LoweredName>,
     /// Current font path, element order significant. Elements are
     /// directories (with fonts.dir) or the literal "built-ins".
     pub(crate) font_path: Vec<String>,
     /// Parsed dirs parallel to `font_path` (`None` = "built-ins").
     pub(crate) path_dirs: Vec<Option<FontDir>>,
+    /// What each name resolved to on the current path, by lowered name.
+    /// Cleared with the path.
+    resolutions: RefCell<HashMap<Box<[u8]>, Option<FontResolution>>>,
+    /// Metrics and per-char info of each font opened, so a font asked for
+    /// again (OpenFont, ListFontsWithInfo) skips FreeType's walk over every
+    /// glyph. Cleared with the path, so `xset fp rehash` rereads files.
+    infos: RefCell<HashMap<FontInfoKey, std::rc::Rc<FontInfo>>>,
+}
+
+/// What a name a path element lists stands for.
+enum ElementName {
+    Font(FontResolution),
+    /// An alias, with its (lowered) target.
+    Alias(String),
+}
+
+/// One reply of ListFontsWithInfo.
+#[derive(Debug, Clone)]
+pub(crate) struct ListedFont {
+    /// The name the reply carries.
+    pub(crate) reply_name: String,
+    /// The name `res` was resolved from.
+    pub(crate) open_name: String,
+    pub(crate) res: FontResolution,
+}
+
+/// More entries than this in a [`FontLoader`] cache and it starts over:
+/// clients choose the names, so the caches must not grow without bound.
+const FONT_CACHE_CAP: usize = 4096;
+
+/// The font a [`FontInfo`] was computed from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FontInfoKey {
+    /// A fonts.dir file; the entry name sizes a scalable one.
+    File(std::path::PathBuf, String),
+    Embedded(&'static str),
+    /// A fontconfig face, by the lowered name it was asked by.
+    BuiltIn(Box<[u8]>),
+}
+
+/// A font's metrics, its properties among them, and per-char info.
+#[derive(Debug)]
+pub(crate) struct FontInfo {
+    pub(crate) metrics: FontMetrics,
+    pub(crate) chars: HashMap<char, ProtocolCharInfo>,
+}
+
+impl FontInfo {
+    /// The metrics without the per-char table, which ListFontsWithInfo
+    /// does not carry and a two-byte font makes large.
+    pub(crate) fn metrics_without_chars(&self) -> FontMetrics {
+        let m = &self.metrics;
+        FontMetrics {
+            min_bounds: m.min_bounds,
+            max_bounds: m.max_bounds,
+            min_char_or_byte2: m.min_char_or_byte2,
+            max_char_or_byte2: m.max_char_or_byte2,
+            default_char: m.default_char,
+            draw_direction: m.draw_direction,
+            min_byte1: m.min_byte1,
+            max_byte1: m.max_byte1,
+            all_chars_exist: m.all_chars_exist,
+            font_ascent: m.font_ascent,
+            font_descent: m.font_descent,
+            properties: m.properties.clone(),
+            named_properties: m.named_properties.clone(),
+            char_infos: Vec::new(),
+        }
+    }
 }
 
 /// Built-in alias names that always resolve via fontconfig — the
@@ -527,17 +725,27 @@ pub(crate) const BUILTIN_ALIASES: &[&str] = &["fixed", "cursor", "nil2"];
 
 impl FontLoader {
     pub(crate) fn new() -> io::Result<Self> {
+        #[cfg(not(windows))]
         let fc = fontconfig::Fontconfig::new()
             .ok_or_else(|| io::Error::other("fontconfig init failed"))?;
+        #[cfg(windows)]
+        let fc = super::font_scan::FontScan::new()
+            .ok_or_else(|| io::Error::other("font scan init failed"))?;
         let catalog = build_font_catalog(&fc);
         log::info!("font catalog: {} XLFDs from fontconfig", catalog.len());
         let mut loader = Self {
             library: freetype::Library::init()
                 .map_err(|e| io::Error::other(format!("freetype init failed: {e:?}")))?,
             fc,
-            catalog,
+            catalog: FontTable::new(catalog.into_iter().map(|n| (n, ()))),
+            builtin_keys: XORG_BUILTIN_NAMES
+                .iter()
+                .map(|n| LoweredName::new(n))
+                .collect(),
             font_path: Vec::new(),
             path_dirs: Vec::new(),
+            resolutions: RefCell::new(HashMap::new()),
+            infos: RefCell::new(HashMap::new()),
         };
         let default = Self::default_font_path();
         // Default path elements are pre-vetted (fonts.dir checked) —
@@ -566,6 +774,13 @@ impl FontLoader {
             "/usr/share/fonts/X11/100dpi",
             "/usr/share/fonts/75dpi",
             "/usr/share/fonts/X11/75dpi",
+            // XQuartz and Homebrew on macOS.
+            "/opt/X11/share/fonts/misc",
+            "/opt/X11/share/fonts/TTF",
+            "/opt/X11/share/fonts/Type1",
+            "/opt/X11/share/fonts/100dpi",
+            "/opt/X11/share/fonts/75dpi",
+            "/opt/homebrew/share/fonts",
         ];
         let mut path: Vec<String> = CANDIDATES
             .iter()
@@ -577,7 +792,7 @@ impl FontLoader {
     }
 
     /// Validate and install a new font path. Every element must be
-    /// "built-ins" or a directory with a readable fonts.dir; on any
+    /// "built-ins" or a directory with a readable fonts.dir or fonts.alias; on any
     /// invalid element the old path is kept and Err carries the bad
     /// element (handler → BadValue). Empty list resets to default
     /// (Xorg SetFontPath semantics).
@@ -603,6 +818,8 @@ impl FontLoader {
         }
         self.font_path = effective;
         self.path_dirs = dirs;
+        self.resolutions.borrow_mut().clear();
+        self.infos.borrow_mut().clear();
         Ok(())
     }
 
@@ -612,55 +829,126 @@ impl FontLoader {
     /// wildcard match against fonts.dir names; "built-ins" matches
     /// the alias set or the fontconfig catalog. None = BadName.
     pub(crate) fn resolve(&self, name: &str) -> Option<FontResolution> {
-        self.resolve_inner(name, 20)
+        let key = LoweredName::new(name).bytes;
+        if let Some(hit) = self.resolutions.borrow().get(&key) {
+            return hit.clone();
+        }
+        let found = self.resolve_inner(name, 20);
+        let mut cache = self.resolutions.borrow_mut();
+        if cache.len() >= FONT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, found.clone());
+        found
     }
 
     fn resolve_inner(&self, name: &str, hops: u8) -> Option<FontResolution> {
         if hops == 0 {
             return None;
         }
-        for (el, dir) in self.font_path.iter().zip(&self.path_dirs) {
+        let pattern = FontPattern::new(name);
+        for dir in &self.path_dirs {
             let Some(dir) = dir else {
                 // "built-ins": embedded fonts first — a fontconfig
                 // substitute for `cursor`/`nil2` is always wrong (#79).
-                if let Some(f) = embedded_font(name) {
+                if let Some(f) = embedded_font(name).or_else(|| {
+                    XORG_BUILTIN_NAMES
+                        .iter()
+                        .zip(&self.builtin_keys)
+                        .find(|(_, k)| pattern.matches(k))
+                        .and_then(|(n, _)| embedded_font(n))
+                }) {
                     return Some(FontResolution::Embedded(f));
                 }
                 // then the alias set, then catalog XLFD match.
                 if BUILTIN_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(name))
-                    || self
-                        .catalog
-                        .iter()
-                        .any(|entry| font_pattern_matches(name, entry))
+                    || self.catalog.matching(&pattern).next().is_some()
                     || self.builtin_xlfd_is_current_alias_reply(name)
                 {
                     return Some(FontResolution::BuiltIn);
                 }
-                let _ = el;
                 continue;
             };
-            if let Some((entry_name, path)) = dir
-                .entries
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(n, p)| (n.clone(), p.clone()))
-            {
-                return Some(FontResolution::File { path, entry_name });
+            // libXfont looks a name up in one table of a directory's
+            // fonts and aliases (`FontFileFindNameInDir`), so CDE's
+            // `-dt-interface …-m*-…` opens through
+            // `/usr/dt/etc/cde/fontaliases`, a directory of aliases alone.
+            // The first match decides: an alias starts over with its
+            // target from the first element, and if that is not on this
+            // system the name is BadName (`doOpenFont`), even where a
+            // later alias would have led somewhere.
+            if let Some(e) = dir.matching(&pattern).next() {
+                return match &e.value {
+                    DirEntry::File(path) => Some(FontResolution::File {
+                        path: path.clone(),
+                        entry_name: e.name.to_string(),
+                    }),
+                    DirEntry::Alias(target) => self.resolve_inner(target, hops - 1),
+                };
             }
-            if let Some((_, target)) = dir
-                .aliases
+        }
+        None
+    }
+
+    /// The first `max` names element `dir` lists for `pattern`, each with
+    /// the font it is or the alias target it stands for
+    /// (`_FontFileListFonts` with aliases marked).
+    fn element_names(
+        &self,
+        dir: Option<&FontDir>,
+        pattern: &FontPattern,
+        max: usize,
+    ) -> Vec<(String, ElementName)> {
+        let Some(dir) = dir else {
+            return XORG_BUILTIN_NAMES
                 .iter()
-                .find(|(a, _)| a.eq_ignore_ascii_case(name))
-            {
-                return self.resolve_inner(target, hops - 1);
-            }
-            if let Some((entry_name, path)) = dir
-                .entries
-                .iter()
-                .find(|(n, _)| font_pattern_matches(name, n))
-                .map(|(n, p)| (n.clone(), p.clone()))
-            {
-                return Some(FontResolution::File { path, entry_name });
+                .zip(&self.builtin_keys)
+                .filter(|(_, k)| pattern.matches(k))
+                .map(|(n, _)| {
+                    let res =
+                        embedded_font(n).map_or(FontResolution::BuiltIn, FontResolution::Embedded);
+                    ((*n).to_string(), ElementName::Font(res))
+                })
+                .chain(self.catalog.matching(pattern).map(|e| {
+                    (
+                        e.name.to_string(),
+                        ElementName::Font(FontResolution::BuiltIn),
+                    )
+                }))
+                .take(max)
+                .collect();
+        };
+        dir.matching(pattern)
+            .take(max)
+            .map(|e| {
+                let kind = match &e.value {
+                    DirEntry::File(path) => ElementName::Font(FontResolution::File {
+                        path: path.clone(),
+                        entry_name: e.name.to_string(),
+                    }),
+                    DirEntry::Alias(target) => ElementName::Alias(target.clone()),
+                };
+                (e.name.to_string(), kind)
+            })
+            .collect()
+    }
+
+    /// The font an alias target names, as Xorg resolves an alias met while
+    /// listing (`doListFontsAndAliases`, `doListFontsWithInfo`): the first
+    /// element that lists anything for `target` decides, a further alias
+    /// starts over, at most 20 aliases deep. The name is the one the
+    /// font was found by.
+    fn resolve_alias_target(&self, target: &str, aliases: u8) -> Option<(String, FontResolution)> {
+        let pattern = FontPattern::new(target);
+        for dir in &self.path_dirs {
+            if let Some((name, kind)) = self.element_names(dir.as_ref(), &pattern, 1).pop() {
+                return match kind {
+                    ElementName::Font(res) => Some((name, res)),
+                    ElementName::Alias(next) if aliases > 1 => {
+                        self.resolve_alias_target(&next, aliases - 1)
+                    }
+                    ElementName::Alias(_) => None,
+                };
             }
         }
         None
@@ -746,26 +1034,75 @@ impl FontLoader {
         };
         // Neither `open_font_builtin` nor `open_font_embedded` consults
         // the font path, so this cannot recurse back into `resolve_inner`.
-        let Ok((_, metrics, _)) = self.open_builtin_or_embedded(alias) else {
+        let res = match embedded_font(alias) {
+            Some(f) => FontResolution::Embedded(f),
+            None => FontResolution::BuiltIn,
+        };
+        let Ok(info) = self.font_info(&res, alias) else {
             return false;
         };
-        Self::alias_to_xlfd(alias, &metrics).eq_ignore_ascii_case(name)
+        Self::alias_to_xlfd(alias, &info.metrics).eq_ignore_ascii_case(name)
     }
 
-    /// All fonts.dir/alias names on the current path matching
-    /// `pattern`, in path order — feed for ListFonts ahead of the
-    /// built-ins catalog. Aliases are reported by their alias name.
-    pub(crate) fn path_font_names(&self, pattern: &str) -> Vec<String> {
+    /// The first `max` names on the current path matching `pattern`, as
+    /// Xorg's ListFonts finds them (`doListFontsAndAliases`): element by
+    /// element, each asked only for what is left of `max`, in libXfont's
+    /// order ([`FontDir::matching`]); for `built-ins`, Xorg's own built-in
+    /// names, then the fontconfig catalog this server adds there. An
+    /// alias is listed by its own name, and only when its target resolves
+    /// to a font. Nothing from `built-ins` when the path does not hold it,
+    /// as on Xorg.
+    pub(crate) fn list_font_names(&self, pattern: &str, max: usize) -> Vec<String> {
+        let pattern = FontPattern::new(pattern);
         let mut out = Vec::new();
-        for dir in self.path_dirs.iter().flatten() {
-            for (name, _) in &dir.entries {
-                if font_pattern_matches(pattern, name) {
-                    out.push(name.clone());
+        for dir in &self.path_dirs {
+            let left = max.saturating_sub(out.len());
+            if left == 0 {
+                break;
+            }
+            for (name, kind) in self.element_names(dir.as_ref(), &pattern, left) {
+                match kind {
+                    ElementName::Font(_) => out.push(name),
+                    ElementName::Alias(target) => {
+                        if self.resolve_alias_target(&target, 20).is_some() {
+                            out.push(name);
+                        }
+                    }
                 }
             }
-            for (alias, _) in &dir.aliases {
-                if font_pattern_matches(pattern, alias) {
-                    out.push(alias.clone());
+        }
+        out
+    }
+
+    /// What ListFontsWithInfo reports for `pattern`, as Xorg's
+    /// `doListFontsWithInfo`: up to `max` fonts, element by element, each
+    /// element listing what is left of `max`. An alias is reported by its
+    /// target name — the font it resolves to, under the name the alias
+    /// gives — and left out when that resolves to nothing.
+    pub(crate) fn list_fonts_with_info(&self, pattern: &str, max: usize) -> Vec<ListedFont> {
+        let pattern = FontPattern::new(pattern);
+        let mut out = Vec::new();
+        for dir in &self.path_dirs {
+            let left = max.saturating_sub(out.len());
+            if left == 0 {
+                break;
+            }
+            for (name, kind) in self.element_names(dir.as_ref(), &pattern, left) {
+                match kind {
+                    ElementName::Font(res) => out.push(ListedFont {
+                        open_name: name.clone(),
+                        reply_name: name,
+                        res,
+                    }),
+                    ElementName::Alias(target) => {
+                        if let Some((open_name, res)) = self.resolve_alias_target(&target, 20) {
+                            out.push(ListedFont {
+                                reply_name: target,
+                                open_name,
+                                res,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -845,16 +1182,75 @@ impl FontLoader {
         &self,
         name: &str,
     ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
-        match self.resolve(name) {
-            Some(FontResolution::File { path, entry_name }) => {
-                self.open_font_file(&path, &entry_name)
-            }
-            Some(FontResolution::Embedded(f)) => self.open_font_embedded(f),
-            Some(FontResolution::BuiltIn) => self.open_font_builtin(name),
-            None => Err(io::Error::new(
+        let Some(res) = self.resolve(name) else {
+            return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no font on path matches {name:?}"),
-            )),
+            ));
+        };
+        let face = self.open_face(&res, name)?;
+        let info = match self.cached_info(&res, name) {
+            Some(info) => info,
+            None => self.compute_info(&res, name, &face),
+        };
+        Ok((face, info.metrics.clone(), info.chars.clone()))
+    }
+
+    /// The metrics of the font `res` names, `name` being the name it was
+    /// resolved from: cached, else read from a freshly opened face.
+    pub(crate) fn font_info(
+        &self,
+        res: &FontResolution,
+        name: &str,
+    ) -> io::Result<std::rc::Rc<FontInfo>> {
+        if let Some(info) = self.cached_info(res, name) {
+            return Ok(info);
+        }
+        let face = self.open_face(res, name)?;
+        Ok(self.compute_info(res, name, &face))
+    }
+
+    fn info_key(res: &FontResolution, name: &str) -> FontInfoKey {
+        match res {
+            FontResolution::File { path, entry_name } => {
+                FontInfoKey::File(path.clone(), entry_name.clone())
+            }
+            FontResolution::Embedded(f) => FontInfoKey::Embedded(f.name),
+            FontResolution::BuiltIn => FontInfoKey::BuiltIn(LoweredName::new(name).bytes),
+        }
+    }
+
+    fn cached_info(&self, res: &FontResolution, name: &str) -> Option<std::rc::Rc<FontInfo>> {
+        self.infos.borrow().get(&Self::info_key(res, name)).cloned()
+    }
+
+    fn compute_info(
+        &self,
+        res: &FontResolution,
+        name: &str,
+        face: &freetype::Face,
+    ) -> std::rc::Rc<FontInfo> {
+        let (metrics, chars) = match res {
+            FontResolution::File { path, .. } => file_font_metrics(face, pcf_file_info(path)),
+            FontResolution::Embedded(f) => file_font_metrics(face, pcf_info_from_bytes(f.bytes)),
+            FontResolution::BuiltIn => compute_font_metrics(face, false),
+        };
+        let info = std::rc::Rc::new(FontInfo { metrics, chars });
+        let mut cache = self.infos.borrow_mut();
+        if cache.len() >= FONT_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(Self::info_key(res, name), info.clone());
+        info
+    }
+
+    /// A FreeType face for the font `res` names, sized and with its
+    /// charmap selected.
+    fn open_face(&self, res: &FontResolution, name: &str) -> io::Result<freetype::Face> {
+        match res {
+            FontResolution::File { path, entry_name } => self.open_face_file(path, entry_name),
+            FontResolution::Embedded(f) => self.open_face_embedded(f),
+            FontResolution::BuiltIn => self.open_face_builtin(name),
         }
     }
 
@@ -862,11 +1258,11 @@ impl FontLoader {
     /// FreeType auto-detects). Bitmap faces select their (single)
     /// strike; scalable files honour the matched entry name's XLFD
     /// pixel size.
-    fn open_font_file(
+    fn open_face_file(
         &self,
         path: &std::path::Path,
         entry_name: &str,
-    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+    ) -> io::Result<freetype::Face> {
         let face = self
             .library
             .new_face(path, 0)
@@ -896,48 +1292,16 @@ impl FontLoader {
             // X11 font dirs.
             let _ = face.select_size(0);
         }
-        let pcf = pcf_file_info(path);
-        // Ink metrics iff the PCF carries the table; BDF files always
-        // (Xorg's bdf reader computes ink unconditionally); scalable
-        // faces use cell metrics (old behavior).
-        let use_ink = match &pcf {
-            Some(info) => info.has_ink_metrics,
-            None => !face.is_scalable(),
-        };
-        let (mut metrics, char_cache) = compute_font_metrics(&face, use_ink);
-        // PCF authoritative overrides — Xorg's QueryFont serves
-        // these from the file's tables, not from re-derivation:
-        // default_char (encodings header), min/max_bounds + font
-        // ascent/descent (accelerators, ink variants when present).
-        if let Some(pcf) = pcf {
-            if let Some(default_char) = pcf.default_char {
-                metrics.default_char = default_char;
-            }
-            // min/max_bounds intentionally NOT taken from the accel
-            // table: R6+ servers fold them from per-char metrics,
-            // excluding all-zero entries (xtfont3/4's #if
-            // XT_X_RELEASE==6 expectations) — compute_font_metrics
-            // does exactly that.
-            if let Some(a) = pcf.font_ascent {
-                metrics.font_ascent = a;
-            }
-            if let Some(d) = pcf.font_descent {
-                metrics.font_descent = d;
-            }
-        }
-        Ok((face, metrics, char_cache))
+        Ok(face)
     }
 
     /// Open a font compiled into the binary. Same handling as a
-    /// fonts.dir-resolved PCF ([`Self::open_font_file`]) — explicit
+    /// fonts.dir-resolved PCF ([`Self::open_face_file`]) — explicit
     /// charmap selection, single bitmap strike, PCF-authoritative
     /// metric overrides — just sourced from `include_bytes!` instead
     /// of the filesystem, so it works on hosts with no X core font
     /// packages installed at all.
-    fn open_font_embedded(
-        &self,
-        font: &'static EmbeddedFont,
-    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+    fn open_face_embedded(&self, font: &'static EmbeddedFont) -> io::Result<freetype::Face> {
         let face = self
             .library
             .new_memory_face(font.bytes.to_vec(), 0)
@@ -949,31 +1313,14 @@ impl FontLoader {
             })?;
         // PCF exposes exactly one charmap and FreeType leaves none
         // active when the file carries no recognized registry — same
-        // reason as open_font_file.
+        // reason as open_face_file.
         if face.raw().charmap.is_null() && face.num_charmaps() > 0 {
             let cm = face.get_charmap(0);
             let _ = face.set_charmap(&cm);
         }
         // Bitmap strike: one size per X11 core font file.
         let _ = face.select_size(0);
-        let pcf = pcf_info_from_bytes(font.bytes);
-        let use_ink = match &pcf {
-            Some(info) => info.has_ink_metrics,
-            None => !face.is_scalable(),
-        };
-        let (mut metrics, char_cache) = compute_font_metrics(&face, use_ink);
-        if let Some(pcf) = pcf {
-            if let Some(default_char) = pcf.default_char {
-                metrics.default_char = default_char;
-            }
-            if let Some(a) = pcf.font_ascent {
-                metrics.font_ascent = a;
-            }
-            if let Some(d) = pcf.font_descent {
-                metrics.font_descent = d;
-            }
-        }
-        Ok((face, metrics, char_cache))
+        Ok(face)
     }
 
     /// Open a built-ins-element font with the same precedence
@@ -984,20 +1331,21 @@ impl FontLoader {
     /// carried; that reply is built from `open_font`'s metrics, so an
     /// embedded font here and a fontconfig font there would make the
     /// server reject its own reply name (the #107 failure mode).
+    #[cfg(test)]
     fn open_builtin_or_embedded(
         &self,
         alias: &str,
     ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
-        match embedded_font(alias) {
-            Some(f) => self.open_font_embedded(f),
-            None => self.open_font_builtin(alias),
-        }
+        let res = match embedded_font(alias) {
+            Some(f) => FontResolution::Embedded(f),
+            None => FontResolution::BuiltIn,
+        };
+        let face = self.open_face(&res, alias)?;
+        let info = self.font_info(&res, alias)?;
+        Ok((face, info.metrics.clone(), info.chars.clone()))
     }
 
-    fn open_font_builtin(
-        &self,
-        name: &str,
-    ) -> io::Result<(freetype::Face, FontMetrics, HashMap<char, ProtocolCharInfo>)> {
+    fn open_face_builtin(&self, name: &str) -> io::Result<freetype::Face> {
         // Resolve the X11 font name to a file path via fontconfig. We can't
         // rely on the high-level `Fontconfig::find`: when the requested family
         // doesn't exist, fontconfig falls back to the *system default* (often
@@ -1011,7 +1359,30 @@ impl FontLoader {
             (Some(name.to_string()), None, None)
         };
         let query_family = family.as_deref().unwrap_or("monospace");
+        let (path, face_index) = self.match_builtin_file(name, query_family, style.as_deref())?;
+        let face = self
+            .library
+            .new_face(&path, face_index)
+            .map_err(|e| io::Error::other(format!("freetype new_face({path}) failed: {e:?}")))?;
 
+        // Honour XLFD PIXEL_SIZE if specified; otherwise default to 12pt @ 96dpi.
+        if let Some(px) = xlfd_px {
+            let _ = face.set_pixel_sizes(0, px);
+        } else {
+            let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
+        }
+        Ok(face)
+    }
+
+    /// The file and face index fontconfig matches for `query_family`
+    /// (chained with `monospace`) in `style`.
+    #[cfg(not(windows))]
+    fn match_builtin_file(
+        &self,
+        name: &str,
+        query_family: &str,
+        style: Option<&str>,
+    ) -> io::Result<(String, isize)> {
         let cfamily = std::ffi::CString::new(query_family)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font name has nul"))?;
 
@@ -1028,7 +1399,7 @@ impl FontLoader {
                 .map_err(fc_err)?;
         }
         let cstyle_storage;
-        if let Some(style) = style.as_deref() {
+        if let Some(style) = style {
             cstyle_storage = std::ffi::CString::new(style)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "font style has nul"))?;
             pat.add_string(fontconfig::FC_STYLE, &cstyle_storage)
@@ -1039,20 +1410,63 @@ impl FontLoader {
             io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
         })?;
         let face_index: isize = matched.face_index().unwrap_or(0) as isize;
-        let face = self
-            .library
-            .new_face(path, face_index)
-            .map_err(|e| io::Error::other(format!("freetype new_face({path}) failed: {e:?}")))?;
-
-        // Honour XLFD PIXEL_SIZE if specified; otherwise default to 12pt @ 96dpi.
-        if let Some(px) = xlfd_px {
-            let _ = face.set_pixel_sizes(0, px);
-        } else {
-            let _ = face.set_char_size(12 << 6, 12 << 6, 96, 96);
-        }
-        let (metrics, char_cache) = compute_font_metrics(&face, false);
-        Ok((face, metrics, char_cache))
+        Ok((path.to_string(), face_index))
     }
+
+    #[cfg(windows)]
+    fn match_builtin_file(
+        &self,
+        name: &str,
+        query_family: &str,
+        style: Option<&str>,
+    ) -> io::Result<(String, isize)> {
+        let face = self.fc.find(query_family, style).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("font not found: {name}"))
+        })?;
+        Ok((face.path.to_string_lossy().into_owned(), face.index))
+    }
+}
+
+/// Metrics of a fonts.dir or embedded bitmap face, `pcf` its PCF tables
+/// when it is one.
+fn file_font_metrics(
+    face: &freetype::Face,
+    pcf: Option<PcfFileInfo>,
+) -> (FontMetrics, HashMap<char, ProtocolCharInfo>) {
+    // Ink metrics iff the PCF carries the table; BDF files always
+    // (Xorg's bdf reader computes ink unconditionally); scalable
+    // faces use cell metrics (old behavior).
+    let use_ink = match &pcf {
+        Some(info) => info.has_ink_metrics,
+        None => !face.is_scalable(),
+    };
+    let (mut metrics, char_cache) = compute_font_metrics(face, use_ink);
+    // PCF authoritative overrides — Xorg's QueryFont serves
+    // these from the file's tables, not from re-derivation:
+    // default_char (encodings header), min/max_bounds + font
+    // ascent/descent (accelerators, ink variants when present).
+    if let Some(pcf) = pcf {
+        if let Some(default_char) = pcf.default_char {
+            metrics.default_char = default_char;
+        }
+        // min/max_bounds intentionally NOT taken from the accel
+        // table: R6+ servers fold them from per-char metrics,
+        // excluding all-zero entries (xtfont3/4's #if
+        // XT_X_RELEASE==6 expectations) — compute_font_metrics
+        // does exactly that.
+        if let Some(a) = pcf.font_ascent {
+            metrics.font_ascent = a;
+        }
+        if let Some(d) = pcf.font_descent {
+            metrics.font_descent = d;
+        }
+        // libXfont serves the PROPERTIES table whole; FreeType exposes
+        // only the names asked for.
+        if let Some(props) = pcf.properties {
+            metrics.named_properties = props;
+        }
+    }
+    (metrics, char_cache)
 }
 
 /// Per-char QueryFont metrics. Mirrors Xorg's table choice:
@@ -1146,6 +1560,7 @@ fn compute_char_info(face: &freetype::Face, ch: char, use_ink: bool) -> Protocol
 }
 
 /// PCF file facts FreeType doesn't expose.
+#[derive(Debug, PartialEq)]
 struct PcfFileInfo {
     /// BDF_ENCODINGS header default_char — bdftopcf moves
     /// DEFAULT_CHAR out of the property table.
@@ -1160,17 +1575,40 @@ struct PcfFileInfo {
     max_bounds: Option<ProtocolCharInfo>,
     font_ascent: Option<i16>,
     font_descent: Option<i16>,
+    /// The PROPERTIES table, in file order — what libXfont's
+    /// pcfGetProperties hands QueryFont and ListFontsWithInfo.
+    properties: Option<Vec<(String, FontPropValue)>>,
 }
 
 /// Parse the PCF table directory for [`PcfFileInfo`]. Returns None
-/// for non-PCF/compressed/odd files.
+/// for non-PCF/odd files.
 fn pcf_file_info(path: &std::path::Path) -> Option<PcfFileInfo> {
     pcf_info_from_bytes(&std::fs::read(path).ok()?)
 }
 
-/// [`pcf_file_info`] over an in-memory PCF image — shared with the
-/// embedded built-in fonts, which have no path to read.
+/// A PCF image as libXfont reads it: gzip-compressed files (detected
+/// by magic, like its BufFilePushZIP) are inflated first.
+fn pcf_image(data: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
+    use std::io::Read;
+    // Bitmap fonts inflate to a few MiB at most; cap a bogus stream.
+    const MAX_PCF: u64 = 64 << 20;
+    if !data.starts_with(&[0x1f, 0x8b]) {
+        return Some(std::borrow::Cow::Borrowed(data));
+    }
+    let mut out = Vec::new();
+    flate2::read::MultiGzDecoder::new(data)
+        .take(MAX_PCF)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(std::borrow::Cow::Owned(out))
+}
+
+/// [`pcf_file_info`] over an in-memory PCF image, plain or gzipped —
+/// shared with the embedded built-in fonts, which have no path to read.
 fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
+    let image = pcf_image(data)?;
+    let data: &[u8] = &image;
+    const PCF_PROPERTIES: u32 = 1 << 0;
     const PCF_ACCELERATORS: u32 = 1 << 1;
     const PCF_INK_METRICS: u32 = 1 << 4;
     const PCF_BDF_ENCODINGS: u32 = 1 << 5;
@@ -1187,6 +1625,7 @@ fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
         max_bounds: None,
         font_ascent: None,
         font_descent: None,
+        properties: None,
     };
     let read_i16 = |off: usize, big: bool| -> Option<i16> {
         let raw: [u8; 2] = data.get(off..off + 2)?.try_into().ok()?;
@@ -1223,6 +1662,7 @@ fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
         let ttype = u32::from_le_bytes(data.get(base..base + 4)?.try_into().ok()?);
         let off = u32::from_le_bytes(data.get(base + 12..base + 16)?.try_into().ok()?) as usize;
         match ttype {
+            PCF_PROPERTIES => info.properties = pcf_properties(data, off),
             PCF_INK_METRICS => info.has_ink_metrics = true,
             PCF_ACCELERATORS => accel_off = Some(off),
             PCF_BDF_ACCELERATORS => bdf_accel_off = Some(off),
@@ -1257,6 +1697,50 @@ fn pcf_info_from_bytes(data: &[u8]) -> Option<PcfFileInfo> {
         info.max_bounds = read_metrics(max_off, big);
     }
     Some(info)
+}
+
+/// The PCF PROPERTIES table at `off`, as libXfont's pcfGetProperties
+/// reads it: format word, count, (name offset, is-string, value)
+/// records padded to 4, then the string pool. None if malformed.
+fn pcf_properties(data: &[u8], off: usize) -> Option<Vec<(String, FontPropValue)>> {
+    let fmt = u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?);
+    if fmt & 0xFFFF_FF00 != 0 {
+        return None; // not PCF_DEFAULT_FORMAT
+    }
+    let big = fmt & (1 << 2) != 0;
+    let read_i32 = |at: usize| -> Option<i32> {
+        let raw: [u8; 4] = data.get(at..at + 4)?.try_into().ok()?;
+        Some(if big {
+            i32::from_be_bytes(raw)
+        } else {
+            i32::from_le_bytes(raw)
+        })
+    };
+    let nprops = usize::try_from(read_i32(off + 4)?)
+        .ok()
+        .filter(|&n| n > 0)?;
+    let records = off + 8;
+    let pool_len_at = records + (nprops * 9).next_multiple_of(4);
+    let pool_len = usize::try_from(read_i32(pool_len_at)?).ok()?;
+    let pool = data.get(pool_len_at + 4..pool_len_at + 4 + pool_len)?;
+    let string_at = |at: i32| -> Option<String> {
+        let tail = pool.get(usize::try_from(at).ok()?..)?;
+        let end = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+        Some(String::from_utf8_lossy(&tail[..end]).into_owned())
+    };
+    let mut props = Vec::with_capacity(nprops);
+    for i in 0..nprops {
+        let rec = records + 9 * i;
+        let name = string_at(read_i32(rec)?)?;
+        let value = read_i32(rec + 5)?;
+        let value = match data.get(rec + 4)? {
+            0 => FontPropValue::Int(value),
+            1 => FontPropValue::Str(string_at(value)?),
+            _ => return None,
+        };
+        props.push((name, value));
+    }
+    Some(props)
 }
 
 /// FFI for FreeType's BDF/PCF property accessor — freetype-sys
@@ -1362,10 +1846,12 @@ fn read_bdf_properties(face: &freetype::Face) -> Vec<(String, FontPropValue)> {
                 };
                 FontPropValue::Str(s)
             }
-            // SAFETY: tag-checked union reads.
+            // SAFETY: tag-checked union reads. `c_long` is `i32` on Windows.
+            #[cfg_attr(windows, allow(clippy::unnecessary_cast))]
             ft_bdf::BDF_PROPERTY_TYPE_INTEGER => {
                 FontPropValue::Int(unsafe { prop.u.integer } as i32)
             }
+            #[cfg_attr(windows, allow(clippy::unnecessary_cast))]
             ft_bdf::BDF_PROPERTY_TYPE_CARDINAL => {
                 FontPropValue::Card(unsafe { prop.u.cardinal } as u32)
             }
@@ -1603,21 +2089,19 @@ pub(crate) fn sanitize_xlfd_field(s: &str) -> String {
 /// gb2312*, ksc*) need real fonts on disk to satisfy properly; rather
 /// than stub them, we let libXt warn "Missing charset X" and proceed
 /// with the iso* coverage that's guaranteed real.
+#[cfg(not(windows))]
 pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
-    const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
-    const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
-
-    // Aliases the loader handles directly without an XLFD parse pass.
-    let mut entries: Vec<String> = vec!["fixed".into(), "cursor".into(), "nil2".into()];
+    // `fixed`, `cursor` and the rest of Xorg's own built-ins are listed
+    // from `XORG_BUILTIN_NAMES`, ahead of these.
 
     // fontconfig 0.11 wraps construction/queries in `Result`; this fn
     // is infallible, so on any setup failure fall back to just the
     // alias entries rather than panicking at boot.
     let Ok(pat) = fontconfig::Pattern::new(fc) else {
-        return entries;
+        return Vec::new();
     };
     let Ok(mut objs) = fontconfig::ObjectSet::new(fc) else {
-        return entries;
+        return Vec::new();
     };
     for obj in [
         fontconfig::FC_FAMILY,
@@ -1629,11 +2113,10 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
         let _ = objs.add(obj);
     }
     let Ok(set) = fontconfig::list_fonts(&pat, Some(&objs)) else {
-        return entries;
+        return Vec::new();
     };
 
-    let mut seen: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
-
+    let mut catalog = CatalogBuilder::default();
     for font in set.iter() {
         let Ok(family) = font.get_string(fontconfig::FC_FAMILY) else {
             continue;
@@ -1642,6 +2125,33 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
         let weight = font.get_int(fontconfig::FC_WEIGHT).unwrap_or(80);
         let slant = font.get_int(fontconfig::FC_SLANT).unwrap_or(0);
         let spacing = font.get_int(fontconfig::FC_SPACING).unwrap_or(0);
+        catalog.add(family, foundry, weight, slant, spacing);
+    }
+    catalog.entries
+}
+
+/// [`build_font_catalog`] over the faces a directory scan found.
+#[cfg(windows)]
+pub(crate) fn build_font_catalog(fc: &super::font_scan::FontScan) -> Vec<String> {
+    let mut catalog = CatalogBuilder::default();
+    for f in fc.faces() {
+        catalog.add(&f.family, "misc", f.weight, f.slant, f.spacing);
+    }
+    catalog.entries
+}
+
+/// Catalog XLFDs, one set per distinct face.
+#[derive(Default)]
+struct CatalogBuilder {
+    entries: Vec<String>,
+    seen: HashSet<(String, String, i32, i32, i32)>,
+}
+
+impl CatalogBuilder {
+    /// Add a face, its properties in fontconfig's values.
+    fn add(&mut self, family: &str, foundry: &str, weight: i32, slant: i32, spacing: i32) {
+        const PIXEL_SIZES: &[u32] = &[8, 10, 12, 14, 16, 18, 24];
+        const CHARSETS: &[&str] = &["iso8859-1", "iso10646-1"];
 
         let key = (
             family.to_lowercase(),
@@ -1650,8 +2160,8 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
             slant,
             spacing,
         );
-        if !seen.insert(key) {
-            continue;
+        if !self.seen.insert(key) {
+            return;
         }
 
         let foundry_x = sanitize_xlfd_field(foundry);
@@ -1666,15 +2176,13 @@ pub(crate) fn build_font_catalog(fc: &fontconfig::Fontconfig) -> Vec<String> {
             // by this field, and QueryFont returns the real widths.
             let avg_width = (px * 6).clamp(1, 999);
             for &charset in CHARSETS {
-                entries.push(format!(
+                self.entries.push(format!(
                     "-{foundry_x}-{family_x}-{weight_x}-{slant_x}-normal--{px}-{}-75-75-{spacing_x}-{avg_width}-{charset}",
                     px * 10,
                 ));
             }
         }
     }
-
-    entries
 }
 
 // ───────────────────────────────────────────────────────────────
@@ -2049,10 +2557,23 @@ pub(crate) struct KmsCore {
     /// the same text skips the compile.
     xkb_text: String,
     pub(crate) xkb_state: XkbState,
+    /// Xorg's `sli->effectiveState`: the lit indicators, those without a
+    /// map in use keeping their last state.
+    pub(crate) indicator_state: u32,
     /// The RMLVO the active keymap was compiled from, or, for an edited
     /// keymap, the one it was edited from. Read by GetNames (`symbolsName`)
     /// and `_XKB_RULES_NAMES`.
     pub(crate) xkb_rmlvo: XkbRmlvo,
+    /// Immutable process-start keyboard description. A server-generation
+    /// reset starts a new XKB session on this map even though the KMS backend
+    /// itself survives the reset boundary.
+    startup_xkb_desc: XkbDesc,
+    startup_xkb_text: String,
+    startup_xkb_keymap: XkbKeymap,
+    startup_xkb_rmlvo: XkbRmlvo,
+    /// The startup map's [`KeymapSource`]: `Edited` for a rootless host's
+    /// own keymap ([`Self::install_host_keymap`]).
+    startup_keymap_source: KeymapSource,
     /// Whether the active keymap is `xkb_rmlvo`'s or an edited copy.
     pub(crate) keymap_source: KeymapSource,
     /// Authoritative active keyboard group (0..=3). Tracked server-side
@@ -2082,6 +2603,10 @@ pub(crate) struct KmsCore {
     pub(crate) button_mask: u16,
     pub(crate) prev_pointer_window: Option<u32>,
     pub(crate) pending_pointer_events: Vec<HostPointerEvent>,
+    /// Barrier policy for the queued motion generated by the current input.
+    /// KMS builds pointer events before `on_host_input` drains them, so the
+    /// policy must travel alongside that pending queue.
+    pub(crate) pending_motion_barrier_bypass: bool,
 
     // Default GC state (the in-progress GC values feeding paint paths)
     pub(crate) current_font: Option<u32>,
@@ -2151,6 +2676,9 @@ impl KmsCore {
     /// Returns `io::Error` on FontLoader init failure or XKB
     /// keymap construction failure.
     pub(crate) fn new(fb_w: u16, fb_h: u16, layout_arg: Option<String>) -> io::Result<Self> {
+        #[cfg(windows)]
+        let xkb_context = XkbContext(crate::windows::xkb::context());
+        #[cfg(not(windows))]
         let xkb_context = XkbContext(xkbcommon::xkb::Context::new(
             xkbcommon::xkb::CONTEXT_NO_FLAGS,
         ));
@@ -2186,6 +2714,10 @@ impl KmsCore {
         };
         let (xkb_desc, xkb_text, keymap) = cooking_keymap_for(&xkb_context.0, keymap, &rmlvo);
         let xkb_state = XkbState(fresh_state(&keymap));
+        let startup_xkb_desc = xkb_desc.clone();
+        let startup_xkb_text = xkb_text.clone();
+        let startup_xkb_keymap = XkbKeymap(keymap.clone());
+        let startup_xkb_rmlvo = rmlvo.clone();
         let xkb_keymap = XkbKeymap(keymap);
 
         let mut xid_map: HostXidMap = HashMap::new();
@@ -2203,8 +2735,14 @@ impl KmsCore {
             xkb_text,
             xkb_state,
             xkb_rmlvo: rmlvo,
+            startup_xkb_desc,
+            startup_xkb_text,
+            startup_xkb_keymap,
+            startup_xkb_rmlvo,
+            startup_keymap_source: KeymapSource::Rmlvo,
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
+            indicator_state: 0,
             down_keys: HashSet::new(),
             font_loader: FontLoader::new()?,
             fonts: HashMap::new(),
@@ -2216,6 +2754,7 @@ impl KmsCore {
             button_mask: 0,
             prev_pointer_window: None,
             pending_pointer_events: Vec::new(),
+            pending_motion_barrier_bypass: false,
             current_font: None,
             current_function: GcFunction::Copy,
             current_plane_mask: u32::MAX,
@@ -2247,6 +2786,7 @@ impl KmsCore {
     /// matching `KmsBackend::for_tests`'s synthetic output.
     #[doc(hidden)]
     #[must_use]
+    #[cfg(any(kms, test))]
     pub(crate) fn for_tests() -> Self {
         let xkb_context = XkbContext(xkbcommon::xkb::Context::new(
             xkbcommon::xkb::CONTEXT_NO_FLAGS,
@@ -2275,6 +2815,10 @@ impl KmsCore {
         let (xkb_desc, xkb_text, keymap) =
             cooking_keymap_for(&xkb_context.0, keymap, &XkbRmlvo::default());
         let xkb_state = XkbState(fresh_state(&keymap));
+        let startup_xkb_desc = xkb_desc.clone();
+        let startup_xkb_text = xkb_text.clone();
+        let startup_xkb_keymap = XkbKeymap(keymap.clone());
+        let startup_xkb_rmlvo = XkbRmlvo::default();
         let xkb_keymap = XkbKeymap(keymap);
 
         Self {
@@ -2289,8 +2833,14 @@ impl KmsCore {
             xkb_text,
             xkb_state,
             xkb_rmlvo: XkbRmlvo::default(),
+            startup_xkb_desc,
+            startup_xkb_text,
+            startup_xkb_keymap,
+            startup_xkb_rmlvo,
+            startup_keymap_source: KeymapSource::Rmlvo,
             keymap_source: KeymapSource::Rmlvo,
             locked_group: 0,
+            indicator_state: 0,
             down_keys: HashSet::new(),
             font_loader: FontLoader::new().expect("test font loader"),
             fonts: HashMap::new(),
@@ -2302,6 +2852,7 @@ impl KmsCore {
             button_mask: 0,
             prev_pointer_window: None,
             pending_pointer_events: Vec::new(),
+            pending_motion_barrier_bypass: false,
             current_font: None,
             current_function: GcFunction::Copy,
             current_plane_mask: u32::MAX,
@@ -2347,21 +2898,10 @@ impl KmsCore {
     /// reloads, even for its own base RMLVO: Xorg reloads on every
     /// `setxkbmap`, which is how a user undoes an `xmodmap`.
     ///
-    /// A fresh `xkb_state` is built, then every physically-held key in
-    /// `down_keys` is re-applied to it. The layout switch is typically
-    /// triggered by a *hotkey* still held at swap time; without re-applying,
-    /// the new state's modifier/group tracking diverges from the physical
-    /// keyboard (the stuck-modifier class seen on the VT path).
-    ///
-    /// LIMITATION (deliberate): *locked* state (Caps Lock, a locked group)
-    /// is reset by the rebuild — only physically-held keys are re-asserted.
-    /// We do NOT restore locked mods/group via `update_mask`: xkbcommon
-    /// documents `update_mask` as the lossy slave/wire entry point that
-    /// "must not be used to update the master state" and "should not be used
-    /// together" with `update_key`. Mixing it in would risk an incoherent
-    /// master state for subsequent real key events. This matches the
-    /// VT-acquire path's fresh-state behavior. (An in-place edit,
-    /// [`Self::install_desc`], does carry the locks, by replay.)
+    /// The keyboard state carries across as Xorg's does
+    /// (`xorg-xkb-locks.txt`): the locked real modifiers and the held keys,
+    /// each held key still acting on its release as it would have
+    /// ([`Self::swap_keymap`]).
     pub(crate) fn recompile_keymap(&mut self, rmlvo: &XkbRmlvo) -> Option<(u8, u8)> {
         if self.keymap_is_pristine(rmlvo) {
             return None;
@@ -2375,7 +2915,52 @@ impl KmsCore {
             rmlvo.options.clone(),
             xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
         )?;
-        Some(self.install_keymap(keymap, rmlvo))
+        let ctx = self.xkb_context.0.clone();
+        Some(self.install_keymap(&ctx, keymap, rmlvo))
+    }
+
+    /// Make a rootless host's own keymap (XKB's text form, a Wayland
+    /// compositor's) the keymap, from start: a server reset starts its
+    /// session on it too, as on one `-layout` names. Its options and custom
+    /// keys are kept, which its names alone would lose. `_XKB_RULES_NAMES`
+    /// reports `layout` (the layout and variant the rules call it), else
+    /// the names the server started with; and as no names compile to it, a
+    /// load by names always reloads. `false` when it does not compile, and
+    /// the keymap stays.
+    #[cfg_attr(
+        not(wayland_host),
+        allow(dead_code, reason = "the Wayland host's keymap is installed with it")
+    )]
+    pub(crate) fn install_host_keymap(
+        &mut self,
+        text: &str,
+        layout: Option<(String, String)>,
+    ) -> bool {
+        let ctx = self.xkb_context.0.clone();
+        let Some(keymap) = xkbcommon::xkb::Keymap::new_from_string(
+            &ctx,
+            text.to_owned(),
+            xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        ) else {
+            return false;
+        };
+        let rmlvo = match layout {
+            Some((layout, variant)) => XkbRmlvo {
+                layout,
+                variant,
+                ..self.xkb_rmlvo.clone()
+            },
+            None => self.xkb_rmlvo.clone(),
+        };
+        self.install_keymap(&ctx, keymap, &rmlvo);
+        self.keymap_source = KeymapSource::Edited;
+        self.startup_xkb_desc = self.xkb_desc.clone();
+        self.startup_xkb_text.clone_from(&self.xkb_text);
+        self.startup_xkb_keymap = XkbKeymap(self.xkb_keymap.0.clone());
+        self.startup_xkb_rmlvo = self.xkb_rmlvo.clone();
+        self.startup_keymap_source = KeymapSource::Edited;
+        true
     }
 
     /// True when the active keymap is exactly what `rmlvo` compiles to: same
@@ -2384,19 +2969,21 @@ impl KmsCore {
         self.keymap_source == KeymapSource::Rmlvo && self.xkb_rmlvo == *rmlvo
     }
 
-    /// Make `keymap` (compiled from `rmlvo`) the active one: seed the
-    /// description from it and install its cooking keymap. Returns the
+    /// Make `keymap` (compiled from `rmlvo` in `ctx`) the active one: seed
+    /// the description from it and install its cooking keymap. Returns the
     /// keycode bounds. The tail of [`Self::recompile_keymap`], split out so
     /// tests can install a keymap frozen from a known xkeyboard-config.
     pub(crate) fn install_keymap(
         &mut self,
+        ctx: &xkbcommon::xkb::Context,
         keymap: xkbcommon::xkb::Keymap,
         rmlvo: &XkbRmlvo,
     ) -> (u8, u8) {
-        let (desc, text, cooking) = cooking_keymap_for(&self.xkb_context.0, keymap, rmlvo);
+        let (desc, text, cooking) = cooking_keymap_for(ctx, keymap, rmlvo);
         self.xkb_desc = desc;
         self.xkb_text = text;
-        self.swap_keymap(cooking, 0);
+        let locked = locked_real_mods(&self.xkb_state.0, &self.xkb_keymap.0);
+        self.swap_keymap(cooking, locked);
         self.xkb_rmlvo = rmlvo.clone();
         self.keymap_source = KeymapSource::Rmlvo;
         log::info!(
@@ -2419,10 +3006,9 @@ impl KmsCore {
     /// returned (xkbcommon writes the compiler's message to its log). Text
     /// identical to the installed keymap's skips the compile.
     ///
-    /// Unlike an RMLVO reload this is an in-place mapping change, and Xorg
-    /// keeps the keyboard state through those: the locked real modifiers
-    /// are restored by replaying the keymap's own lock keys (see
-    /// `relock_real_mods`), held keys are re-asserted, and `locked_group`
+    /// Xorg keeps the keyboard state through a mapping change: the locked
+    /// real modifiers are restored by replaying the keymap's own lock keys
+    /// (see `relock_real_mods`), held keys are re-asserted, and `locked_group`
     /// (tracked here, not in `xkb_state`) is kept, clamped to the new
     /// group count. The keymap becomes [`KeymapSource::Edited`];
     /// `xkb_rmlvo` keeps naming its base.
@@ -2462,24 +3048,50 @@ impl KmsCore {
     }
 
     /// Replace keymap and state: a fresh state with the real modifiers
-    /// `relock` locked again, then every held key in `down_keys` re-applied
-    /// (locks first, so the replay happens on a neutral keyboard).
+    /// `relock` locked again and every held key in `down_keys` re-pressed.
+    ///
+    /// Xorg keeps each held key's action across a reload: a lock key whose
+    /// press locked keeps the lock on release, one pressed while locked
+    /// unlocks on release (`xorg-xkb-locks.txt`, `reload-*-held*`). A
+    /// libxkbcommon `LockMods` press unlocks on release iff the lock was
+    /// already set, so a held key's lock is restored before its replay only
+    /// when its release would undo it, as read off the old state.
     fn swap_keymap(&mut self, keymap: xkbcommon::xkb::Keymap, relock: u8) {
+        let mut held: Vec<u8> = self.down_keys.iter().copied().collect();
+        held.sort_unstable();
+        let unlocking = release_unlocks(&mut self.xkb_state.0, &self.xkb_keymap.0, &held);
+        let held_locks = held.iter().fold(0, |m, &kc| m | press_locks(&keymap, kc)) & !unlocking;
         let mut new_state = fresh_state(&keymap);
+        let _ = relock_real_mods(&mut new_state, &keymap, relock & !held_locks);
+        for &kc in &held {
+            new_state.update_key(
+                xkbcommon::xkb::Keycode::new(u32::from(kc)),
+                xkbcommon::xkb::KeyDirection::Down,
+            );
+        }
         let dropped = relock_real_mods(&mut new_state, &keymap, relock);
         if dropped != 0 {
             log::info!(
                 "xkb: locked modifiers {dropped:#04x} have no lock key in the new keymap; released"
             );
         }
-        for kc in &self.down_keys {
-            new_state.update_key(
-                xkbcommon::xkb::Keycode::new(u32::from(*kc)),
-                xkbcommon::xkb::KeyDirection::Down,
-            );
-        }
         self.xkb_state = XkbState(new_state);
         self.xkb_keymap = XkbKeymap(keymap);
+    }
+
+    /// Begin a fresh server-generation keyboard session from the immutable
+    /// startup map. Unlike a VT resume, reset inherits no pressed keys,
+    /// locked modifiers, or locked group from the previous session.
+    pub(crate) fn reset_keyboard_session(&mut self) {
+        self.down_keys.clear();
+        self.xkb_desc = self.startup_xkb_desc.clone();
+        self.xkb_text.clone_from(&self.startup_xkb_text);
+        self.xkb_keymap = XkbKeymap(self.startup_xkb_keymap.0.clone());
+        self.xkb_rmlvo = self.startup_xkb_rmlvo.clone();
+        self.keymap_source = self.startup_keymap_source;
+        self.locked_group = 0;
+        self.indicator_state = 0;
+        self.xkb_state = XkbState(fresh_state(&self.xkb_keymap.0));
     }
 }
 
@@ -2512,6 +3124,47 @@ mod xkb_rmlvo_tests {
             .0
             .key_get_one_sym(xkbcommon::xkb::Keycode::new(29));
         assert_eq!(de_sym, xkbcommon::xkb::keysyms::KEY_z.into());
+    }
+
+    /// A host's keymap is taken whole, options included, which its layout
+    /// name alone loses, and a server reset starts on it again.
+    #[test]
+    fn a_hosts_keymap_is_the_keymap_from_start_options_and_all() {
+        let ctx = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+        let text = xkbcommon::xkb::Keymap::new_from_names(
+            &ctx,
+            "evdev",
+            "pc105",
+            "de",
+            "",
+            Some("ctrl:nocaps".into()),
+            xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("de with ctrl:nocaps")
+        .get_as_string(xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1);
+        let mut core = KmsCore::for_tests();
+        let sym = |core: &KmsCore, kc: u32| {
+            core.xkb_state
+                .0
+                .key_get_one_sym(xkbcommon::xkb::Keycode::new(kc))
+        };
+        assert!(core.install_host_keymap(&text, Some(("de".into(), String::new()))));
+        // Y (AD06) is z on de, and Caps Lock (66) a Control.
+        assert_eq!(sym(&core, 29), xkbcommon::xkb::keysyms::KEY_z.into());
+        assert_eq!(
+            sym(&core, 66),
+            xkbcommon::xkb::keysyms::KEY_Control_L.into()
+        );
+        assert_eq!(core.xkb_rmlvo.layout, "de");
+        assert!(!core.keymap_is_pristine(&core.xkb_rmlvo.clone()));
+        core.reset_keyboard_session();
+        assert_eq!(sym(&core, 29), xkbcommon::xkb::keysyms::KEY_z.into());
+        assert_eq!(
+            sym(&core, 66),
+            xkbcommon::xkb::keysyms::KEY_Control_L.into()
+        );
+        assert!(!core.install_host_keymap("not a keymap", None));
+        assert_eq!(sym(&core, 29), xkbcommon::xkb::keysyms::KEY_z.into());
     }
 
     #[test]
@@ -2584,7 +3237,11 @@ mod xkb_rmlvo_tests {
     fn install_desc_installs_the_description() {
         // External truth: the frozen de fixture puts `z` on keycode 29.
         let mut core = KmsCore::for_tests();
-        let de = XkbDesc::from_keymap(&crate::kms::xkb::golden_keymap("de", None)).expect("seed");
+        let de = XkbDesc::from_keymap(
+            &crate::kms::xkb::golden_keymap("de", None),
+            &crate::kms::xkb::golden_context(),
+        )
+        .expect("seed");
         let range = core.install_desc(de.clone()).expect("de compiles");
         assert_eq!(range, (8, 255));
         assert_eq!(core.xkb_desc, de);
@@ -2600,6 +3257,7 @@ mod xkb_rmlvo_tests {
     fn edit_keeps_locked_group_locked_mods_and_held_keys() {
         let mut core = KmsCore::for_tests();
         core.install_keymap(
+            &crate::kms::xkb::golden_context(),
             crate::kms::xkb::golden_keymap("us,ru", Some("grp:alt_shift_toggle")),
             &usru_rmlvo(),
         );
@@ -2669,18 +3327,24 @@ mod xkb_rmlvo_tests {
     fn edit_clamps_the_locked_group_to_the_new_keymap() {
         let mut core = KmsCore::for_tests();
         core.install_keymap(
+            &crate::kms::xkb::golden_context(),
             crate::kms::xkb::golden_keymap("us,ru", Some("grp:alt_shift_toggle")),
             &usru_rmlvo(),
         );
         core.locked_group = 1;
-        let us = XkbDesc::from_keymap(&crate::kms::xkb::golden_keymap("us", None)).expect("seed");
+        let us = XkbDesc::from_keymap(
+            &crate::kms::xkb::golden_keymap("us", None),
+            &crate::kms::xkb::golden_context(),
+        )
+        .expect("seed");
         core.install_desc(us).expect("us compiles");
         assert_eq!(core.keymap_group_count(), 1, "precondition");
         assert_eq!(core.locked_group, 0, "group 2 no longer exists");
     }
 
+    /// Xorg: `xorg-xkb-locks.txt`, `reload-capslock-key`.
     #[test]
-    fn rmlvo_swap_still_resets_locks() {
+    fn rmlvo_swap_keeps_locks() {
         let mut core = KmsCore::for_tests();
         press_release(&mut core, 66);
         assert!(locked(&core, "Lock"), "precondition");
@@ -2689,10 +3353,7 @@ mod xkb_rmlvo_tests {
             ..XkbRmlvo::default()
         });
         assert!(changed.is_some());
-        assert!(
-            !locked(&core, "Lock"),
-            "a full reload starts from a fresh state"
-        );
+        assert!(locked(&core, "Lock"), "a full reload keeps the lock");
     }
 
     #[test]
@@ -2791,25 +3452,31 @@ mod font_tests {
     fn fonts_dir_parse_and_alias() {
         let dir = write_test_font_dir("parse");
         let fd = FontDir::load(&dir).unwrap();
-        assert_eq!(fd.entries.len(), 2);
-        assert_eq!(fd.entries[0].0, "testfont0");
+        assert_eq!(fd.non_scalable.len(), 3);
+        assert_eq!(fd.scalable.len(), 0);
+        let all = FontPattern::new("*");
+        let names: Vec<(String, DirEntry)> = fd
+            .matching(&all)
+            .map(|e| (e.name.to_string(), e.value.clone()))
+            .collect();
         assert_eq!(
-            fd.aliases,
-            vec![("myalias".to_string(), "testfont0".to_string())]
+            names,
+            [
+                (
+                    "-vsw-testfont-bold-r-normal--13-130-75-75-m-70-iso8859-1".to_string(),
+                    DirEntry::File(dir.join("testfont0.bdf"))
+                ),
+                (
+                    "myalias".to_string(),
+                    DirEntry::Alias("testfont0".to_string())
+                ),
+                (
+                    "testfont0".to_string(),
+                    DirEntry::File(dir.join("testfont0.bdf"))
+                ),
+            ]
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn font_pattern_glob() {
-        assert!(font_pattern_matches("xtfont*", "xtfont0"));
-        assert!(font_pattern_matches("XTFONT0", "xtfont0")); // case-insensitive
-        assert!(font_pattern_matches(
-            "-vsw-*-bold-r-*",
-            "-vsw-testfont-bold-r-normal--13-130-75-75-m-70-iso8859-1"
-        ));
-        assert!(!font_pattern_matches("xtfont?", "xtfont"));
-        assert!(!font_pattern_matches("nope", "xtfont0"));
     }
 
     /// The built-ins escape hatch for our own synthesized alias XLFD
@@ -2965,10 +3632,10 @@ mod font_tests {
             "nil2 must resolve to the embedded font — a visible substitute \
              inverts its whole purpose (invisible cursors)"
         );
-        // `fixed` is ordinary text; fontconfig substitution stays.
+        // `fixed` is libXfont2's built-in 6x13, as on Xorg.
         assert!(
-            matches!(loader.resolve("fixed"), Some(FontResolution::BuiltIn)),
-            "fixed keeps its fontconfig fallback"
+            matches!(loader.resolve("fixed"), Some(FontResolution::Embedded(f)) if f.name == XORG_BUILTIN_FIXED),
+            "fixed is the embedded 6x13"
         );
 
         // XC_left_ptr: the arrow the reporter saw as an `E`.
@@ -3010,7 +3677,7 @@ mod font_tests {
     fn builtin_alias_xlfd_identity_not_just_shape() {
         let mut loader = FontLoader::new().unwrap();
         loader.set_font_path(&["built-ins".into()]).unwrap();
-        let (_, metrics, _) = loader.open_font_builtin("fixed").unwrap();
+        let (_, metrics, _) = loader.open_builtin_or_embedded("fixed").unwrap();
         let real = FontLoader::alias_to_xlfd("fixed", &metrics);
         assert!(
             matches!(loader.resolve(&real), Some(FontResolution::BuiltIn)),
@@ -3071,11 +3738,122 @@ mod font_tests {
         // built-ins alias survives any path
         assert!(matches!(
             loader.resolve("fixed"),
-            Some(FontResolution::BuiltIn)
+            Some(FontResolution::Embedded(_))
         ));
         // unknown bare name → None → BadName at the request layer
         assert!(loader.resolve("definitely-not-a-font").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Xorg's `built-ins` element alone (measured, Xorg 21.1): `fixed`,
+    /// `6x13` and the 6x13 XLFD open as one 6-wide font with ascent 11
+    /// and descent 2; `*` lists its six names first; and a path without
+    /// `built-ins` has none of them.
+    #[test]
+    fn built_ins_are_xorgs_fixed_and_cursor() {
+        let mut loader = FontLoader::new().unwrap();
+        loader.set_font_path(&["built-ins".into()]).unwrap();
+        for name in [
+            "fixed",
+            "FIXED",
+            "6x13",
+            XORG_BUILTIN_FIXED,
+            "-*-*-*-R-*-*-*-120-*-*-*-*",
+        ] {
+            let Some(FontResolution::Embedded(f)) = loader.resolve(name) else {
+                panic!("{name} must resolve to the built-in 6x13");
+            };
+            assert_eq!(f.name, XORG_BUILTIN_FIXED);
+        }
+        let (_, metrics, _) = loader.open_builtin_or_embedded("fixed").unwrap();
+        assert_eq!(
+            (
+                metrics.max_bounds.character_width,
+                metrics.font_ascent,
+                metrics.font_descent
+            ),
+            (6, 11, 2)
+        );
+        assert_eq!(&loader.list_font_names("*", 6), XORG_BUILTIN_NAMES);
+        let aliases = std::env::temp_dir().join(format!(
+            "yserver-font-test-no-builtins-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&aliases);
+        std::fs::write(aliases.join("fonts.alias"), "other fixed\n").unwrap();
+        loader
+            .set_font_path(&[aliases.to_string_lossy().into_owned()])
+            .unwrap();
+        assert!(loader.list_font_names("fixed", 10).is_empty());
+        let _ = std::fs::remove_dir_all(aliases);
+    }
+
+    /// CDE's Xsession adds `/usr/dt/etc/cde/fontaliases`, a directory
+    /// with a fonts.alias and no fonts.dir, which Xorg takes
+    /// (`FontFileReadDirectory`); its patterns then open through the
+    /// aliases (`FontFileFindNameInDir`). The first match in `strcmpn`
+    /// order decides: an alias whose target is not installed makes the
+    /// name BadName (`doOpenFont`), ListFonts leaves it out and
+    /// ListFontsWithInfo reports a resolved alias by its target name
+    /// (`doListFontsAndAliases`, `doListFontsWithInfo`; the font-list vng
+    /// scenario compares these with Xorg).
+    #[test]
+    fn an_alias_only_directory_joins_the_path_and_opens_by_pattern() {
+        let fonts = write_test_font_dir("alias-target");
+        let aliases = std::env::temp_dir().join(format!(
+            "yserver-font-test-alias-only-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&aliases);
+        std::fs::write(
+            aliases.join("fonts.alias"),
+            "\"-dt-interface system-medium-r-normal-s serif-13-130-75-75-m-70-iso8859-1\" testfont0\n\
+             \"-dt-interface system-medium-r-normal-s gone-13-130-75-75-m-70-iso8859-1\" no-such-font\n",
+        )
+        .unwrap();
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[
+                fonts.to_string_lossy().into_owned(),
+                aliases.to_string_lossy().into_owned(),
+            ])
+            .expect("an alias-only directory is a valid path element");
+        assert!(matches!(
+            loader.resolve("-dt-interface system-medium-r-normal-s s*-*-*-*-*-*-*-ISO8859-1"),
+            Some(FontResolution::File { .. })
+        ));
+        // "s gone" sorts first and leads nowhere.
+        assert!(
+            loader
+                .resolve("-dt-interface system-medium-r-normal-s*-*-*-*-*-*-*-ISO8859-1")
+                .is_none()
+        );
+        assert_eq!(
+            loader.list_font_names("-dt-interface system-*", 10),
+            ["-dt-interface system-medium-r-normal-s serif-13-130-75-75-m-70-iso8859-1"]
+        );
+        // max-names is spent on the alias that leads nowhere.
+        assert!(
+            loader
+                .list_font_names("-dt-interface system-*", 1)
+                .is_empty()
+        );
+        let listed = loader.list_fonts_with_info("-dt-interface system-*", 10);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].reply_name, "testfont0");
+        assert!(matches!(listed[0].res, FontResolution::File { .. }));
+        let empty =
+            std::env::temp_dir().join(format!("yserver-font-test-empty-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&empty);
+        assert!(
+            loader
+                .set_font_path(&[empty.to_string_lossy().into_owned()])
+                .is_err(),
+            "neither fonts.dir nor fonts.alias"
+        );
+        for d in [fonts, aliases, empty] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 
     #[test]
@@ -3133,6 +3911,101 @@ mod font_tests {
 #[cfg(test)]
 mod pcf_tests {
     use super::*;
+
+    /// A gzipped PCF (how distros install bitmap fonts) reads the same
+    /// tables as the plain image it inflates to.
+    #[test]
+    fn gzipped_pcf_parses_like_its_plain_image() {
+        use std::io::Write;
+        let plain = include_bytes!("../../fonts/6x13-ISO8859-1.pcf");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(plain).unwrap();
+        let gz = enc.finish().unwrap();
+        let from_plain = pcf_info_from_bytes(plain).expect("plain PCF parses");
+        assert_eq!(pcf_info_from_bytes(&gz), Some(from_plain));
+        assert_eq!(
+            pcf_info_from_bytes(&gz[..gz.len() / 2]),
+            None,
+            "truncated stream"
+        );
+    }
+
+    /// The PROPERTIES table whole and in file order, as a live Xorg
+    /// 21.1 ListFontsWithInfo reports sony 8x16 (vng font-list
+    /// scenario) — FreeType exposed only the names asked for.
+    #[test]
+    fn system_pcf_properties_match_xorg() {
+        let file = std::path::Path::new("/usr/share/fonts/misc/8x16.pcf.gz");
+        if !file.is_file() {
+            eprintln!("skipping: {} not present", file.display());
+            return;
+        }
+        let s = |v: &str| FontPropValue::Str(v.to_string());
+        let expected = [
+            ("FONTNAME_REGISTRY", s("")),
+            ("FOUNDRY", s("Sony")),
+            ("FAMILY_NAME", s("Fixed")),
+            ("WEIGHT_NAME", s("Medium")),
+            ("SLANT", s("R")),
+            ("SETWIDTH_NAME", s("Normal")),
+            ("ADD_STYLE_NAME", s("")),
+            ("PIXEL_SIZE", FontPropValue::Int(16)),
+            ("POINT_SIZE", FontPropValue::Int(120)),
+            ("RESOLUTION_X", FontPropValue::Int(100)),
+            ("RESOLUTION_Y", FontPropValue::Int(100)),
+            ("SPACING", s("C")),
+            ("AVERAGE_WIDTH", FontPropValue::Int(80)),
+            ("CHARSET_REGISTRY", s("ISO8859")),
+            ("CHARSET_ENCODING", s("1")),
+            ("COPYRIGHT", s("Copyright (c) 1987, 1988 Sony Corp.")),
+            (
+                "FONT",
+                s("-Sony-Fixed-Medium-R-Normal--16-120-100-100-C-80-ISO8859-1"),
+            ),
+            ("WEIGHT", FontPropValue::Int(10)),
+            ("RESOLUTION", FontPropValue::Int(138)),
+            ("X_HEIGHT", FontPropValue::Int(14)),
+            ("QUAD_WIDTH", FontPropValue::Int(8)),
+        ]
+        .map(|(n, v)| (n.to_string(), v));
+        let info = pcf_file_info(file).expect("gzipped PCF parses");
+        assert_eq!(info.properties.as_deref(), Some(&expected[..]));
+    }
+
+    /// default_char of installed .pcf.gz fonts, as a live Xorg 21.1
+    /// ListFontsWithInfo reports it (vng font-list scenario): 32 for
+    /// sony 8x16, 0x2121 for jiskan16. Skips when the fonts are absent.
+    #[test]
+    fn system_pcf_gz_default_char_matches_xorg() {
+        let dir = std::path::Path::new("/usr/share/fonts/misc");
+        let cases = [
+            (
+                "8x16.pcf.gz",
+                "-sony-fixed-medium-r-normal--16-120-100-100-c-80-iso8859-1",
+                32,
+            ),
+            (
+                "jiskan16.pcf.gz",
+                "-jis-fixed-medium-r-normal--16-150-75-75-c-160-jisx0208.1983-0",
+                0x2121,
+            ),
+        ];
+        if !cases.iter().all(|(f, _, _)| dir.join(f).is_file()) || !dir.join("fonts.dir").is_file()
+        {
+            eprintln!("skipping: misc .pcf.gz fonts not present");
+            return;
+        }
+        let mut loader = FontLoader::new().unwrap();
+        loader
+            .set_font_path(&[dir.to_string_lossy().into_owned()])
+            .unwrap();
+        for (file, xlfd, dc) in cases {
+            let info = pcf_file_info(&dir.join(file)).expect("gzipped PCF parses");
+            assert_eq!(info.default_char, Some(dc), "{file}");
+            let (_face, metrics, _) = loader.open_font(xlfd).unwrap();
+            assert_eq!(metrics.default_char, dc, "{xlfd}");
+        }
+    }
 
     /// Real compiled PCF regression: FreeType's PCF driver leaves no
     /// charmap selected for registry-less fonts (the xts xtfonts), so

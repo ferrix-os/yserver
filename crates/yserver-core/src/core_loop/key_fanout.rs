@@ -26,13 +26,299 @@ const KEY_RELEASE_MASK: u32 = 0x0000_0002;
 const XI2_MAJOR_OPCODE: u8 = 137;
 const XI2_KEYPRESS_EVTYPE: u16 = 2;
 const XI2_KEYRELEASE_EVTYPE: u16 = 3;
+/// XIKeyRepeat is bit 16 in the XI2 device-event flags word for key presses.
+const XI2_KEY_REPEAT_FLAG: u32 = 0x0001_0000;
 const XI2_MASTER_KEYBOARD_DEVICE_ID: u16 = 3;
-const XI2_SLAVE_KEYBOARD_DEVICE_ID: u16 = 5;
 const XI2_RAW_KEY_PRESS_EVTYPE: u16 = 13;
 const XI2_RAW_KEY_RELEASE_EVTYPE: u16 = 14;
 /// XISelectEvents wildcard deviceids.
 const XI2_ALL_DEVICES: u16 = 0;
 const XI2_ALL_MASTER_DEVICES: u16 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyXiSource {
+    slave_deviceid: Option<u16>,
+    sourceid: u16,
+    attached_master: Option<u16>,
+}
+
+/// Resolve the keyboard XI forms represented by an input origin. Unknown,
+/// removed, suspended, disabled, and non-keyboard XTEST targets have no
+/// source. A known physical source without an allocated keyboard facet and
+/// nested host input use master identity 3 for both deviceid and sourceid.
+fn resolve_key_xi_source(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+) -> Option<KeyXiSource> {
+    use crate::{core_loop::InputOrigin, xinput::XiFacetKind};
+    match origin {
+        InputOrigin::Physical(source) => {
+            state
+                .xi_devices
+                .source(source)
+                .filter(|info| info.enabled)?;
+            if let Some(device_id) = state.xi_devices.facet(source, XiFacetKind::Keyboard) {
+                let device = state.xi_devices.device(device_id)?;
+                if !device.enabled
+                    || device
+                        .attached_master
+                        .is_some_and(|master| master != XI2_MASTER_KEYBOARD_DEVICE_ID)
+                {
+                    return None;
+                }
+                return Some(KeyXiSource {
+                    slave_deviceid: Some(device_id),
+                    sourceid: device_id,
+                    attached_master: device.attached_master,
+                });
+            }
+            Some(KeyXiSource {
+                slave_deviceid: None,
+                sourceid: XI2_MASTER_KEYBOARD_DEVICE_ID,
+                attached_master: Some(XI2_MASTER_KEYBOARD_DEVICE_ID),
+            })
+        }
+        InputOrigin::XTest(device_id) => {
+            let device = state.xi_devices.device(device_id)?;
+            if !device.enabled {
+                return None;
+            }
+            match state.xi_devices.role(device_id)? {
+                crate::xinput::XiDeviceRole::MasterKeyboard => Some(KeyXiSource {
+                    slave_deviceid: None,
+                    sourceid: device_id,
+                    attached_master: Some(device_id),
+                }),
+                crate::xinput::XiDeviceRole::SlaveKeyboard => Some(KeyXiSource {
+                    slave_deviceid: Some(device_id),
+                    sourceid: device_id,
+                    attached_master: device.attached_master,
+                }),
+                crate::xinput::XiDeviceRole::MasterPointer
+                | crate::xinput::XiDeviceRole::SlavePointer => None,
+            }
+        }
+        InputOrigin::NestedHost => Some(KeyXiSource {
+            slave_deviceid: None,
+            sourceid: XI2_MASTER_KEYBOARD_DEVICE_ID,
+            attached_master: Some(XI2_MASTER_KEYBOARD_DEVICE_ID),
+        }),
+    }
+}
+
+/// KMS checks physical identity before cooking keys or mutating backend
+/// XKB/held state. The fanout repeats this validation for queued input.
+pub fn keyboard_origin_is_live(state: &ServerState, origin: crate::core_loop::InputOrigin) -> bool {
+    resolve_key_xi_source(state, origin).is_some()
+}
+
+/// The independently guarded state transition represented by one host key.
+/// A slave may accept its transition while the attached master suppresses a
+/// duplicate press or release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyTransition {
+    pub device_accepted: bool,
+    pub master_accepted: bool,
+}
+
+/// Whether this origin currently holds `keycode` in its own XI keyboard view.
+/// For unpublished physical sources the equivalent internal source map is
+/// used; master-only origins use the core/master QueryKeymap bitmap.
+pub fn keyboard_key_is_down(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+    keycode: u8,
+) -> bool {
+    use crate::core_loop::InputOrigin;
+    let Some(source) = resolve_key_xi_source(state, origin) else {
+        return false;
+    };
+    match origin {
+        InputOrigin::Physical(source_id) if source.slave_deviceid.is_none() => state
+            .unpublished_keyboard_keys_down
+            .get(&source_id)
+            .is_some_and(|keys| keys.contains_key(&keycode)),
+        InputOrigin::Physical(_) | InputOrigin::XTest(_) if source.slave_deviceid.is_some() => {
+            state
+                .key_down_by_device
+                .get(&source.slave_deviceid.unwrap_or_default())
+                .is_some_and(|keys| keys.contains_key(&keycode))
+        }
+        InputOrigin::XTest(_) | InputOrigin::NestedHost => master_key_is_down(state, keycode),
+        InputOrigin::Physical(_) => false,
+    }
+}
+
+/// Check the generating keyboard guard independently from the attached
+/// master's down guard. The master release deliberately accepts the first
+/// valid release from any attached slave (Xi/exevents.c:922-943).
+pub fn key_transition_status(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+    keycode: u8,
+    pressed: bool,
+) -> Option<KeyTransition> {
+    use crate::core_loop::InputOrigin;
+    let source = resolve_key_xi_source(state, origin)?;
+    let device_was_down = match origin {
+        InputOrigin::Physical(source_id) if source.slave_deviceid.is_none() => state
+            .unpublished_keyboard_keys_down
+            .get(&source_id)
+            .is_some_and(|keys| keys.contains_key(&keycode)),
+        InputOrigin::Physical(_) | InputOrigin::XTest(_) if source.slave_deviceid.is_some() => {
+            state
+                .key_down_by_device
+                .get(&source.slave_deviceid.unwrap_or_default())
+                .is_some_and(|keys| keys.contains_key(&keycode))
+        }
+        InputOrigin::XTest(_) | InputOrigin::NestedHost => master_key_is_down(state, keycode),
+        InputOrigin::Physical(_) => false,
+    };
+    let device_accepted = pressed != device_was_down;
+    let master_accepted = match origin {
+        InputOrigin::Physical(_) if source.attached_master.is_some() => {
+            if pressed {
+                !master_key_is_down(state, keycode)
+            } else {
+                master_key_is_down(state, keycode)
+            }
+        }
+        // Xorg's master-copy path returns no master event for a floating
+        // slave (mi/mieq.c:385-398); XTEST addressed to an attached slave
+        // follows its paired master as usual.
+        InputOrigin::XTest(_)
+            if source.slave_deviceid.is_some() && source.attached_master.is_some() =>
+        {
+            if pressed {
+                !master_key_is_down(state, keycode)
+            } else {
+                master_key_is_down(state, keycode)
+            }
+        }
+        InputOrigin::XTest(_) | InputOrigin::NestedHost if source.attached_master.is_some() => {
+            // Master-targeted XTEST and nested input have a single guard.
+            device_accepted
+        }
+        _ => false,
+    };
+    Some(KeyTransition {
+        device_accepted,
+        master_accepted,
+    })
+}
+
+/// Commit one accepted generating-device transition and, independently, an
+/// accepted master transition. Call only after `key_transition_status` has
+/// accepted the slave/device edge.
+pub fn commit_key_transition(
+    state: &mut ServerState,
+    origin: crate::core_loop::InputOrigin,
+    keycode: u8,
+    pressed: bool,
+    transition: KeyTransition,
+) {
+    use crate::core_loop::InputOrigin;
+    if !transition.device_accepted {
+        return;
+    }
+    let Some(source) = resolve_key_xi_source(state, origin) else {
+        return;
+    };
+    match origin {
+        InputOrigin::Physical(source_id) if source.slave_deviceid.is_none() => {
+            let keys = state
+                .unpublished_keyboard_keys_down
+                .entry(source_id)
+                .or_default();
+            if pressed {
+                keys.insert(keycode, origin);
+            } else {
+                keys.remove(&keycode);
+                if keys.is_empty() {
+                    state.unpublished_keyboard_keys_down.remove(&source_id);
+                }
+            }
+        }
+        InputOrigin::Physical(_) | InputOrigin::XTest(_) if source.slave_deviceid.is_some() => {
+            let device_id = source.slave_deviceid.unwrap_or_default();
+            let keys = state.key_down_by_device.entry(device_id).or_default();
+            if pressed {
+                keys.insert(keycode, origin);
+            } else {
+                keys.remove(&keycode);
+                if keys.is_empty() {
+                    state.key_down_by_device.remove(&device_id);
+                }
+            }
+        }
+        InputOrigin::XTest(_) | InputOrigin::NestedHost | InputOrigin::Physical(_) => {}
+    }
+
+    if transition.master_accepted {
+        set_master_key_down(state, keycode, pressed);
+    }
+}
+
+fn master_key_is_down(state: &ServerState, keycode: u8) -> bool {
+    let byte = usize::from(keycode / 8);
+    let bit = 1u8 << (keycode % 8);
+    state.keys_down[byte] & bit != 0
+}
+
+fn set_master_key_down(state: &mut ServerState, keycode: u8, pressed: bool) {
+    let byte = usize::from(keycode / 8);
+    let bit = 1u8 << (keycode % 8);
+    if pressed {
+        state.keys_down[byte] |= bit;
+    } else {
+        state.keys_down[byte] &= !bit;
+    }
+}
+
+/// Resolve the device-indexed grab/freeze key for an input origin.
+fn key_origin_device(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+) -> (u16, Option<u16>) {
+    resolve_key_xi_source(state, origin).map_or((XI2_MASTER_KEYBOARD_DEVICE_ID, None), |source| {
+        (
+            source.slave_deviceid.unwrap_or(source.sourceid),
+            source.attached_master,
+        )
+    })
+}
+
+/// Whether `origin` names a keyboard facet that is currently floating under
+/// an explicit XI2 grab. KMS uses this before touching master XKB state.
+pub fn keyboard_origin_is_floating(
+    state: &ServerState,
+    origin: crate::core_loop::InputOrigin,
+) -> bool {
+    let (device_id, master_id) = key_origin_device(state, origin);
+    matches!(
+        state.xi_devices.role(device_id),
+        Some(crate::xinput::XiDeviceRole::SlaveKeyboard)
+    ) && master_id.is_none()
+}
+
+fn active_keyboard_grab_for_origin(
+    state: &ServerState,
+    device_id: u16,
+    master_id: Option<u16>,
+) -> Option<(ActiveKeyboardGrab, bool)> {
+    state
+        .xi2_keyboard_grabs
+        .get(&device_id)
+        .copied()
+        .map(|grab| (grab, false))
+        .or_else(|| {
+            (device_id == XI2_MASTER_KEYBOARD_DEVICE_ID
+                || master_id == Some(XI2_MASTER_KEYBOARD_DEVICE_ID))
+            .then_some(state.active_keyboard_grab)
+            .flatten()
+            .map(|grab| (grab, true))
+        })
+}
 
 /// Fan a host key event out to nested clients.
 ///
@@ -44,27 +330,42 @@ pub fn key_event_fanout_to_state(
     backend: &mut dyn crate::backend::Backend,
     event: HostKeyEvent,
 ) -> Vec<ClientId> {
-    // QueryKeymap bitmap — device key state tracks the physical
-    // event regardless of where (or whether) it gets delivered.
-    //
-    // NOTE: we deliberately do NOT reconstruct modifier state here and
-    // stamp it onto the event. The backend already cooks the
-    // authoritative xkb modifier state into `event.state`
-    // (`cook_host_key` → `serialize_modifiers`, and XTest fakes are
-    // cooked the same way via `on_host_input`). A second server-side
-    // tracker (keys_down × modifier-map) is a redundant source of
-    // truth that drifts from xkb — `synthesize_held_releases` on a
-    // VT-switch clears keys_down without touching xkb — and any
-    // `state == 0` override then clobbers every unmodified keypress
-    // with the stale modifier ("stuck Ctrl, can't type in wezterm").
-    {
-        let byte = usize::from(event.keycode / 8);
-        let bit = 1u8 << (event.keycode % 8);
-        if event.pressed {
-            state.keys_down[byte] |= bit;
-        } else {
-            state.keys_down[byte] &= !bit;
-        }
+    let Some(transition) = key_transition_status(state, event.origin, event.keycode, event.pressed)
+    else {
+        return Vec::new();
+    };
+    if !transition.device_accepted {
+        return Vec::new();
+    }
+    commit_key_transition(
+        state,
+        event.origin,
+        event.keycode,
+        event.pressed,
+        transition,
+    );
+    key_event_fanout_after_transition(state, backend, event, transition.master_accepted, false)
+}
+
+/// Fan an already guarded host key transition out to clients. KMS calls this
+/// after it has updated its XKB state only when the master transition was
+/// accepted; queued replay paths retain the original transition decision.
+pub fn key_event_fanout_after_transition(
+    state: &mut ServerState,
+    backend: &mut dyn crate::backend::Backend,
+    event: HostKeyEvent,
+    master_transition_accepted: bool,
+    synthetic_repeat: bool,
+) -> Vec<ClientId> {
+    let Some(xi_source) = resolve_key_xi_source(state, event.origin) else {
+        return Vec::new();
+    };
+    let device_id = xi_source.slave_deviceid.unwrap_or(xi_source.sourceid);
+    let master_id = xi_source.attached_master;
+    let mut switch_dropped = Vec::new();
+    if let (Some(sourceid), Some(master_id)) = (xi_source.slave_deviceid, master_id) {
+        switch_dropped =
+            crate::xinput::hotplug::announce_xi2_slave_switch(state, master_id, sourceid);
     }
     // DPMS: any key resets the idle timer; from any non-On level
     // we wake the screen *before* fanning out, so the first event
@@ -133,116 +434,206 @@ pub fn key_event_fanout_to_state(
     // regenerates both the core and the XI1 form — queueing the XI1
     // form separately here would double-deliver it on thaw (XTS
     // XUngrabDevice-1: "expecting two events, got 4").
-    if state
-        .xi1_frozen
-        .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
-        .is_some_and(crate::server::Xi1Freeze::frozen)
-    {
+    let frozen_device = [Some(device_id), master_id]
+        .into_iter()
+        .flatten()
+        .find(|id| {
+            state
+                .xi1_frozen
+                .get(id)
+                .is_some_and(crate::server::Xi1Freeze::frozen)
+        });
+    if let Some(frozen_device) = frozen_device {
         state
             .sync_pending
             .push_back(crate::server::PendingSyncEvent {
-                device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-                event: crate::server::QueuedInputEvent::HostKey(event),
+                device: frozen_device,
+                event: crate::server::QueuedInputEvent::HostKeyTransition(
+                    event,
+                    master_transition_accepted,
+                    synthetic_repeat,
+                ),
             });
         return Vec::new();
     }
 
-    let dropped = deliver_routed_key(state, event);
+    let mut dropped = switch_dropped;
+    merge_dropped(
+        &mut dropped,
+        deliver_routed_key_with_master_status(
+            state,
+            event,
+            master_transition_accepted,
+            synthetic_repeat,
+        ),
+    );
 
-    // XkbStateNotify (GH #59): libxkbcommon-x11 clients (kitty/GLFW, all
-    // of Wayland's X11 path) keep their xkb_state synchronized ONLY from
-    // these events via `xkb_state_update_mask()` — NOT from the key
-    // events. So if the effective modifiers OR the group changed across
-    // this key event (cook_host_key already advanced the backend's
-    // xkb_state), fan out a full XkbStateNotify to StateNotify selectors.
-    // Without this a client that seeded a held modifier from XkbGetState
-    // (e.g. kitty launched from a `super + Return` chord, with Mod4 held
-    // at query time) never learns the modifier cleared on release, and
-    // every key resolves to NoSymbol. The `last_xkb_*` anchors dedup
-    // against the XkbLatchLockState handler so neither re-emits the other.
-    let g = backend.current_group();
-    let (eff_mods, base_mods, latched_mods, locked_mods) = backend.current_xkb_mods();
-    if eff_mods != state.last_xkb_mods || g != state.last_xkb_group {
-        let base = backend.xkb_info().map_or(0, |(_maj, ev, _err)| ev);
-        let subs = crate::core_loop::xkb_layout::subscribers(state, 0x0004);
-        // changed: all modifier components + the compat/grab/lookup mirrors
-        // Xorg fills (0x1F0F); add the group bits on a group switch.
-        let mut changed: u16 = 0x1F0F;
-        if g != state.last_xkb_group {
-            changed |= 0x0090; // XkbGroupStateMask | XkbGroupLockMask
-        }
-        let notify = x11::XkbStateNotify {
-            device_id: 1,
-            mods: eff_mods,
-            base_mods,
-            latched_mods,
-            locked_mods,
-            group: g,
-            locked_group: g,
-            changed,
+    // Xorg `_XkbApplyState` after the key event: libxkbcommon-x11 clients
+    // track modifiers from XkbStateNotify alone (GH #59).
+    crate::core_loop::xkb_layout::announce_xkb_state(
+        state,
+        backend,
+        crate::core_loop::xkb_layout::XkbStateCause {
             keycode: event.keycode,
             event_type: if event.pressed { 2 } else { 3 },
-            request_major: 0,
-            request_minor: 0,
-        };
-        let _redundant = fanout_event_to_clients(state, &subs, |buf, seq, order| {
-            let _ = x11::write_xkb_state_notify(buf, order, seq, base, notify);
-        });
-        state.last_xkb_group = g;
-        state.last_xkb_mods = eff_mods;
-    }
+            request: (0, 0),
+        },
+    );
+    backend.sync_floating_keyboard_states(state);
 
     dropped
+}
+
+/// Publish a master source switch before KMS emits the raw-key form. Xorg
+/// queues `UpdateFromMaster`'s DeviceChanged before the raw and device events.
+pub fn announce_key_source_switch(
+    state: &mut ServerState,
+    origin: crate::core_loop::InputOrigin,
+) -> Vec<ClientId> {
+    let Some(source) = resolve_key_xi_source(state, origin) else {
+        return Vec::new();
+    };
+    let (Some(sourceid), Some(master_id)) = (source.slave_deviceid, source.attached_master) else {
+        return Vec::new();
+    };
+    crate::xinput::hotplug::announce_xi2_slave_switch(state, master_id, sourceid)
 }
 
 /// The routing+delivery tail of [`key_event_fanout_to_state`] —
 /// callable without a backend so `xi1_compute_freezes` can replay
 /// withheld core keys on thaw.
 pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
+    deliver_routed_key_with_master_status(state, event, true, false)
+}
+
+pub(crate) fn deliver_routed_key_after_transition(
+    state: &mut ServerState,
+    event: HostKeyEvent,
+    master_transition_accepted: bool,
+    synthetic_repeat: bool,
+) -> Vec<ClientId> {
+    deliver_routed_key_with_master_status(
+        state,
+        event,
+        master_transition_accepted,
+        synthetic_repeat,
+    )
+}
+
+fn deliver_routed_key_with_master_status(
+    state: &mut ServerState,
+    event: HostKeyEvent,
+    master_transition_accepted: bool,
+    synthetic_repeat: bool,
+) -> Vec<ClientId> {
+    if !keyboard_origin_is_live(state, event.origin) {
+        return Vec::new();
+    }
+    let (device_id, master_id) = key_origin_device(state, event.origin);
+    if !master_transition_accepted
+        && master_id == Some(XI2_MASTER_KEYBOARD_DEVICE_ID)
+        && device_id != XI2_MASTER_KEYBOARD_DEVICE_ID
+    {
+        // The slave pass remains independently deliverable even when the
+        // master guard rejected its copy. An exact slave grab owns this form;
+        // otherwise route the slave selection on the natural focus path.
+        if let Some(grab) = state.xi2_keyboard_grabs.get(&device_id).copied() {
+            let mut dropped = deliver_key_to_grab_owner(
+                state,
+                &event,
+                grab.owner,
+                grab.grab_window,
+                grab.via_xi2,
+                device_id,
+                synthetic_repeat,
+            );
+            merge_dropped(
+                &mut dropped,
+                deliver_xi1_focused_key(state, &event, synthetic_repeat),
+            );
+            return dropped;
+        }
+        let focus = current_focus(state);
+        let mut dropped = if focus == ResourceId(0) {
+            Vec::new()
+        } else {
+            let target = focused_walk_target(state, focus, &event);
+            deliver_key_to_window(state, &event, target, false, false, synthetic_repeat)
+        };
+        merge_dropped(
+            &mut dropped,
+            deliver_xi1_focused_key(state, &event, synthetic_repeat),
+        );
+        return dropped;
+    }
     match key_route(state, &event) {
         // Core delivery has nowhere to go (focus on root, no grab) —
         // but the XI1 fanout routes by the extension keyboard's own
         // device focus (default PointerRoot → window under pointer),
         // so SelectExtensionEvent subscribers still receive DeviceKey
         // events.
-        KeyRoute::Drop => deliver_xi1_focused_key(state, &event),
+        KeyRoute::Drop => deliver_xi1_focused_key(state, &event, synthetic_repeat),
         KeyRoute::PassiveGrabOwner {
             owner,
             grab_window,
             freeze,
             owner_events,
+            activating,
             via_xi2,
+            device_id: grab_device_id,
         } => {
             // Synchronous passive key grab: hold the activating press
             // so AllowEvents(ReplayKeyboard) can replay it to the
             // focus window if the grab owner declines it. Mirrors the
             // sync passive-button-grab freeze in `pointer_fanout`.
             if freeze && event.pressed {
-                state
-                    .xi1_frozen
-                    .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
-                    .or_default()
-                    .stored = Some(crate::server::QueuedInputEvent::HostKey(event));
+                state.xi1_frozen.entry(device_id).or_default().stored =
+                    Some(crate::server::QueuedInputEvent::HostKeyTransition(
+                        event,
+                        master_transition_accepted,
+                        synthetic_repeat,
+                    ));
             }
             // Xorg DeliverGrabbedEvent: with owner_events, key events
             // that would naturally land on one of the grab client's
             // windows are reported there instead of the grab window.
-            let natural = if owner_events {
+            // The activating press skips the walk: ActivatePassiveGrab
+            // sends it to the grab window (GH #277).
+            let natural = if owner_events && !activating {
                 key_grabbed_natural_target(state, &event, owner)
             } else {
                 None
             };
             let mut dropped = if let Some(target) = natural {
-                deliver_key_to_grab_owner(state, &event, owner, target, via_xi2)
+                deliver_key_to_grab_owner(
+                    state,
+                    &event,
+                    owner,
+                    target,
+                    via_xi2,
+                    grab_device_id,
+                    synthetic_repeat,
+                )
             } else {
-                deliver_key_to_grab_owner(state, &event, owner, grab_window, via_xi2)
+                deliver_key_to_grab_owner(
+                    state,
+                    &event,
+                    owner,
+                    grab_window,
+                    via_xi2,
+                    grab_device_id,
+                    synthetic_repeat,
+                )
             };
             // XI1 leg runs under grabs too — the router handles its
             // own grab/freeze semantics, including the armed
             // FreezeNextEvent / FreezeBothNextEvent trip that a key
             // event delivered through the (bridged) grab must fire
             // (XTS XAllowDeviceEvents-11/-12 SyncAll re-freeze).
-            merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+            merge_dropped(
+                &mut dropped,
+                deliver_xi1_focused_key(state, &event, synthetic_repeat),
+            );
             dropped
         }
         KeyRoute::Window(window) => {
@@ -252,8 +643,18 @@ pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -
             // focus) where a client selected the event — Xorg
             // DeliverFocusedEvent's pointer-walk leg.
             let target = focused_walk_target(state, window, &event);
-            let mut dropped = deliver_key_to_window(state, &event, target);
-            merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+            let mut dropped = deliver_key_to_window(
+                state,
+                &event,
+                target,
+                master_transition_accepted,
+                master_transition_accepted,
+                synthetic_repeat,
+            );
+            merge_dropped(
+                &mut dropped,
+                deliver_xi1_focused_key(state, &event, synthetic_repeat),
+            );
             dropped
         }
     }
@@ -265,29 +666,54 @@ pub(crate) fn deliver_routed_key(state: &mut ServerState, event: HostKeyEvent) -
 /// after the grab owner declines the key. Mirrors Xorg
 /// `ComputeFreezes` → `DeliverFocusedEvent` (dix/events.c:1360).
 pub fn replay_frozen_key_to_focus(state: &mut ServerState, event: HostKeyEvent) -> Vec<ClientId> {
+    replay_frozen_key_to_focus_after_transition(state, event, true, false)
+}
+
+pub(crate) fn replay_frozen_key_to_focus_after_transition(
+    state: &mut ServerState,
+    event: HostKeyEvent,
+    master_transition_accepted: bool,
+    synthetic_repeat: bool,
+) -> Vec<ClientId> {
+    if !keyboard_origin_is_live(state, event.origin) {
+        return Vec::new();
+    }
     let focus = current_focus(state);
     if focus == ResourceId(0) {
         return Vec::new();
     }
-    let mut dropped = deliver_key_to_window(state, &event, focus);
-    merge_dropped(&mut dropped, deliver_xi1_focused_key(state, &event));
+    let mut dropped = deliver_key_to_window(
+        state,
+        &event,
+        focus,
+        master_transition_accepted,
+        master_transition_accepted,
+        synthetic_repeat,
+    );
+    merge_dropped(
+        &mut dropped,
+        deliver_xi1_focused_key(state, &event, synthetic_repeat),
+    );
     dropped
 }
 
 /// Deliver a key event to a single window's subscribers — the normal
-/// path (focus window, or an explicit-grab window). Core KeyPress/
-/// KeyRelease to `KeyPressMask`/`KeyReleaseMask` subscribers, plus a
-/// parallel XI2 device event to XI2 selectors on the same window.
+/// path (focus window, or an explicit-grab window). Core key events and
+/// parallel XI2 device events go to their respective selectors.
 fn deliver_key_to_window(
     state: &mut ServerState,
     event: &HostKeyEvent,
     target_window: ResourceId,
+    include_master_form: bool,
+    include_core_form: bool,
+    synthetic_repeat: bool,
 ) -> Vec<ClientId> {
     let mask_bit = if event.pressed {
         KEY_PRESS_MASK
     } else {
         KEY_RELEASE_MASK
     };
+    let fields = key_window_fields(state, event, target_window);
 
     // Clients that selected XI2 for this key event on the window. Computed
     // first because XI2 *shadows* core per client: a client receiving the
@@ -296,46 +722,77 @@ fn deliver_key_to_window(
     // core (XSelectInput KeyPressMask) and XI2 (XISelectEvents) — e.g.
     // Chromium's Ozone X11 layer — gets every keystroke twice.
     let xi2_evtype = xi2_evtype_for(event);
-    let xi2_targets: Vec<ClientId> = state
-        .clients
-        .iter()
-        .filter_map(|(id, client)| {
-            let mask = xi2_mask_for_client(
-                client,
-                target_window,
-                target_window,
-                &[
-                    XI2_SLAVE_KEYBOARD_DEVICE_ID,
-                    XI2_MASTER_KEYBOARD_DEVICE_ID,
-                    1,
-                    0,
-                ],
-            );
-            if mask & (1 << xi2_evtype) != 0 {
-                Some(ClientId(*id))
-            } else {
-                None
+    let forms = key_xi2_forms(state, event.origin)
+        .into_iter()
+        .filter(|(device_id, _)| include_master_form || *device_id != XI2_MASTER_KEYBOARD_DEVICE_ID)
+        .collect::<Vec<_>>();
+    let mut xi2_targets = Vec::new();
+    for (device_id, _) in &forms {
+        for (id, client) in &state.clients {
+            if key_xi2_form_selected(client, target_window, *device_id, xi2_evtype)
+                && !xi2_targets.contains(&ClientId(*id))
+            {
+                xi2_targets.push(ClientId(*id));
             }
-        })
-        .collect();
+        }
+    }
 
     // Core KeyPress/KeyRelease to KeyPressMask/KeyReleaseMask subscribers,
     // excluding any client already getting the XI2 form above.
-    let core_targets: Vec<ClientId> = subscribers_by_id(state, target_window, mask_bit)
-        .into_iter()
-        .filter(|c| !xi2_targets.contains(c))
-        .collect();
+    let core_targets: Vec<ClientId> = if include_core_form {
+        subscribers_by_id(state, target_window, mask_bit)
+            .into_iter()
+            .filter(|c| {
+                !xi2_targets.contains(c)
+                    && !(synthetic_repeat
+                        && !event.pressed
+                        && state
+                            .xkb_clients
+                            .get(&c.0)
+                            .is_some_and(|flags| flags.wants_detectable_auto_repeat()))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let mut dropped = if core_targets.is_empty() {
         Vec::new()
     } else {
         fanout_event_to_clients(state, &core_targets, |buf, seq, order| {
-            x11::encode_key_event(buf, order, key_event_wire(event, seq, target_window));
+            x11::encode_key_event(buf, order, key_event_wire(event, seq, fields));
         })
     };
 
-    if !xi2_targets.is_empty() {
-        let xi2_dropped = fanout_event_to_clients(state, &xi2_targets, |buf, seq, order| {
-            encode_key_xi2(buf, order, seq, event, target_window);
+    // Keep XI2-selected clients in `xi2_targets` above while suppressing the
+    // synthetic XI2 release here: XI2 still shadows the core form for that
+    // client, even though it receives no release form.
+    if synthetic_repeat && !event.pressed {
+        return dropped;
+    }
+
+    for (device_id, source_id) in forms {
+        let targets: Vec<ClientId> = state
+            .clients
+            .iter()
+            .filter_map(|(id, client)| {
+                key_xi2_form_selected(client, target_window, device_id, xi2_evtype)
+                    .then_some(ClientId(*id))
+            })
+            .collect();
+        if targets.is_empty() {
+            continue;
+        }
+        let xi2_dropped = fanout_event_to_clients(state, &targets, |buf, seq, order| {
+            encode_key_xi2_for_device(
+                buf,
+                order,
+                seq,
+                event,
+                fields,
+                device_id,
+                source_id,
+                synthetic_repeat,
+            );
         });
         merge_dropped(&mut dropped, xi2_dropped);
     }
@@ -371,14 +828,40 @@ fn deliver_key_to_grab_owner(
     owner: ClientId,
     grab_window: ResourceId,
     via_xi2: bool,
+    device_id: u16,
+    synthetic_repeat: bool,
 ) -> Vec<ClientId> {
+    let fields = key_window_fields(state, event, grab_window);
     if via_xi2 {
+        if synthetic_repeat && !event.pressed {
+            return Vec::new();
+        }
+        let source_id =
+            resolve_key_xi_source(state, event.origin).map_or(device_id, |source| source.sourceid);
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-            encode_key_xi2(buf, order, seq, event, grab_window);
+            encode_key_xi2_for_device(
+                buf,
+                order,
+                seq,
+                event,
+                fields,
+                device_id,
+                source_id,
+                synthetic_repeat,
+            );
         })
     } else {
+        if synthetic_repeat
+            && !event.pressed
+            && state
+                .xkb_clients
+                .get(&owner.0)
+                .is_some_and(|flags| flags.wants_detectable_auto_repeat())
+        {
+            return Vec::new();
+        }
         fanout_event_to_clients(state, &[owner], |buf, seq, order| {
-            x11::encode_key_event(buf, order, key_event_wire(event, seq, grab_window));
+            x11::encode_key_event(buf, order, key_event_wire(event, seq, fields));
         })
     }
 }
@@ -391,10 +874,84 @@ fn xi2_evtype_for(event: &HostKeyEvent) -> u16 {
     }
 }
 
+/// Device event copies follow Xorg's slave-first mieq pass. A detached
+/// keyboard has only its slave form; attached sources also get a master copy.
+fn key_xi2_forms(state: &ServerState, origin: crate::core_loop::InputOrigin) -> Vec<(u16, u16)> {
+    let Some(source) = resolve_key_xi_source(state, origin) else {
+        return Vec::new();
+    };
+    let mut forms = Vec::with_capacity(2);
+    if let Some(slave_id) = source.slave_deviceid {
+        forms.push((slave_id, slave_id));
+    }
+    if let Some(master_id) = source.attached_master {
+        forms.push((master_id, source.sourceid));
+    }
+    forms
+}
+
+fn key_xi2_form_selected(
+    client: &crate::server::ClientState,
+    window: ResourceId,
+    device_id: u16,
+    evtype: u16,
+) -> bool {
+    let devices = if device_id == XI2_MASTER_KEYBOARD_DEVICE_ID {
+        [device_id, XI2_ALL_MASTER_DEVICES, XI2_ALL_DEVICES]
+    } else {
+        [device_id, XI2_ALL_DEVICES, u16::MAX]
+    };
+    let device_count = if device_id == XI2_MASTER_KEYBOARD_DEVICE_ID {
+        3
+    } else {
+        2
+    };
+    xi2_mask_for_client(client, window, window, &devices[..device_count]) & (1 << evtype) != 0
+}
+
+/// The window-dependent fields of a key event reported on one window —
+/// Xorg `FixUpEventFromWindow` (dix/events.c).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyWindowFields {
+    window: ResourceId,
+    event_x: i16,
+    event_y: i16,
+    child: ResourceId,
+}
+
+/// Event coordinates are the root coordinates minus the window's inside
+/// origin (`pWin->drawable.x/y`). `child` is Xorg `FindChildForEvent`:
+/// the child of `window` on the path to the deepest window under the
+/// pointer, `None` when that window is `window` itself or is not inside
+/// it. During the focus walk that is the previous window on the path,
+/// which is what `DeliverDeviceEvents` passes.
+fn key_window_fields(
+    state: &ServerState,
+    event: &HostKeyEvent,
+    window: ResourceId,
+) -> KeyWindowFields {
+    let (ox, oy) = state.resources.window_absolute_position(window);
+    let relative = |root: i16, origin: i32| {
+        i16::try_from(
+            i32::from(root)
+                .saturating_sub(origin)
+                .clamp(i32::from(i16::MIN), i32::from(i16::MAX)),
+        )
+        .unwrap_or_default()
+    };
+    let sprite = deepest_window_at_pointer(state);
+    KeyWindowFields {
+        window,
+        event_x: relative(event.root_x, ox),
+        event_y: relative(event.root_y, oy),
+        child: crate::core_loop::pointer_fanout::xi2_child_toward(state, window, sprite),
+    }
+}
+
 fn key_event_wire(
     event: &HostKeyEvent,
     sequence: x11::SequenceNumber,
-    target_window: ResourceId,
+    fields: KeyWindowFields,
 ) -> x11::KeyEvent {
     x11::KeyEvent {
         pressed: event.pressed,
@@ -402,21 +959,25 @@ fn key_event_wire(
         sequence,
         time: event.time,
         root: ROOT_WINDOW,
-        event: target_window,
+        event: fields.window,
+        child: fields.child,
         root_x: event.root_x,
         root_y: event.root_y,
-        event_x: event.event_x,
-        event_y: event.event_y,
+        event_x: fields.event_x,
+        event_y: fields.event_y,
         state: event.state,
     }
 }
 
-fn encode_key_xi2(
+fn encode_key_xi2_for_device(
     buf: &mut Vec<u8>,
     order: x11::ClientByteOrder,
     seq: x11::SequenceNumber,
     event: &HostKeyEvent,
-    target_window: ResourceId,
+    fields: KeyWindowFields,
+    device_id: u16,
+    source_id: u16,
+    synthetic_repeat: bool,
 ) {
     x11::encode_xi2_device_event(
         buf,
@@ -424,19 +985,23 @@ fn encode_key_xi2(
         seq,
         XI2_MAJOR_OPCODE,
         xi2_evtype_for(event),
-        XI2_MASTER_KEYBOARD_DEVICE_ID,
+        device_id,
         event.time,
         ROOT_WINDOW,
-        target_window,
-        ResourceId(0), // child=None; key events target the window directly
+        fields.window,
+        fields.child,
         event.root_x,
         event.root_y,
-        event.event_x,
-        event.event_y,
+        fields.event_x,
+        fields.event_y,
         event.state,
         u32::from(event.keycode),
-        XI2_SLAVE_KEYBOARD_DEVICE_ID,
-        0, // flags: no XIPointerEmulated on key events
+        source_id,
+        if synthetic_repeat && event.pressed {
+            XI2_KEY_REPEAT_FLAG
+        } else {
+            0
+        },
     );
 }
 
@@ -445,6 +1010,10 @@ fn encode_key_xi2(
 /// valuators, so the keycode, direction and timestamp are all of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawKeyEvent {
+    /// Keep the producer identity with a raw event while it is queued behind
+    /// a device freeze, even when the backend's current delivery pass is
+    /// master-only.
+    pub origin: crate::core_loop::InputOrigin,
     pub keycode: u8,
     pub pressed: bool,
     /// Shared with the device event generated from the same input
@@ -477,21 +1046,21 @@ impl RawKeyEvent {
 /// auto-repeat is off globally or for the key, or the key is a modifier.
 ///
 /// Delivery mirrors Xorg's two passes through `DeliverRawEvent`
-/// (dix/events.c), slave first then master (mi/mieq.c): the slave form
-/// (deviceid = sourceid = slave keyboard) goes to root selectors of the
-/// slave keyboard / `XIAllDevices`; the master form (deviceid = master
-/// keyboard) to root selectors of the master keyboard / `XIAllMasterDevices`
-/// / `XIAllDevices`, subject to the keyboard grab. The master form is queued
-/// behind a frozen keyboard like any other master event (Xorg
-/// `EnqueueEvent`) and delivered on thaw; the slave is never frozen.
-/// Keys arrive only on the master keyboard's attached slave, so an
-/// `XIAllDevices` selector receives both forms.
+/// (dix/events.c), slave first then master (mi/mieq.c). A slave form uses
+/// that keyboard's ID for both deviceid and sourceid; its master copy uses
+/// deviceid 3 and retains the generating sourceid. Master copies go to root
+/// selectors of the master / `XIAllMasterDevices` / `XIAllDevices`, subject
+/// to the keyboard grab. The master form queues behind a frozen keyboard and
+/// revalidates the origin on thaw; floating keyboards produce no master form.
 pub fn raw_key_event_to_state(
     state: &mut ServerState,
     event: RawKeyEvent,
     key_was_down: bool,
     is_modifier: bool,
 ) -> Vec<ClientId> {
+    let Some(source) = resolve_key_xi_source(state, event.origin) else {
+        return Vec::new();
+    };
     if event.pressed
         && key_was_down
         && (is_modifier || !state.keyboard_control.key_auto_repeats(event.keycode))
@@ -503,21 +1072,30 @@ pub fn raw_key_event_to_state(
         return Vec::new();
     }
     let evtype = event.evtype();
-    let slave_targets = raw_key_root_selectors(
-        state,
-        &[XI2_SLAVE_KEYBOARD_DEVICE_ID, XI2_ALL_DEVICES],
-        evtype,
-    );
-    let mut dropped = send_raw_key(state, &slave_targets, event, XI2_SLAVE_KEYBOARD_DEVICE_ID);
-    if state
-        .xi1_frozen
-        .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
-        .is_some_and(crate::server::Xi1Freeze::frozen)
-    {
+    let mut dropped = Vec::new();
+    if let Some(slave_id) = source.slave_deviceid {
+        let slave_targets = raw_key_root_selectors(state, &[slave_id, XI2_ALL_DEVICES], evtype);
+        dropped = send_raw_key(state, &slave_targets, event, slave_id, slave_id);
+    }
+
+    let Some(master_id) = source.attached_master else {
+        return dropped;
+    };
+    let freeze_device = source.slave_deviceid.unwrap_or(master_id);
+    let frozen_device = [Some(freeze_device), Some(master_id)]
+        .into_iter()
+        .flatten()
+        .find(|device_id| {
+            state
+                .xi1_frozen
+                .get(device_id)
+                .is_some_and(crate::server::Xi1Freeze::frozen)
+        });
+    if let Some(device) = frozen_device {
         state
             .sync_pending
             .push_back(crate::server::PendingSyncEvent {
-                device: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                device,
                 event: crate::server::QueuedInputEvent::RawKey(event),
             });
     } else {
@@ -533,13 +1111,15 @@ pub fn raw_key_event_to_state(
 /// behind a frozen keyboard — the grab consulted is the one in effect when
 /// the event is finally processed, as on Xorg.
 pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent) -> Vec<ClientId> {
+    let Some(source) = resolve_key_xi_source(state, event.origin) else {
+        return Vec::new();
+    };
+    let Some(master_id) = source.attached_master else {
+        return Vec::new();
+    };
     let evtype = event.evtype();
     let bit = 1u64 << evtype;
-    let master_devices = [
-        XI2_MASTER_KEYBOARD_DEVICE_ID,
-        XI2_ALL_MASTER_DEVICES,
-        XI2_ALL_DEVICES,
-    ];
+    let master_devices = [master_id, XI2_ALL_MASTER_DEVICES, XI2_ALL_DEVICES];
     let grab = state.active_keyboard_grab;
     let mut dropped = Vec::new();
 
@@ -565,7 +1145,7 @@ pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent
         if natural || u64::from(g.xi2_mask) & bit != 0 {
             merge_dropped(
                 &mut dropped,
-                send_raw_key(state, &[g.owner], event, XI2_MASTER_KEYBOARD_DEVICE_ID),
+                send_raw_key(state, &[g.owner], event, master_id, source.sourceid),
             );
         }
     }
@@ -588,7 +1168,7 @@ pub(crate) fn deliver_raw_key_master(state: &mut ServerState, event: RawKeyEvent
         .collect();
     merge_dropped(
         &mut dropped,
-        send_raw_key(state, &targets, event, XI2_MASTER_KEYBOARD_DEVICE_ID),
+        send_raw_key(state, &targets, event, master_id, source.sourceid),
     );
     dropped
 }
@@ -606,14 +1186,15 @@ fn raw_key_root_selectors(state: &ServerState, devices: &[u16], evtype: u16) -> 
         .collect()
 }
 
-/// Write one raw key event with the given `deviceid` to each target. The
-/// source is always the slave keyboard, and keys carry no valuators — the
-/// valuator mask is two zero words (Xorg `eventToRawEvent`).
+/// Write one raw key event with the given `deviceid` and `sourceid` to each
+/// target. Keys carry no valuators; the valuator mask is two zero words
+/// (Xorg `eventToRawEvent`).
 fn send_raw_key(
     state: &mut ServerState,
     targets: &[ClientId],
     event: RawKeyEvent,
     deviceid: u16,
+    sourceid: u16,
 ) -> Vec<ClientId> {
     if targets.is_empty() {
         return Vec::new();
@@ -628,7 +1209,7 @@ fn send_raw_key(
             deviceid,
             event.time,
             u32::from(event.keycode),
-            XI2_SLAVE_KEYBOARD_DEVICE_ID,
+            sourceid,
             0,
             0,
         );
@@ -660,7 +1241,12 @@ enum KeyRoute {
         /// X11 `owner_events` — when true, try natural delivery to
         /// the grab owner first (Xorg DeliverGrabbedEvent).
         owner_events: bool,
+        /// The press that just activated a passive grab. Xorg
+        /// `ActivatePassiveGrab` reports it on the grab window with no
+        /// `owner_events` walk; only later events take the walk.
+        activating: bool,
         via_xi2: bool,
+        device_id: u16,
     },
     /// Normal delivery to a window's subscribers (focus window, or an
     /// explicit-grab window).
@@ -670,8 +1256,10 @@ enum KeyRoute {
 /// Apply X11 keyboard routing rules. May activate a passive grab or
 /// auto-release one on the matching key release.
 fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
+    let (device_id, master_id) = key_origin_device(state, event.origin);
     // Active grab in effect.
-    if let Some(g) = state.active_keyboard_grab {
+    if let Some((g, is_master_grab)) = active_keyboard_grab_for_origin(state, device_id, master_id)
+    {
         let passive = matches!(g.source, ActiveKeyboardGrabSource::PassiveKey { .. });
         // Auto-release a passive-key grab on the matching key-release
         // (the release still goes to the grab owner below).
@@ -679,18 +1267,18 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             && let ActiveKeyboardGrabSource::PassiveKey { keycode: kc } = g.source
             && kc == event.keycode
         {
-            state.active_keyboard_grab = None;
-            if let Some(freeze) = state
-                .xi1_frozen
-                .get_mut(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
-            {
+            if is_master_grab {
+                state.active_keyboard_grab = None;
+            } else {
+                state.xi2_keyboard_grabs.remove(&device_id);
+                state.reattach_xi2_slave(device_id);
+            }
+            if let Some(freeze) = state.xi1_frozen.get_mut(&device_id) {
                 freeze.stored = None;
             }
             // Release the XI1-side holds the activation placed.
             crate::core_loop::pointer_fanout::xi1_core_grab_bridge_release(
-                state,
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-                g.owner,
+                state, device_id, g.owner,
             );
             // Xorg DeactivateKeyboardGrab: DoFocusEvents(grab_window
             // → focus, NotifyUngrab).
@@ -707,7 +1295,13 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
                 grab_window: g.grab_window,
                 freeze: false,
                 owner_events: g.owner_events,
+                activating: false,
                 via_xi2: g.via_xi2,
+                device_id: if is_master_grab {
+                    XI2_MASTER_KEYBOARD_DEVICE_ID
+                } else {
+                    device_id
+                },
             };
         }
         // Explicit grab (GrabKeyboard): key events go to the grabbing
@@ -722,7 +1316,13 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             grab_window: g.grab_window,
             freeze: false,
             owner_events: g.owner_events,
+            activating: false,
             via_xi2: g.via_xi2,
+            device_id: if is_master_grab {
+                XI2_MASTER_KEYBOARD_DEVICE_ID
+            } else {
+                device_id
+            },
         };
     }
 
@@ -738,7 +1338,13 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
     };
     if event.pressed
         && let Some(grab) = state
-            .find_key_grab(grab_walk_start, event.keycode, event.state)
+            .find_key_grab(
+                grab_walk_start,
+                event.keycode,
+                event.state,
+                device_id,
+                master_id,
+            )
             .cloned()
     {
         let crate::server::KeyGrab {
@@ -749,9 +1355,10 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             owner_events,
             via_xi2,
             xi2_mask,
+            device_id: grabbed_device_id,
             ..
         } = grab;
-        state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+        let active = ActiveKeyboardGrab {
             owner,
             grab_window,
             source: ActiveKeyboardGrabSource::PassiveKey {
@@ -760,7 +1367,15 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             owner_events,
             via_xi2,
             xi2_mask,
-        });
+        };
+        let device_grab =
+            grabbed_device_id != 0 && grabbed_device_id != XI2_MASTER_KEYBOARD_DEVICE_ID;
+        if device_grab {
+            state.xi2_keyboard_grabs.insert(grabbed_device_id, active);
+            let _ = state.detach_xi2_slave(grabbed_device_id);
+        } else {
+            state.active_keyboard_grab = Some(active);
+        }
         // Xorg ActivateKeyboardGrab: DoFocusEvents(focus →
         // grab_window, NotifyGrab).
         crate::core_loop::process_request::emit_core_focus_transition(
@@ -777,7 +1392,11 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
         // this way).
         crate::core_loop::pointer_fanout::xi1_check_grab_for_syncs(
             state,
-            crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            if device_grab {
+                grabbed_device_id
+            } else {
+                crate::xinput::DEVICEID_MASTER_KEYBOARD
+            },
             owner,
             keyboard_mode == 0,
             pointer_mode == 0,
@@ -788,7 +1407,13 @@ fn key_route(state: &mut ServerState, event: &HostKeyEvent) -> KeyRoute {
             // keyboard_mode 0 == Synchronous → freeze for replay.
             freeze: keyboard_mode == 0,
             owner_events,
+            activating: true,
             via_xi2,
+            device_id: if device_grab {
+                grabbed_device_id
+            } else {
+                XI2_MASTER_KEYBOARD_DEVICE_ID
+            },
         };
     }
 
@@ -820,28 +1445,35 @@ pub(crate) fn current_focus(state: &ServerState) -> ResourceId {
 /// (`xi1_focus::key_delivery_route`, the XI1 port of Xorg
 /// `DeliverFocusedEvent`); grab/freeze handling inside
 /// `xi1_route_device_event` is unaffected by the focus.
-fn deliver_xi1_focused_key(state: &mut ServerState, event: &HostKeyEvent) -> Vec<ClientId> {
+fn deliver_xi1_focused_key(
+    state: &mut ServerState,
+    event: &HostKeyEvent,
+    synthetic_repeat: bool,
+) -> Vec<ClientId> {
+    let Some(device_id) =
+        resolve_key_xi_source(state, event.origin).and_then(|source| source.slave_deviceid)
+    else {
+        // Nested and unpublished origins have no XI1 slave form; in
+        // particular they must not be relabeled as virtual XTEST keyboard 5.
+        return Vec::new();
+    };
     let xi1_offset = if event.pressed {
         crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET
     } else {
         crate::xinput::XI_DEVICE_KEY_RELEASE_OFFSET
     };
     let evcode = crate::server::XI_FIRST_EVENT + xi1_offset;
-    let (natural, focus_route) = crate::core_loop::xi1_focus::key_delivery_route(
-        state,
-        crate::xinput::DEVICEID_SLAVE_KEYBOARD,
-    );
+    let (natural, focus_route) = crate::core_loop::xi1_focus::key_delivery_route(state, device_id);
     crate::core_loop::pointer_fanout::xi1_route_device_event(
         state,
         crate::server::Xi1QueuedEvent {
-            deviceid: crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+            deviceid: device_id,
             evcode,
             detail: event.keycode,
+            synthetic_repeat,
             time: event.time,
             root_x: event.root_x,
             root_y: event.root_y,
-            event_x: event.event_x,
-            event_y: event.event_y,
             state_mask: event.state,
             natural_target: natural,
             focus_route,
@@ -856,11 +1488,17 @@ fn deliver_xi1_focused_key(state: &mut ServerState, event: &HostKeyEvent) -> Vec
 /// window P is the focus or a descendant of it, the event window is
 /// the first window from P upward (bounded at the focus, inclusive)
 /// where any client selected the event; otherwise the focus itself.
+/// Under PointerRoot the walk is bounded at the root, not at P.
 fn focused_walk_target(state: &ServerState, focus: ResourceId, event: &HostKeyEvent) -> ResourceId {
     let mask_bit = if event.pressed {
         KEY_PRESS_MASK
     } else {
         KEY_RELEASE_MASK
+    };
+    let focus = if state.core_focus.raw == 1 {
+        ROOT_WINDOW
+    } else {
+        focus
     };
     let p = deepest_window_at_pointer(state);
     let mut chain = vec![p];
@@ -879,7 +1517,7 @@ fn focused_walk_target(state: &ServerState, focus: ResourceId, event: &HostKeyEv
         return focus;
     }
     for w in chain {
-        if !crate::core_loop::fanout::subscribers_by_id(state, w, mask_bit).is_empty() {
+        if !key_selectors(state, event, w, mask_bit).is_empty() {
             return w;
         }
         if w == focus {
@@ -887,6 +1525,32 @@ fn focused_walk_target(state: &ServerState, focus: ResourceId, event: &HostKeyEv
         }
     }
     focus
+}
+
+/// Clients that selected this key event on `window` in any form: the core
+/// mask or the XI2 mask of one of the event's device forms. Xorg
+/// `DeliverDeviceEvents` stops at the first window where
+/// `EventIsDeliverable` finds any of them (dix/events.c), so a walk that
+/// looks at the core masks alone runs past XI2-only selectors.
+fn key_selectors(
+    state: &ServerState,
+    event: &HostKeyEvent,
+    window: ResourceId,
+    mask_bit: u32,
+) -> Vec<ClientId> {
+    let mut clients = crate::core_loop::fanout::subscribers_by_id(state, window, mask_bit);
+    let evtype = xi2_evtype_for(event);
+    let forms = key_xi2_forms(state, event.origin);
+    for (id, client) in &state.clients {
+        if !clients.contains(&ClientId(*id))
+            && forms
+                .iter()
+                .any(|(device_id, _)| key_xi2_form_selected(client, window, *device_id, evtype))
+        {
+            clients.push(ClientId(*id));
+        }
+    }
+    clients
 }
 
 /// Natural-delivery probe for an `owner_events` keyboard grab — the
@@ -924,11 +1588,20 @@ fn key_grabbed_natural_target(
         cur = w.parent;
     }
     let start = if chain.contains(&focus) { p } else { focus };
+    // DeliverDeviceEvents stops at the focus; PointerRoot walks to the root.
+    let stop = if state.core_focus.raw == 1 {
+        ROOT_WINDOW
+    } else {
+        focus
+    };
     let mut cur = start;
     for _ in 0..256 {
-        let subs = crate::core_loop::fanout::subscribers_by_id(state, cur, mask_bit);
+        let subs = key_selectors(state, event, cur, mask_bit);
         if !subs.is_empty() {
             return subs.contains(&owner).then_some(cur);
+        }
+        if cur == stop {
+            return None;
         }
         let w = state.resources.window(cur)?;
         if w.parent == cur {
@@ -982,6 +1655,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -994,11 +1668,16 @@ mod tests {
                 xi1_event_classes: HashSet::new(),
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
+                outbound_fds: Default::default(),
                 watching_writable: false,
+                write_failed: false,
+                gone: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
                 fd_passing: true,
+                internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         b
@@ -1022,6 +1701,7 @@ mod tests {
 
     fn key_event(pressed: bool, keycode: u8) -> HostKeyEvent {
         HostKeyEvent {
+            origin: crate::core_loop::InputOrigin::NestedHost,
             pressed,
             keycode,
             time: 1,
@@ -1030,6 +1710,462 @@ mod tests {
             event_x: 10,
             event_y: 20,
             state: 0,
+        }
+    }
+
+    mod key_source_routing {
+        use super::*;
+        use crate::{
+            core_loop::{DeviceInfo, InputOrigin, message::LibinputConfigSnapshot},
+            xinput::{InputCapabilities, InputSourceId, XiFacetKind},
+        };
+
+        const KEY_PRESS: u32 = 1 << 2;
+        const KEY_RELEASE: u32 = 1 << 3;
+        const RAW_KEY_PRESS: u32 = 1 << 13;
+        const RAW_KEY_RELEASE: u32 = 1 << 14;
+        const ROUTED_MASK: u32 = KEY_PRESS | KEY_RELEASE | RAW_KEY_PRESS | RAW_KEY_RELEASE;
+
+        pub(super) fn keyboard_info(source_id: InputSourceId) -> DeviceInfo {
+            DeviceInfo {
+                source_id,
+                enabled: true,
+                resume_key: None,
+                capabilities: InputCapabilities {
+                    keyboard: true,
+                    pointer: false,
+                    touch: false,
+                },
+                name: format!("keyboard {}", source_id.0),
+                device_node: format!("/dev/input/event{}", source_id.0),
+                sysname: format!("event{}", source_id.0),
+                vendor_id: 0,
+                product_id: 0,
+                is_touchpad: false,
+                config: LibinputConfigSnapshot::default(),
+            }
+        }
+
+        fn capture_client(state: &mut ServerState, id: u32) -> crate::transport::CapturedPeer {
+            let (writer, peer) = crate::transport::Transport::capture_pair();
+            state.clients.insert(
+                id,
+                ClientState {
+                    admission: crate::access::Admission::Internal,
+                    writer: Arc::new(Mutex::new(writer)),
+                    byte_order: ClientByteOrder::LittleEndian,
+                    last_sequence: Arc::new(AtomicU16::new(0)),
+                    resource_id_base: 0,
+                    resource_id_mask: u32::MAX,
+                    event_masks: HashMap::new(),
+                    save_set: HashSet::new(),
+                    big_requests_enabled: false,
+                    xi2_masks: HashMap::new(),
+                    xi1_event_classes: HashSet::new(),
+                    xi1_window_event_classes: HashMap::new(),
+                    outbound: VecDeque::new(),
+                    outbound_fds: Default::default(),
+                    watching_writable: false,
+                    write_failed: false,
+                    gone: false,
+                    focused_window: ROOT_WINDOW,
+                    reader_control: None,
+                    is_local: true,
+                    fd_passing: true,
+                    internal: false,
+                    peer: crate::peer::PeerIdentity::unknown_unix(),
+                },
+            );
+            peer
+        }
+
+        fn root_selector(
+            state: &mut ServerState,
+            id: u32,
+            device: u16,
+        ) -> crate::transport::CapturedPeer {
+            let peer = capture_client(state, id);
+            let client = state.clients.get_mut(&id).unwrap();
+            client
+                .xi2_masks
+                .insert((ROOT_WINDOW, device), u64::from(ROUTED_MASK));
+            state.xi2_client_versions.insert(ClientId(id), (2, 2));
+            peer
+        }
+
+        fn capture_read_all(peer: &mut crate::transport::CapturedPeer) -> Vec<u8> {
+            use std::io::Read;
+            let mut out = Vec::new();
+            let mut buf = [0u8; 512];
+            while let Ok(n) = peer.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        }
+
+        fn xge_events(peer: &mut crate::transport::CapturedPeer) -> Vec<(u16, u16, u16, u32)> {
+            let bytes = capture_read_all(peer);
+            let read_u16 = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+            let read_u32 = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let mut events = Vec::new();
+            let mut at = 0;
+            while at + 32 <= bytes.len() {
+                if bytes[at] & 0x7f != 35 {
+                    at += 32;
+                    continue;
+                }
+                let evtype = read_u16(at + 8);
+                let source_offset = if (13..=17).contains(&evtype) { 20 } else { 52 };
+                events.push((
+                    evtype,
+                    read_u16(at + 10),
+                    read_u16(at + source_offset),
+                    read_u32(at + 16),
+                ));
+                at += 32 + 4 * read_u32(at + 4) as usize;
+            }
+            events
+        }
+
+        fn raw_event(origin: InputOrigin, pressed: bool) -> RawKeyEvent {
+            RawKeyEvent {
+                origin,
+                keycode: 38,
+                pressed,
+                time: if pressed { 17 } else { 18 },
+            }
+        }
+
+        fn key_event_from(origin: InputOrigin, pressed: bool) -> HostKeyEvent {
+            HostKeyEvent {
+                origin,
+                pressed,
+                keycode: 38,
+                time: if pressed { 17 } else { 18 },
+                root_x: 10,
+                root_y: 20,
+                event_x: 10,
+                event_y: 20,
+                state: 0,
+            }
+        }
+
+        #[test]
+        fn physical_keyboard_facets_keep_raw_and_device_source_ids() {
+            let mut state = ServerState::new();
+            let source_a = InputSourceId(0xA11);
+            let source_b = InputSourceId(0xA12);
+            let a_id = state.xi_register_source(&keyboard_info(source_a))[0];
+            let b_id = state.xi_register_source(&keyboard_info(source_b))[0];
+            assert_eq!((a_id, b_id), (6, 7));
+
+            let mut a_peer = root_selector(&mut state, 1, a_id);
+            let mut b_peer = root_selector(&mut state, 2, b_id);
+            let mut master_peer = root_selector(&mut state, 3, 3);
+            let mut all_peer = root_selector(&mut state, 4, 0);
+            state.core_focus.raw = ROOT_WINDOW.0;
+
+            let origin = InputOrigin::Physical(source_a);
+            let _ = raw_key_event_to_state(&mut state, raw_event(origin, true), false, false);
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(origin, true));
+
+            assert_eq!(
+                xge_events(&mut a_peer),
+                vec![(13, a_id, a_id, 38), (2, a_id, a_id, 38)],
+                "the source facet receives its slave raw and device forms"
+            );
+            assert!(
+                xge_events(&mut b_peer).is_empty(),
+                "another keyboard is untouched"
+            );
+            assert_eq!(
+                xge_events(&mut master_peer),
+                vec![(13, 3, a_id, 38), (2, 3, a_id, 38)],
+                "master copies name the generating keyboard facet"
+            );
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![
+                    (13, a_id, a_id, 38),
+                    (13, 3, a_id, 38),
+                    (2, a_id, a_id, 38),
+                    (2, 3, a_id, 38),
+                ],
+                "XIAllDevices sees slave form before the master copy"
+            );
+
+            let _ = raw_key_event_to_state(&mut state, raw_event(origin, false), true, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(origin, false));
+            assert_eq!(
+                xge_events(&mut a_peer),
+                vec![(14, a_id, a_id, 38), (3, a_id, a_id, 38)]
+            );
+            assert_eq!(
+                xge_events(&mut b_peer),
+                Vec::<(u16, u16, u16, u32)>::new(),
+                "unrelated keyboard remains untouched"
+            );
+            assert_eq!(
+                xge_events(&mut master_peer),
+                vec![(14, 3, a_id, 38), (3, 3, a_id, 38)]
+            );
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![
+                    (14, a_id, a_id, 38),
+                    (14, 3, a_id, 38),
+                    (3, a_id, a_id, 38),
+                    (3, 3, a_id, 38),
+                ]
+            );
+            assert!(state.keys_down.iter().all(|byte| *byte == 0));
+            assert!(state.sync_pending.is_empty());
+            assert_eq!(
+                state.xi_devices.facet(source_a, XiFacetKind::Keyboard),
+                Some(a_id)
+            );
+            assert_eq!(
+                state.xi_devices.facet(source_b, XiFacetKind::Keyboard),
+                Some(b_id)
+            );
+        }
+
+        #[test]
+        fn virtual_nested_unpublished_and_removed_keyboard_sources_route_separately() {
+            let mut state = ServerState::new();
+            // Exhaust physical XI IDs while retaining one known source with
+            // no published keyboard facet for master-only delivery.
+            for n in 1..=122 {
+                let _ = state.xi_register_source(&keyboard_info(InputSourceId(n)));
+            }
+            let unpublished = InputSourceId(123);
+            assert!(
+                state
+                    .xi_register_source(&keyboard_info(unpublished))
+                    .is_empty()
+            );
+            let removed_source = InputSourceId(124);
+            assert!(
+                state
+                    .xi_register_source(&keyboard_info(removed_source))
+                    .is_empty()
+            );
+            assert!(state.xi_unregister_source(removed_source).is_empty());
+
+            let mut all_peer = root_selector(&mut state, 1, 0);
+            state.core_focus.raw = ROOT_WINDOW.0;
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+
+            let xtest = InputOrigin::XTest(5);
+            let _ = raw_key_event_to_state(&mut state, raw_event(xtest, true), false, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(xtest, true));
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(13, 5, 5, 38), (13, 3, 5, 38), (2, 5, 5, 38), (2, 3, 5, 38),],
+                "XTEST keeps its explicit virtual keyboard identity"
+            );
+            let _ = raw_key_event_to_state(&mut state, raw_event(xtest, false), true, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(xtest, false));
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(14, 5, 5, 38), (14, 3, 5, 38), (3, 5, 5, 38), (3, 3, 5, 38)]
+            );
+
+            let nested = InputOrigin::NestedHost;
+            let _ = raw_key_event_to_state(&mut state, raw_event(nested, true), false, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(nested, true));
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(13, 3, 3, 38), (2, 3, 3, 38)],
+                "nested input is master-only and is not attributed to XTEST"
+            );
+            let _ = raw_key_event_to_state(&mut state, raw_event(nested, false), true, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(nested, false));
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(14, 3, 3, 38), (3, 3, 3, 38)]
+            );
+
+            let unpublished_origin = InputOrigin::Physical(unpublished);
+            let _ = raw_key_event_to_state(
+                &mut state,
+                raw_event(unpublished_origin, true),
+                false,
+                false,
+            );
+            let _ = key_event_fanout_to_state(
+                &mut state,
+                &mut backend,
+                key_event_from(unpublished_origin, true),
+            );
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(13, 3, 3, 38), (2, 3, 3, 38)],
+                "unpublished known sources retain only master forms"
+            );
+            let _ = raw_key_event_to_state(
+                &mut state,
+                raw_event(unpublished_origin, false),
+                true,
+                false,
+            );
+            let _ = key_event_fanout_to_state(
+                &mut state,
+                &mut backend,
+                key_event_from(unpublished_origin, false),
+            );
+            assert_eq!(
+                xge_events(&mut all_peer),
+                vec![(14, 3, 3, 38), (3, 3, 3, 38)]
+            );
+            assert!(state.xi_unregister_source(unpublished).is_empty());
+
+            let removed = InputOrigin::Physical(removed_source);
+            let _ = raw_key_event_to_state(&mut state, raw_event(removed, true), false, false);
+            let _ =
+                key_event_fanout_to_state(&mut state, &mut backend, key_event_from(removed, true));
+            assert!(
+                xge_events(&mut all_peer).is_empty(),
+                "removed source events are dropped rather than relabeled"
+            );
+            assert!(state.keys_down.iter().all(|byte| *byte == 0));
+            assert!(state.sync_pending.is_empty());
+            assert!(state.xi_devices.source(unpublished).is_none());
+            assert!(
+                state
+                    .xi_devices
+                    .facet(unpublished, XiFacetKind::Keyboard)
+                    .is_none()
+            );
+            assert!(state.xi_devices.source(removed_source).is_none());
+            assert_eq!(state.xi_devices.devices().len(), 126);
+        }
+
+        #[test]
+        fn xi_slave_switch_keyboards_alternate_before_master_key_and_keep_same_source_quiet() {
+            const DEVICE_CHANGED: u64 = 1 << 1;
+            let mut state = ServerState::new();
+            let razer = InputSourceId(0xA61);
+            let hyperx = InputSourceId(0xA62);
+            let razer_id = state.xi_register_source(&keyboard_info(razer))[0];
+            let hyperx_id = state.xi_register_source(&keyboard_info(hyperx))[0];
+            state.xi_devices.device_mut(razer_id).unwrap().name = "Razer keyboard".to_owned();
+            state.xi_devices.device_mut(hyperx_id).unwrap().name = "HyperX keyboard".to_owned();
+            assert_eq!((razer_id, hyperx_id), (6, 7));
+
+            let mut peer = root_selector(&mut state, 61, 3);
+            state
+                .clients
+                .get_mut(&61)
+                .unwrap()
+                .xi2_masks
+                .insert((ROOT_WINDOW, 3), u64::from(ROUTED_MASK) | DEVICE_CHANGED);
+            let mut backend = crate::backend::recording::RecordingBackend::new();
+
+            let parse = |bytes: &[u8]| {
+                let mut events = Vec::new();
+                let mut offset = 0;
+                while offset + 32 <= bytes.len() {
+                    let event_type = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+                    let device_id = u16::from_le_bytes([bytes[offset + 10], bytes[offset + 11]]);
+                    let source_offset = if event_type == 1 { 18 } else { 52 };
+                    let source_id = u16::from_le_bytes([
+                        bytes[offset + source_offset],
+                        bytes[offset + source_offset + 1],
+                    ]);
+                    if event_type == 1 {
+                        let num_classes =
+                            u16::from_le_bytes([bytes[offset + 16], bytes[offset + 17]]);
+                        assert_eq!(num_classes, 1, "keyboard switch carries KeyClass");
+                        assert_eq!(
+                            u16::from_le_bytes([bytes[offset + 32], bytes[offset + 33]]),
+                            0,
+                            "class is KeyClass"
+                        );
+                        assert_eq!(
+                            u16::from_le_bytes([bytes[offset + 36], bytes[offset + 37]]),
+                            source_id,
+                            "KeyClass belongs to the new keyboard source"
+                        );
+                        assert_eq!(bytes[offset + 20], 1, "XI2.h XISlaveSwitch");
+                    }
+                    events.push((event_type, device_id, source_id));
+                    let units =
+                        u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+                    offset += 32 + units as usize * 4;
+                }
+                assert_eq!(offset, bytes.len(), "complete XI2 event stream");
+                events
+            };
+
+            let input = |source, keycode, pressed| {
+                let mut event = key_event_from(InputOrigin::Physical(source), pressed);
+                event.keycode = keycode;
+                event
+            };
+            let send = |state: &mut ServerState,
+                        backend: &mut crate::backend::recording::RecordingBackend,
+                        peer: &mut crate::transport::CapturedPeer,
+                        source,
+                        keycode,
+                        pressed| {
+                let _dropped =
+                    key_event_fanout_to_state(state, backend, input(source, keycode, pressed));
+                parse(&capture_read_all(peer))
+            };
+
+            assert_eq!(
+                send(&mut state, &mut backend, &mut peer, razer, 38, true),
+                vec![(1, 3, razer_id), (2, 3, razer_id)]
+            );
+            assert_eq!(
+                send(&mut state, &mut backend, &mut peer, razer, 39, true),
+                vec![(2, 3, razer_id)],
+                "continuing on the same keyboard emits no switch"
+            );
+            assert_eq!(
+                send(&mut state, &mut backend, &mut peer, hyperx, 40, true),
+                vec![(1, 3, hyperx_id), (2, 3, hyperx_id)]
+            );
+            assert_eq!(
+                send(&mut state, &mut backend, &mut peer, hyperx, 41, true),
+                vec![(2, 3, hyperx_id)],
+                "continuing on HyperX emits no switch"
+            );
+
+            for (source, keycode) in [(razer, 38), (razer, 39), (hyperx, 40), (hyperx, 41)] {
+                let _ = send(&mut state, &mut backend, &mut peer, source, keycode, false);
+            }
+            assert_eq!(state.xi_last_slave(3), Some(hyperx_id));
+            assert!(state.keys_down.iter().all(|byte| *byte == 0));
+            assert!(
+                state
+                    .key_down_by_device
+                    .values()
+                    .all(std::collections::HashMap::is_empty)
+            );
+            assert!(state.sync_pending.is_empty());
+            assert_eq!(state.xi_devices.devices().len(), 6);
+            assert!(state.xi_devices.device(razer_id).unwrap().enabled);
+            assert!(state.xi_devices.device(hyperx_id).unwrap().enabled);
+            assert_eq!(
+                state.xi_devices.source(razer).unwrap().name,
+                "keyboard 2657"
+            );
+            assert_eq!(
+                state.xi_devices.source(hyperx).unwrap().name,
+                "keyboard 2658"
+            );
         }
     }
 
@@ -1045,6 +2181,7 @@ mod tests {
     ) -> UnixStream {
         let (server_side, peer) = UnixStream::pair().unwrap();
         let client = ClientState {
+            admission: crate::access::Admission::Internal,
             writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(server_side))),
             byte_order: ClientByteOrder::LittleEndian,
             last_sequence: Arc::new(AtomicU16::new(0)),
@@ -1057,11 +2194,16 @@ mod tests {
             xi1_event_classes: HashSet::new(),
             xi1_window_event_classes: HashMap::new(),
             outbound: VecDeque::new(),
+            outbound_fds: Default::default(),
             watching_writable: false,
+            write_failed: false,
+            gone: false,
             focused_window: ROOT_WINDOW,
             reader_control: None,
             is_local: true,
             fd_passing: true,
+            internal: false,
+            peer: crate::peer::PeerIdentity::unknown_unix(),
         };
         state.clients.insert(id, client);
         peer
@@ -1078,6 +2220,29 @@ mod tests {
     /// selection, only the grab), and freezes the event for replay.
     /// This is the dead-`p`-in-wezterm fix: previously the press was
     /// delivered via window selection on the grab window, so a grab
+    /// Key family: a focus-window key subscriber over `OUTBOUND_CAP` is
+    /// flagged for the core loop to disconnect, and the reading subscriber
+    /// still gets the press.
+    #[test]
+    fn overflowing_key_subscriber_is_flagged_for_disconnect() {
+        const WIN: u32 = 0x0020_0001;
+        let mut state = ServerState::new();
+        let _slow = install_kf(&mut state, 8, ResourceId(WIN), KEY_PRESS_MASK, 0);
+        let mut fast = install_kf(&mut state, 9, ResourceId(WIN), KEY_PRESS_MASK, 0);
+        let mut backend = crate::backend::recording::RecordingBackend::default();
+        state.core_focus.raw = WIN;
+        crate::core_loop::client_io::saturate_for_test(state.clients.get_mut(&8).unwrap());
+        let _ = key_event_fanout_to_state(&mut state, &mut backend, key_event(true, 38));
+        assert_eq!(
+            crate::core_loop::client_io::failed_writers(&state.clients),
+            [ClientId(8)]
+        );
+        fast.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 64];
+        assert!(fast.read(&mut buf).unwrap_or(0) >= 32);
+        assert_eq!(buf[0] & 0x7f, 2, "KeyPress");
+    }
+
     /// Regression: an unmodified keypress (cooked `state == 0`) must
     /// be delivered with `state == 0` — the fanout must NOT OR in any
     /// server-tracked modifier state. Pre-fix, a stale modifier
@@ -1123,6 +2288,7 @@ mod tests {
         let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
         let mut backend = crate::backend::recording::RecordingBackend::default();
         state.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner: ClientId(7),
             grab_window: ROOT_WINDOW,
             keycode: 33,
@@ -1150,7 +2316,7 @@ mod tests {
         assert!(
             state
                 .xi1_frozen
-                .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .get(&crate::xinput::DEVICEID_MASTER_KEYBOARD)
                 .and_then(|f| f.stored.as_ref())
                 .is_some(),
             "synchronous grab must freeze the press for replay"
@@ -1189,6 +2355,7 @@ mod tests {
         let _owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
         let mut backend = crate::backend::recording::RecordingBackend::default();
         state.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner: ClientId(7),
             grab_window: ROOT_WINDOW,
             keycode: 33,
@@ -1204,7 +2371,7 @@ mod tests {
         assert!(
             state
                 .xi1_frozen
-                .get(&crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .get(&crate::xinput::DEVICEID_XTEST_KEYBOARD)
                 .and_then(|f| f.stored.as_ref())
                 .is_none(),
             "async grab must not freeze"
@@ -1236,7 +2403,7 @@ mod tests {
         );
         assert_eq!(bytes[1], 2, "xkbType = XkbStateNotify");
         assert_eq!(bytes[9], 0x40, "mods @9 = effective Mod4");
-        assert_eq!(state.last_xkb_mods, 0x40);
+        assert_eq!(state.xkb_announced.1.0, 0x40);
 
         // Modifier released → effective mods 0. The CLEAR must be announced
         // (this is what unsticks a seeded modifier in kitty).
@@ -1250,7 +2417,7 @@ mod tests {
         );
         assert_eq!(bytes2[1], 2, "xkbType = XkbStateNotify");
         assert_eq!(bytes2[9], 0x00, "mods @9 cleared to 0 on modifier release");
-        assert_eq!(state.last_xkb_mods, 0);
+        assert_eq!(state.xkb_announced.1.0, 0);
     }
 
     #[test]
@@ -1271,6 +2438,7 @@ mod tests {
         let grab_owner = ClientId(7);
         let mut backend = crate::backend::recording::RecordingBackend::default();
         state.key_grabs.push(KeyGrab {
+            device_id: 0,
             owner: grab_owner,
             grab_window: ROOT_WINDOW,
             keycode: 38,
@@ -1653,6 +2821,9 @@ mod tests {
 
         fn raw(keycode: u8, pressed: bool, time: u32) -> RawKeyEvent {
             RawKeyEvent {
+                // These Xvfb captures are driven through XTEST; keep the
+                // virtual keyboard's explicit source identity in the fixture.
+                origin: crate::core_loop::InputOrigin::XTest(5),
                 keycode,
                 pressed,
                 time,
@@ -1894,7 +3065,7 @@ mod tests {
             state.active_keyboard_grab = Some(keyboard_grab(1, ROOT_WINDOW, false, false, 0));
             state
                 .xi1_frozen
-                .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .entry(crate::xinput::DEVICEID_XTEST_KEYBOARD)
                 .or_default()
                 .state = crate::server::Xi1SyncState::FrozenNoEvent;
 
@@ -1918,7 +3089,7 @@ mod tests {
                 &mut state,
                 &mut backend,
                 &HostXidMap::new(),
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
             );
 
             let master = vec![
@@ -1948,7 +3119,7 @@ mod tests {
             });
             state
                 .xi1_frozen
-                .entry(crate::xinput::DEVICEID_SLAVE_KEYBOARD)
+                .entry(crate::xinput::DEVICEID_XTEST_KEYBOARD)
                 .or_default()
                 .state = crate::server::Xi1SyncState::FrozenWithEvent;
             let _ = raw_key_event_to_state(&mut state, raw(38, false, 101), true, false);
@@ -1959,7 +3130,7 @@ mod tests {
                 &mut state,
                 &mut backend,
                 &HostXidMap::new(),
-                crate::xinput::DEVICEID_SLAVE_KEYBOARD,
+                crate::xinput::DEVICEID_XTEST_KEYBOARD,
             );
 
             assert_eq!(
@@ -1981,6 +3152,570 @@ mod tests {
             let _ = replay_frozen_key_to_focus(&mut state, key_event(true, 38));
 
             assert!(raw_events(&mut m22).is_empty());
+        }
+    }
+
+    /// Event-window fields of key events — Xorg `FixUpEventFromWindow`,
+    /// `DeliverFocusedEvent`, `DeliverDeviceEvents`, `FindChildForEvent`
+    /// (dix/events.c). Tree (root coordinates of each INSIDE origin =
+    /// parent inside origin + x + border_width):
+    ///
+    /// - `FRAME` child of root at (100, 50), border 2 → inside (102, 52)
+    /// - `XEV` child of `FRAME` at (5, 20), border 1 → inside (108, 73)
+    /// - `INNER` child of `XEV` at (10, 10), border 4 → inside (122, 87);
+    ///   outer box in root coordinates x 118..176, y 83..141
+    ///
+    /// The pointer at root (130, 100) is inside `INNER`, so the sprite
+    /// window is `INNER`.
+    mod event_window_fields {
+        use super::*;
+        use yserver_protocol::x11::CreateWindowRequest;
+
+        const FRAME: ResourceId = ResourceId(0x0040_0001);
+        const XEV: ResourceId = ResourceId(0x0020_0001);
+        const INNER: ResourceId = ResourceId(0x0020_0002);
+        const IN_INNER: (i16, i16) = (130, 100);
+        /// Outside `FRAME` (outer x 100..404, y 50..354).
+        const OUTSIDE: (i16, i16) = (450, 380);
+        const XI2_KEY_PRESS_BIT: u64 = 1 << 2;
+
+        pub(super) fn window(
+            state: &mut ServerState,
+            id: ResourceId,
+            parent: ResourceId,
+            geom: (i16, i16, u16, u16, u16),
+        ) {
+            let (x, y, width, height, border_width) = geom;
+            state.resources.create_window(
+                ClientId(1),
+                CreateWindowRequest {
+                    depth: 24,
+                    window: id,
+                    parent,
+                    x,
+                    y,
+                    width,
+                    height,
+                    border_width,
+                    class: 1,
+                    visual: crate::resources::ROOT_VISUAL,
+                    ..Default::default()
+                },
+            );
+            let _ = state.resources.map_window(id);
+        }
+
+        fn tree(pointer: (i16, i16)) -> ServerState {
+            let mut state = ServerState::new();
+            window(&mut state, FRAME, ROOT_WINDOW, (100, 50, 300, 300, 2));
+            window(&mut state, XEV, FRAME, (5, 20, 250, 250, 1));
+            window(&mut state, INNER, XEV, (10, 10, 50, 50, 4));
+            state.pointer_root = pointer;
+            state
+        }
+
+        fn press_at(pointer: (i16, i16)) -> HostKeyEvent {
+            HostKeyEvent {
+                root_x: pointer.0,
+                root_y: pointer.1,
+                // Producers fill these with garbage-in-practice; the
+                // fanout must not copy them.
+                event_x: pointer.0,
+                event_y: pointer.1,
+                ..key_event(true, 38)
+            }
+        }
+
+        fn deliver(state: &mut ServerState, pointer: (i16, i16)) {
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let _ = key_event_fanout_to_state(state, &mut backend, press_at(pointer));
+        }
+
+        fn read_all(peer: &mut UnixStream) -> Vec<u8> {
+            read_all_available(peer)
+        }
+
+        /// (event, child, root_x, root_y, event_x, event_y) of the one core
+        /// KeyPress the peer received.
+        fn core_fields(peer: &mut UnixStream) -> (u32, u32, i16, i16, i16, i16) {
+            let b = read_all(peer);
+            assert_eq!(b.len(), 32, "exactly one core event: {b:?}");
+            assert_eq!(b[0], 2, "KeyPress");
+            let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            let i16_at = |at: usize| i16::from_le_bytes([b[at], b[at + 1]]);
+            (
+                u32_at(12),
+                u32_at(16),
+                i16_at(20),
+                i16_at(22),
+                i16_at(24),
+                i16_at(26),
+            )
+        }
+
+        /// Focus PointerRoot, sprite in the non-selecting `INNER`: the walk
+        /// propagates to `XEV` (`DeliverDeviceEvents` with no stopAt), and
+        /// the child is the previous window on the path.
+        /// event = (130 - 108, 100 - 73) = (22, 27), child = `INNER`.
+        #[test]
+        fn pointer_root_focus_propagates_to_selecting_ancestor() {
+            let mut state = tree(IN_INNER);
+            let mut xev = install_kf(&mut state, 9, XEV, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = 1;
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut xev), (XEV.0, INNER.0, 130, 100, 22, 27));
+        }
+
+        /// Focus explicitly `XEV`, sprite in `INNER`: `XEV` is an ancestor of
+        /// the sprite, so the walk runs from `INNER` up to the focus.
+        /// event = (130 - 108, 100 - 73) = (22, 27), child = `INNER`.
+        #[test]
+        fn window_focus_propagates_from_sprite_in_child() {
+            let mut state = tree(IN_INNER);
+            let mut xev = install_kf(&mut state, 9, XEV, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = XEV.0;
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut xev), (XEV.0, INNER.0, 130, 100, 22, 27));
+        }
+
+        /// The walk under PointerRoot reaches two levels up: only `FRAME`
+        /// selects. event = (130 - 102, 100 - 52) = (28, 48), child = `XEV`.
+        #[test]
+        fn pointer_root_focus_propagates_two_levels() {
+            let mut state = tree(IN_INNER);
+            let mut frame = install_kf(&mut state, 9, FRAME, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = 1;
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut frame), (FRAME.0, XEV.0, 130, 100, 28, 48));
+        }
+
+        /// Sprite outside the focus subtree: delivered to the focus itself,
+        /// `FixUpEventFromWindow(focus, None)`.
+        /// event = (450 - 108, 380 - 73) = (342, 307), child = None.
+        #[test]
+        fn sprite_outside_focus_reports_relative_to_focus_without_child() {
+            let mut state = tree(OUTSIDE);
+            let mut xev = install_kf(&mut state, 9, XEV, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = XEV.0;
+            deliver(&mut state, OUTSIDE);
+            assert_eq!(core_fields(&mut xev), (XEV.0, 0, 450, 380, 342, 307));
+        }
+
+        /// Sprite window is the event window: child None, coordinates
+        /// relative to `INNER`'s inside origin: (130 - 122, 100 - 87) = (8, 13).
+        #[test]
+        fn sprite_window_itself_has_no_child() {
+            let mut state = tree(IN_INNER);
+            let mut inner = install_kf(&mut state, 9, INNER, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = 1;
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut inner), (INNER.0, 0, 130, 100, 8, 13));
+        }
+
+        fn explicit_grab(
+            state: &mut ServerState,
+            owner: u32,
+            window: ResourceId,
+            owner_events: bool,
+        ) {
+            state.active_keyboard_grab = Some(ActiveKeyboardGrab {
+                owner: ClientId(owner),
+                grab_window: window,
+                source: ActiveKeyboardGrabSource::Explicit,
+                owner_events,
+                via_xi2: false,
+                xi2_mask: 0,
+            });
+        }
+
+        /// Grabbed delivery: `FixUpEventFromWindow(grab->window, None, TRUE)`
+        /// → child = `FindChildForEvent`: from `INNER` up, the window whose
+        /// parent is `FRAME` is `XEV`. event = (28, 48).
+        #[test]
+        fn grab_reports_relative_to_grab_window_with_found_child() {
+            let mut state = tree(IN_INNER);
+            let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, FRAME, false);
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut owner), (FRAME.0, XEV.0, 130, 100, 28, 48));
+        }
+
+        /// Grab on the root: event = root coordinates, child = `FRAME`.
+        #[test]
+        fn root_grab_child_is_top_level_on_sprite_path() {
+            let mut state = tree(IN_INNER);
+            let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, ROOT_WINDOW, false);
+            deliver(&mut state, IN_INNER);
+            assert_eq!(
+                core_fields(&mut owner),
+                (ROOT_WINDOW.0, FRAME.0, 130, 100, 130, 100)
+            );
+        }
+
+        /// Grab window not on the sprite path: `FindChildForEvent` walks to
+        /// the root without meeting it → child None.
+        /// event = (450 - 102, 380 - 52) = (348, 328).
+        #[test]
+        fn grab_window_off_sprite_path_has_no_child() {
+            let mut state = tree(OUTSIDE);
+            let mut owner = install_kf(&mut state, 7, ROOT_WINDOW, 0, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, FRAME, false);
+            deliver(&mut state, OUTSIDE);
+            assert_eq!(core_fields(&mut owner), (FRAME.0, 0, 450, 380, 348, 328));
+        }
+
+        /// owner_events grab: `DeliverGrabbedEvent` runs
+        /// `DeliverDeviceEvents(sprite, stopAt = focus)`. Nobody selects on
+        /// `INNER` or the focus `XEV`, so the walk stops at `XEV` without
+        /// reaching the owner's selection on `FRAME`, and the event goes to
+        /// the grab window (root): event = (130, 100), child = `FRAME`.
+        #[test]
+        fn owner_events_grab_walk_stops_at_focus() {
+            let mut state = tree(IN_INNER);
+            let mut owner = install_kf(&mut state, 7, FRAME, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, ROOT_WINDOW, true);
+            deliver(&mut state, IN_INNER);
+            assert_eq!(
+                core_fields(&mut owner),
+                (ROOT_WINDOW.0, FRAME.0, 130, 100, 130, 100)
+            );
+        }
+
+        /// owner_events grab whose owner selects on the focus: natural
+        /// delivery on `XEV` from the walk, child `INNER`, event (22, 27).
+        #[test]
+        fn owner_events_grab_natural_delivery_carries_walk_child() {
+            let mut state = tree(IN_INNER);
+            let mut owner = install_kf(&mut state, 7, XEV, KEY_PRESS_MASK, 0);
+            state.core_focus.raw = XEV.0;
+            explicit_grab(&mut state, 7, ROOT_WINDOW, true);
+            deliver(&mut state, IN_INNER);
+            assert_eq!(core_fields(&mut owner), (XEV.0, INNER.0, 130, 100, 22, 27));
+        }
+
+        /// XI2 `XI_KeyPress` on the focus `XEV`, sprite in `INNER`:
+        /// `FixUpXI2DeviceEventFromWindow` in FP16.16 — root (130, 100),
+        /// event (22, 27), child `INNER`.
+        #[test]
+        fn xi2_key_event_fields_are_window_relative() {
+            let mut state = tree(IN_INNER);
+            let mut xev = install_kf(&mut state, 9, XEV, KEY_PRESS_MASK, XI2_KEY_PRESS_BIT);
+            state.core_focus.raw = XEV.0;
+            deliver(&mut state, IN_INNER);
+            let b = read_all(&mut xev);
+            assert_eq!(b[0], 35, "GenericEvent (XI2 shadows core): {b:?}");
+            let u16_at = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+            let u32_at = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            let i32_at = |at: usize| i32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+            assert_eq!(u16_at(8), XI2_KEYPRESS_EVTYPE);
+            assert_eq!(
+                (u32_at(20), u32_at(24), u32_at(28)),
+                (ROOT_WINDOW.0, XEV.0, INNER.0)
+            );
+            assert_eq!(
+                (i32_at(32), i32_at(36), i32_at(40), i32_at(44)),
+                (130 << 16, 100 << 16, 22 << 16, 27 << 16)
+            );
+        }
+
+        /// XI1 `DeviceKeyPress` from a physical keyboard slave, device focus
+        /// PointerRoot (the default), selected on `XEV`: the XI1 walk from
+        /// the sprite reaches `XEV`; `FixUpEventFromWindow` fills the same
+        /// fields as the core form — child `INNER`, event (22, 27).
+        #[test]
+        fn xi1_device_key_event_fields_are_window_relative() {
+            use crate::{core_loop::InputOrigin, xinput::InputSourceId};
+            let mut state = tree(IN_INNER);
+            let source = InputSourceId(0xA11);
+            let device =
+                state.xi_register_source(&super::key_source_routing::keyboard_info(source))[0];
+            let evcode = crate::server::XI_FIRST_EVENT + crate::xinput::XI_DEVICE_KEY_PRESS_OFFSET;
+            let mut xev = install_kf(&mut state, 9, XEV, 0, 0);
+            state
+                .clients
+                .get_mut(&9)
+                .unwrap()
+                .xi1_window_event_classes
+                .insert(
+                    XEV,
+                    HashSet::from([(u32::from(device) << 8) | u32::from(evcode)]),
+                );
+            state.core_focus.raw = 1;
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let event = HostKeyEvent {
+                origin: InputOrigin::Physical(source),
+                ..press_at(IN_INNER)
+            };
+            let _ = key_event_fanout_to_state(&mut state, &mut backend, event);
+            let b = read_all(&mut xev);
+            let ev = b
+                .chunks(32)
+                .find(|e| e[0] == evcode)
+                .unwrap_or_else(|| panic!("no DeviceKeyPress in {b:?}"));
+            let u32_at = |at: usize| u32::from_le_bytes(ev[at..at + 4].try_into().unwrap());
+            let i16_at = |at: usize| i16::from_le_bytes([ev[at], ev[at + 1]]);
+            assert_eq!(
+                (
+                    u32_at(12),
+                    u32_at(16),
+                    i16_at(20),
+                    i16_at(22),
+                    i16_at(24),
+                    i16_at(26)
+                ),
+                (XEV.0, INNER.0, 130, 100, 22, 27)
+            );
+            assert_eq!(ev[31], u8::try_from(device).unwrap());
+        }
+    }
+
+    /// GH #277: where a passive key grab's ACTIVATING event is reported.
+    /// Xorg `ActivatePassiveGrab` (dix/events.c) delivers it straight to
+    /// the grab owner with `FixUpEventFromWindow(grab->window, …)` — no
+    /// `owner_events` walk; only later events go through
+    /// `DeliverGrabbedEvent`'s walk. Expected values are the Xorg run of
+    /// `tools/vng-scenarios/key-grab-activation` (probe variants V1–V6).
+    ///
+    /// Tree: `T` (100,100 400x300) on the root, its child `B` (0,250
+    /// 400x50), `W2` (600,100 100x100). The pointer at root (300,375) is
+    /// over `B`. Client 7 grabs Mod4+`KEY_2` on the root, owner_events=1.
+    mod passive_grab_activation {
+        use super::{event_window_fields::window, *};
+
+        const T: ResourceId = ResourceId(0x0020_0001);
+        const B: ResourceId = ResourceId(0x0020_0002);
+        const W2: ResourceId = ResourceId(0x0020_0003);
+        const OVER_B: (i16, i16) = (300, 375);
+        const MOD4: u16 = 0x40;
+        const KEY_2: u8 = 11;
+        const KEY_3: u8 = 12;
+        const OWNER: u32 = 7;
+        const OTHER: u32 = 8;
+
+        /// Build the probe tree with the grab installed; `B` is selected by
+        /// `OTHER` when `other_owns_b`, else by the grab owner.
+        fn setup(focus: u32, other_owns_b: bool) -> (ServerState, UnixStream, UnixStream) {
+            let mut state = ServerState::new();
+            window(&mut state, T, ROOT_WINDOW, (100, 100, 400, 300, 0));
+            window(&mut state, B, T, (0, 250, 400, 50, 0));
+            window(&mut state, W2, ROOT_WINDOW, (600, 100, 100, 100, 0));
+            state.pointer_root = OVER_B;
+            let keys = KEY_PRESS_MASK | KEY_RELEASE_MASK;
+            let owner = install_kf(&mut state, OWNER, ROOT_WINDOW, keys, 0);
+            let other = install_kf(&mut state, OTHER, B, if other_owns_b { keys } else { 0 }, 0);
+            let masks = &mut state.clients.get_mut(&OWNER).unwrap().event_masks;
+            masks.insert(T, keys);
+            masks.insert(W2, keys);
+            if !other_owns_b {
+                masks.insert(B, keys);
+            }
+            state.core_focus.raw = focus;
+            state.key_grabs.push(KeyGrab {
+                device_id: 0,
+                owner: ClientId(OWNER),
+                grab_window: ROOT_WINDOW,
+                keycode: KEY_2,
+                modifiers: MOD4,
+                owner_events: true,
+                pointer_mode: 1,
+                keyboard_mode: 1,
+                via_xi2: false,
+                xi2_mask: 0,
+            });
+            (state, owner, other)
+        }
+
+        fn press(state: &mut ServerState, keycode: u8) {
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let event = HostKeyEvent {
+                root_x: OVER_B.0,
+                root_y: OVER_B.1,
+                state: MOD4,
+                ..key_event(true, keycode)
+            };
+            let _ = key_event_fanout_to_state(state, &mut backend, event);
+        }
+
+        /// (event, child, event_x, event_y) of every core KeyPress received.
+        fn presses(peer: &mut UnixStream) -> Vec<(u32, u32, i16, i16)> {
+            read_all_available(peer)
+                .chunks(32)
+                .filter(|e| e[0] & 0x7f == 2)
+                .map(|e| {
+                    let u32_at = |at: usize| u32::from_le_bytes(e[at..at + 4].try_into().unwrap());
+                    let i16_at = |at: usize| i16::from_le_bytes([e[at], e[at + 1]]);
+                    (u32_at(12), u32_at(16), i16_at(24), i16_at(26))
+                })
+                .collect()
+        }
+
+        /// The activating press as Xorg reports it: event = root,
+        /// child = `T`, root coordinates.
+        const ACTIVATING: (u32, u32, i16, i16) = (ROOT_WINDOW.0, T.0, 300, 375);
+
+        /// Run activate (`KEY_2`) then a second press (`KEY_3`) under the
+        /// active grab; return what the owner got for each.
+        fn run(state: &mut ServerState, owner: &mut UnixStream) -> Vec<(u32, u32, i16, i16)> {
+            press(state, KEY_2);
+            let mut got = presses(owner);
+            assert!(
+                state.active_keyboard_grab.is_some(),
+                "the press must activate the grab"
+            );
+            press(state, KEY_3);
+            got.extend(presses(owner));
+            got
+        }
+
+        /// V1: PointerRoot. Activation on the grab window; the next press
+        /// takes the owner_events walk to `B`.
+        #[test]
+        fn v1_pointer_root_activation_reports_on_grab_window() {
+            let (mut state, mut owner, _) = setup(1, false);
+            assert_eq!(run(&mut state, &mut owner), [ACTIVATING, (B.0, 0, 200, 25)]);
+        }
+
+        /// V3: focus `T`, same deliveries as V1.
+        #[test]
+        fn v3_focus_t_activation_reports_on_grab_window() {
+            let (mut state, mut owner, _) = setup(T.0, false);
+            assert_eq!(run(&mut state, &mut owner), [ACTIVATING, (B.0, 0, 200, 25)]);
+        }
+
+        /// V4: focus `W2` (sprite outside it). Activation on the root; the
+        /// next press walks from the focus and lands on `W2`.
+        #[test]
+        fn v4_focus_w2_activation_reports_on_grab_window() {
+            let (mut state, mut owner, _) = setup(W2.0, false);
+            assert_eq!(
+                run(&mut state, &mut owner),
+                [ACTIVATING, (W2.0, 0, -300, 275)]
+            );
+        }
+
+        /// V6: `B` selected only by another client. The walk's first
+        /// selecting window is not the owner's, so the next press also
+        /// falls back to the grab window; the other client gets nothing.
+        #[test]
+        fn v6_other_client_on_b_gets_nothing() {
+            let (mut state, mut owner, mut other) = setup(1, true);
+            assert_eq!(run(&mut state, &mut owner), [ACTIVATING, ACTIVATING]);
+            assert_eq!(presses(&mut other), []);
+        }
+
+        /// XI2 variants V7/V8: the owner selects `XI_KeyPress` /
+        /// `XI_KeyRelease` (XIAllMasterDevices) on root, `T`, `B` and `W2`,
+        /// no core masks, and holds an XI2 passive grab. Xorg
+        /// `DeliverDeviceEvents` stops at the first window where any form
+        /// is deliverable (`EventIsDeliverable` checks the XI2 masks), so
+        /// the XI2 selection on `B` counts for both the focus walk and the
+        /// owner_events walk.
+        fn setup_xi2(owner_events: bool) -> (ServerState, UnixStream) {
+            let mut state = ServerState::new();
+            window(&mut state, T, ROOT_WINDOW, (100, 100, 400, 300, 0));
+            window(&mut state, B, T, (0, 250, 400, 50, 0));
+            window(&mut state, W2, ROOT_WINDOW, (600, 100, 100, 100, 0));
+            state.pointer_root = OVER_B;
+            let xi2_keys = (1u64 << XI2_KEYPRESS_EVTYPE) | (1u64 << XI2_KEYRELEASE_EVTYPE);
+            let owner = install_kf(&mut state, OWNER, ROOT_WINDOW, 0, 0);
+            let masks = &mut state.clients.get_mut(&OWNER).unwrap().xi2_masks;
+            masks.clear();
+            for w in [ROOT_WINDOW, T, B, W2] {
+                masks.insert((w, XI2_ALL_MASTER_DEVICES), xi2_keys);
+            }
+            state.core_focus.raw = 1;
+            state.key_grabs.push(KeyGrab {
+                device_id: XI2_MASTER_KEYBOARD_DEVICE_ID,
+                owner: ClientId(OWNER),
+                grab_window: ROOT_WINDOW,
+                keycode: KEY_2,
+                modifiers: MOD4,
+                owner_events,
+                pointer_mode: 1,
+                keyboard_mode: 1,
+                via_xi2: true,
+                xi2_mask: u32::try_from(xi2_keys).unwrap(),
+            });
+            (state, owner)
+        }
+
+        /// (evtype, event, child, event_x, event_y) of every XI2 key event.
+        fn xi2_keys(peer: &mut UnixStream) -> Vec<(u16, u32, u32, i32, i32)> {
+            let b = read_all_available(peer);
+            let mut out = Vec::new();
+            let mut off = 0;
+            while off + 32 <= b.len() {
+                let e = &b[off..];
+                let len = u32::from_le_bytes(e[4..8].try_into().unwrap()) as usize;
+                if e[0] == 35 {
+                    let u32_at = |at: usize| u32::from_le_bytes(e[at..at + 4].try_into().unwrap());
+                    let i32_at = |at: usize| i32::from_le_bytes(e[at..at + 4].try_into().unwrap());
+                    out.push((
+                        u16::from_le_bytes([e[8], e[9]]),
+                        u32_at(24),
+                        u32_at(28),
+                        i32_at(40) >> 16,
+                        i32_at(44) >> 16,
+                    ));
+                }
+                off += 32 + len * 4;
+            }
+            out
+        }
+
+        fn press_plain(state: &mut ServerState, keycode: u8, mods: u16) {
+            let mut backend = crate::backend::recording::RecordingBackend::default();
+            let event = HostKeyEvent {
+                root_x: OVER_B.0,
+                root_y: OVER_B.1,
+                state: mods,
+                ..key_event(true, keycode)
+            };
+            let _ = key_event_fanout_to_state(state, &mut backend, event);
+        }
+
+        const SUPER: u8 = 133;
+        const XI_PRESS: u16 = XI2_KEYPRESS_EVTYPE;
+
+        /// V7 (owner_events=1): Super → `B`; activating `2` → root/`T`;
+        /// `3` under the grab → `B`.
+        #[test]
+        fn v7_xi2_owner_events_walk_uses_xi2_selections() {
+            let (mut state, mut owner) = setup_xi2(true);
+            press_plain(&mut state, SUPER, 0);
+            press_plain(&mut state, KEY_2, MOD4);
+            press_plain(&mut state, KEY_3, MOD4);
+            assert_eq!(
+                xi2_keys(&mut owner),
+                [
+                    (XI_PRESS, B.0, 0, 200, 25),
+                    (XI_PRESS, ROOT_WINDOW.0, T.0, 300, 375),
+                    (XI_PRESS, B.0, 0, 200, 25),
+                ]
+            );
+        }
+
+        /// V8 (owner_events=0): Super → `B`; activating `2` and `3`
+        /// under the grab → root/`T`.
+        #[test]
+        fn v8_xi2_no_owner_events_reports_on_grab_window() {
+            let (mut state, mut owner) = setup_xi2(false);
+            press_plain(&mut state, SUPER, 0);
+            press_plain(&mut state, KEY_2, MOD4);
+            press_plain(&mut state, KEY_3, MOD4);
+            assert_eq!(
+                xi2_keys(&mut owner),
+                [
+                    (XI_PRESS, B.0, 0, 200, 25),
+                    (XI_PRESS, ROOT_WINDOW.0, T.0, 300, 375),
+                    (XI_PRESS, ROOT_WINDOW.0, T.0, 300, 375),
+                ]
+            );
         }
     }
 }

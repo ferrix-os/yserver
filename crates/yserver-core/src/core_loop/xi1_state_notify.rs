@@ -26,14 +26,9 @@ const BUTTON_CLASS_BIT: u8 = 1 << 1;
 const VALUATOR_CLASS_BIT: u8 = 1 << 2;
 const MODE_BITS_SHIFT: u8 = 6;
 
-/// Device shape reported by DeviceStateNotify. MUST stay in sync with
-/// the XI1 ListInputDevices reply (`encode_list_input_devices_reply`:
-/// keyboards report keycodes 8..=255, pointers 7 buttons + 4 relative
-/// axes) and the XIQueryDevice class list — clients cross-check them.
+/// Keycode bounds shared by keyboard DeviceStateNotify and QueryDeviceState.
 const KEY_MIN: u8 = 8;
 const KEY_MAX: u8 = 255;
-const NUM_BUTTONS: u8 = 7;
-const NUM_AXES: u8 = 4;
 
 /// Deliver the device-state snapshot for `deviceid` to every client
 /// that selected its `DeviceStateNotify` class on `window` via
@@ -62,9 +57,19 @@ pub fn deliver_state_notify(state: &mut ServerState, deviceid: u16, window: Reso
         .get(&deviceid)
         .copied()
         .unwrap_or_default();
-    let has_keys = crate::core_loop::process_request::xi1_device_has_keys(deviceid);
-    let has_buttons = crate::core_loop::process_request::xi1_device_has_buttons(deviceid);
-    let has_valuators = crate::core_loop::process_request::xi1_device_has_valuators(deviceid);
+    let has_keys =
+        crate::core_loop::process_request::xi1_device_has_keys(&state.xi_devices, deviceid);
+    let has_buttons =
+        crate::core_loop::process_request::xi1_device_has_buttons(&state.xi_devices, deviceid);
+    let has_valuators =
+        crate::core_loop::process_request::xi1_device_has_valuators(&state.xi_devices, deviceid);
+    let class_shape = state
+        .xi_devices
+        .device(deviceid)
+        .expect("DeviceFocus device remains registered for its state snapshot")
+        .class_shape;
+    let num_buttons = class_shape.button_count();
+    let num_axes = class_shape.valuator_count();
     // Stored axis values (Xorg `axisVal`): real motion keeps axes 0/1
     // at the sprite position, device-motion fakes write their payload.
     let axes = dev_state.valuators;
@@ -85,6 +90,8 @@ pub fn deliver_state_notify(state: &mut ServerState, deviceid: u16, window: Reso
             has_keys,
             has_buttons,
             has_valuators,
+            num_buttons,
+            num_axes,
             &axes,
         );
     });
@@ -105,19 +112,20 @@ fn encode_state_notify_chain(
     has_keys: bool,
     has_buttons: bool,
     has_valuators: bool,
+    num_buttons: u8,
+    num_axes: u8,
     axes: &[i32; 4],
 ) {
     let first = crate::server::XI_FIRST_EVENT;
     #[allow(clippy::cast_possible_truncation)]
     let dev_byte = deviceid as u8;
 
-    // Continuations needed (FixDeviceStateNotify counting,
-    // dix/enterleave.c:712-730): keys beyond the first 32 keycode bits
-    // ride in a deviceKeyStateNotify; axes beyond the first 3 in
-    // deviceValuator events. 7 buttons fit the leading event.
+    // Continuations follow the current class counts, as in Xorg's
+    // FixDeviceStateNotify counting (`dix/enterleave.c:715-729`): keys
+    // beyond 32 and valuators beyond the first 3 continue in later events.
     let num_keys: u8 = if has_keys { KEY_MAX - KEY_MIN } else { 0 };
     let more_keys = has_keys && num_keys > 32;
-    let more_valuators = has_valuators && NUM_AXES > 3;
+    let more_valuators = has_valuators && num_axes > 3;
 
     let mut classes_reported = 0u8;
     if has_keys {
@@ -144,8 +152,8 @@ fn encode_state_notify_chain(
         seq,
         time,
         num_keys,
-        if has_buttons { NUM_BUTTONS } else { 0 },
-        if has_valuators { NUM_AXES.min(3) } else { 0 },
+        if has_buttons { num_buttons } else { 0 },
+        if has_valuators { num_axes.min(3) } else { 0 },
         classes_reported,
         dev_state.buttons_down[..4].try_into().expect("4 bytes"),
         dev_state.keys_down[..4].try_into().expect("4 bytes"),
@@ -169,7 +177,8 @@ fn encode_state_notify_chain(
     }
 
     if more_valuators {
-        // 4 axes → one continuation with the single remaining axis.
+        // Every valuator after the three in DeviceStateNotify is continued
+        // in DeviceValuator events (`dix/enterleave.c:753-760`).
         crate::xinput::encode_xi1_device_valuator(
             buf,
             order,
@@ -177,7 +186,7 @@ fn encode_state_notify_chain(
             dev_byte,
             seq,
             0, // device_state: libXi ignores it on this path
-            NUM_AXES - 3,
+            num_axes - 3,
             3,
             [axes[3], 0, 0, 0, 0, 0],
         );
@@ -196,8 +205,8 @@ mod tests {
     };
     use yserver_protocol::x11::{ClientByteOrder, CreateWindowRequest};
 
-    const POINTER: u16 = crate::xinput::DEVICEID_SLAVE_POINTER;
-    const KEYBOARD: u16 = crate::xinput::DEVICEID_SLAVE_KEYBOARD;
+    const POINTER: u16 = crate::xinput::DEVICEID_XTEST_POINTER;
+    const KEYBOARD: u16 = crate::xinput::DEVICEID_XTEST_KEYBOARD;
 
     // Duplicated from xi1_focus.rs::tests (shared test_fixtures module
     // is a tracked follow-up).
@@ -206,6 +215,7 @@ mod tests {
         state.clients.insert(
             id,
             ClientState {
+                admission: crate::access::Admission::Internal,
                 writer: Arc::new(Mutex::new(crate::transport::Transport::Unix(a))),
                 byte_order: ClientByteOrder::LittleEndian,
                 last_sequence: Arc::new(AtomicU16::new(0)),
@@ -218,11 +228,16 @@ mod tests {
                 xi1_event_classes: HashSet::new(),
                 xi1_window_event_classes: HashMap::new(),
                 outbound: VecDeque::new(),
+                outbound_fds: Default::default(),
                 watching_writable: false,
+                write_failed: false,
+                gone: false,
                 focused_window: ROOT_WINDOW,
                 reader_control: None,
                 is_local: true,
                 fd_passing: true,
+                internal: false,
+                peer: crate::peer::PeerIdentity::unknown_unix(),
             },
         );
         b
@@ -296,27 +311,20 @@ mod tests {
 
         deliver_state_notify(&mut state, POINTER, w);
         let bytes = read_all_available(&mut peer);
-        assert_eq!(bytes.len(), 64, "deviceStateNotify + deviceValuator");
+        assert_eq!(bytes.len(), 32, "two axes need no valuator continuation");
 
         let first = crate::server::XI_FIRST_EVENT;
-        let sn = &bytes[..32];
+        let sn = &bytes;
         assert_eq!(sn[0], first + crate::xinput::XI_DEVICE_STATE_NOTIFY_OFFSET);
-        assert_eq!(sn[1], 4 | crate::xinput::XI1_MORE_EVENTS);
+        assert_eq!(sn[1], 4, "XTEST device id without MORE_EVENTS");
         assert_eq!(sn[8], 0, "num_keys");
-        assert_eq!(sn[9], 7, "num_buttons");
-        assert_eq!(sn[10], 3, "num_valuators (first 3 of 4)");
+        assert_eq!(sn[9], 10, "num_buttons follows CorePointer");
+        assert_eq!(sn[10], 2, "num_valuators follows CorePointer");
         assert_eq!(sn[11], 0b0000_0110, "Button+Valuator classes, Relative");
         assert_eq!(sn[12], 0b0000_1010, "buttons 1+3 down");
         assert_eq!(&sn[16..20], &[0u8; 4], "no key bits");
         assert_eq!(i32::from_le_bytes(sn[20..24].try_into().unwrap()), 55);
         assert_eq!(i32::from_le_bytes(sn[24..28].try_into().unwrap()), 66);
-
-        let dv = &bytes[32..];
-        assert_eq!(dv[0], first + crate::xinput::XI_DEVICE_VALUATOR_OFFSET);
-        assert_eq!(dv[1], 4, "last event: no MORE_EVENTS");
-        assert_eq!(dv[6], 1, "one remaining valuator");
-        assert_eq!(dv[7], 3, "first_valuator");
-        assert_eq!(i32::from_le_bytes(dv[8..12].try_into().unwrap()), 0);
     }
 
     #[test]

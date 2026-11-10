@@ -1,0 +1,398 @@
+//! The server on the surface platform: headless (no surface, nothing shown,
+//! only with an explicit `--headless`) or in a shell's window.
+
+use std::{
+    ffi::CStr,
+    io,
+    sync::{Arc, atomic::AtomicUsize},
+};
+#[cfg(unix)]
+use std::{fs, path::PathBuf};
+
+use yserver_core::{
+    backend::{Backend as _, BackendTopology, install_backend_root_bindings},
+    core_loop::{self, poll_tokens::ClientIdAllocator},
+    rootless::CoordinatePolicy,
+    server::ServerState,
+};
+
+use super::{
+    SurfacePlatform,
+    clipboard::{ClipboardBridge, HostClipboard},
+    clock::FrameClock,
+    link::ShellLink,
+    swapchain::{NativeSurface, SurfaceOutput},
+    ui::ShellUi,
+};
+use crate::{
+    kms::{
+        render::XBackend,
+        vk::device::{VkContext, VkContextOptions},
+    },
+    launch,
+    rootless::{host::RootlessHost, record::RecordHost},
+};
+
+/// The screen size without `--geometry`, in X pixels.
+pub(crate) const DEFAULT_SIZE: (u16, u16) = (1280, 800);
+
+/// A window shell's half of the server: its surface, the surface's frame
+/// clock (ticked by the shell), its link, its UI commands, the count of
+/// established X clients the core keeps for it and the host pasteboard.
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
+pub(crate) struct WindowSpec {
+    pub(crate) surface: NativeSurface,
+    pub(crate) clock: Arc<FrameClock>,
+    pub(crate) link: Arc<ShellLink>,
+    pub(crate) ui: Arc<dyn ShellUi>,
+    pub(crate) clients: Arc<AtomicUsize>,
+    /// The largest window content the screen shows unclamped, in X pixels.
+    pub(crate) max_output: Option<(u16, u16)>,
+    /// The window's physical size in millimetres; 0: unknown.
+    pub(crate) output_mm: (u32, u32),
+    /// Swapchain pixels per X pixel; later changes come as `Resized`.
+    pub(crate) copy_scale: u32,
+    /// Bridged with CLIPBOARD; none: not bridged.
+    pub(crate) clipboard: Option<HostClipboard>,
+}
+
+/// A rootless window shell's half of the server: one native window per
+/// top-level, no output.
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
+pub(crate) struct RootlessSpec {
+    /// The shell's Vulkan surface extension.
+    pub(crate) surface_extension: &'static CStr,
+    /// The root: every display at one scale.
+    pub(crate) root: (u16, u16),
+    /// Present's MSC and the hosts' pacing tick.
+    pub(crate) clock: Arc<FrameClock>,
+    pub(crate) link: Arc<ShellLink>,
+    pub(crate) ui: Arc<dyn ShellUi>,
+    pub(crate) clients: Arc<AtomicUsize>,
+}
+
+/// The zero-output backend a rootless shell runs on.
+///
+/// # Errors
+///
+/// See [`super::headless_backend`].
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
+pub(crate) fn rootless_backend(
+    vk: Arc<VkContext>,
+    spec: &RootlessSpec,
+    layout: Option<String>,
+) -> io::Result<XBackend<SurfacePlatform>> {
+    log::info!(
+        "rootless: root {}x{}, swapchain maintenance1 {}",
+        spec.root.0,
+        spec.root.1,
+        if vk.swapchain_maintenance1 {
+            "on"
+        } else {
+            "off (every retirement waits for the queue)"
+        }
+    );
+    let mut backend = super::headless_backend(vk, spec.root, layout)?;
+    backend.platform.set_clock(Arc::clone(&spec.clock));
+    backend.pstate.link = Some(Arc::clone(&spec.link));
+    backend.pstate.ui = Some(Arc::clone(&spec.ui));
+    backend.pstate.client_count = Arc::clone(&spec.clients);
+    Ok(backend)
+}
+
+/// Run the rootless server for a window shell's `host`; tells the shell to
+/// quit when the core loop ends. Called on the core thread.
+///
+/// # Errors
+///
+/// Vulkan, rootless mode, the sockets or the core loop failed.
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
+pub(crate) fn run_rootless(
+    opts: launch::LaunchOptions,
+    spec: RootlessSpec,
+    host: Box<dyn RootlessHost + Send>,
+    clipboard: Option<HostClipboard>,
+) -> io::Result<()> {
+    let result = serve(
+        &opts,
+        |opts| {
+            let vk = VkContext::new_with_options(VkContextOptions {
+                wants_present: true,
+                surface_extension: Some(spec.surface_extension),
+                wants_kms_interop: false,
+            })
+            .map_err(|e| io::Error::other(format!("vulkan: {e}")))?;
+            rootless_backend(vk, &spec, opts.layout.clone())
+        },
+        |state, backend| {
+            crate::rootless::start(
+                state,
+                backend,
+                host,
+                CoordinatePolicy::Global { origin: (0, 0) },
+            )
+            .map_err(|e| io::Error::other(format!("rootless: {e}")))
+        },
+        Some(&spec.link),
+        clipboard,
+        |display| spec.ui.set_display(display),
+    );
+    spec.link.disconnect();
+    if let Err(e) = &result {
+        log::error!("yserver: {e}");
+    }
+    spec.ui.quit(result.is_err());
+    result
+}
+
+/// Run the headless server, or refuse without `--headless`.
+///
+/// # Errors
+///
+/// No `--headless`, or Vulkan, the sockets or the core loop failed.
+pub(crate) fn run_headless(opts: launch::LaunchOptions) -> io::Result<()> {
+    if !opts.headless {
+        return Err(io::Error::other(
+            "no window shell on this platform; use --headless for a server without a window",
+        ));
+    }
+    let size = opts.geometry.unwrap_or(DEFAULT_SIZE);
+    // `--rootless`: the recording host answers on its own link.
+    let link = opts.rootless.then(|| Arc::new(ShellLink::default()));
+    let result = serve(
+        &opts,
+        |opts| {
+            let vk = VkContext::new_with_options(VkContextOptions {
+                wants_present: false,
+                surface_extension: None,
+                wants_kms_interop: false,
+            })
+            .map_err(|e| io::Error::other(format!("vulkan: {e}")))?;
+            let mut backend = super::headless_backend(vk, size, opts.layout.clone())?;
+            backend.pstate.link.clone_from(&link);
+            Ok(backend)
+        },
+        |state, backend| {
+            let Some(link) = &link else {
+                return Ok(());
+            };
+            let host = RecordHost::new(Arc::clone(link), opts.rootless_record.clone())?;
+            crate::rootless::start(state, backend, Box::new(host), CoordinatePolicy::Opaque)
+                .map_err(|e| io::Error::other(format!("rootless: {e}")))?;
+            log::info!("yserver: rootless, recording host");
+            Ok(())
+        },
+        link.as_deref(),
+        None,
+        |_| {},
+    );
+    if let Some(link) = &link {
+        link.disconnect();
+    }
+    result
+}
+
+/// Run the server in the shell's window; tells the shell to quit when the
+/// core loop ends. Called on the core thread.
+///
+/// # Errors
+///
+/// Vulkan, the sockets or the core loop failed.
+#[allow(
+    dead_code,
+    reason = "a window shell's; only macOS and Windows have one"
+)]
+pub(crate) fn run_windowed(opts: launch::LaunchOptions, spec: WindowSpec) -> io::Result<()> {
+    let size = opts.geometry.unwrap_or(DEFAULT_SIZE);
+    let WindowSpec {
+        surface,
+        clock,
+        link,
+        ui,
+        clients,
+        max_output,
+        output_mm,
+        copy_scale,
+        clipboard,
+    } = spec;
+    let result = serve(
+        &opts,
+        |opts| {
+            let vk = surface.create_context()?;
+            let extent = ash::vk::Extent2D {
+                width: u32::from(size.0),
+                height: u32::from(size.1),
+            };
+            let mut output = SurfaceOutput::new(Arc::clone(&vk), &surface, extent, clock)
+                .map_err(|e| io::Error::other(format!("surface: {e:?}")))?;
+            output.set_copy_scale(copy_scale);
+            let mut backend = super::surface_backend(vk, size, opts.layout.clone(), vec![output])?;
+            backend.pstate.link = Some(Arc::clone(&link));
+            backend.pstate.ui = Some(Arc::clone(&ui));
+            backend.pstate.client_count = clients;
+            if let Some(max_output) = max_output {
+                backend.platform.set_max_output(max_output);
+            }
+            backend.platform.output_mm = output_mm;
+            Ok(backend)
+        },
+        |_, _| Ok(()),
+        Some(&link),
+        clipboard,
+        |display| ui.set_display(display),
+    );
+    link.disconnect();
+    if let Err(e) = &result {
+        log::error!("yserver: {e}");
+    }
+    ui.quit(result.is_err());
+    result
+}
+
+/// Bring up the backend, the sockets and the core loop, and tear them down.
+fn serve(
+    opts: &launch::LaunchOptions,
+    build: impl FnOnce(&launch::LaunchOptions) -> io::Result<XBackend<SurfacePlatform>>,
+    setup: impl FnOnce(&mut ServerState, &mut XBackend<SurfacePlatform>) -> io::Result<()>,
+    link: Option<&ShellLink>,
+    clipboard: Option<HostClipboard>,
+    on_display: impl FnOnce(u16),
+) -> io::Result<()> {
+    log::info!(target: "yserver::startup", "yserver: startup — {}", crate::version::line());
+
+    let auth = crate::build_auth_state(opts);
+    crate::validate_tcp_startup(opts, &auth)?;
+    let sigusr1_was_ignored = launch::sigusr1_is_ignored();
+    let parent_pid = launch::startup_parent_pid();
+    // Linux masks per thread, so this must precede every other thread; the
+    // macOS kqueue variant ignores the signals process-wide.
+    let signal_source = crate::block_termination_signals()?;
+
+    let mut backend = build(opts)?;
+    let topology = BackendTopology::from_backend(&mut backend);
+    log::info!(
+        "yserver: surface screen {}x{}",
+        topology.width,
+        topology.height
+    );
+    let mut state = topology.into_server_state();
+    crate::clock::init(state.start_instant);
+    install_backend_root_bindings(&mut state, &backend);
+    yserver_core::core_loop::process_request::install_default_font(&mut state, &mut backend)?;
+    setup(&mut state, &mut backend)?;
+
+    #[cfg(unix)]
+    let (display, listener, _lock_guard, socket_path) = bind_display(opts)?;
+    // TODO(windows): no display lock or free-display scan yet.
+    #[cfg(windows)]
+    let display = opts.display.unwrap_or(launch::DEFAULT_DISPLAY);
+    on_display(display);
+    #[cfg(unix)]
+    let listeners = crate::bind_client_listeners(listener, display, opts, &auth)?;
+    #[cfg(windows)]
+    let listeners = crate::bind_client_listeners(display, opts, &auth)?;
+    let xdmcp = crate::build_xdmcp_service(opts, display)?;
+
+    let (poll, sender, rx) = core_loop::channel()?;
+    backend.set_input_sender(sender.clone_handle());
+    crate::spawn_signal_thread(signal_source, sender.clone_handle(), opts.reset_policy)?;
+    if let Some(link) = link {
+        link.connect(sender.clone_handle());
+    }
+    launch::signal_ready(opts, display, sigusr1_was_ignored, parent_pid);
+    // After the listener, stopped first: an internal client, never counted.
+    let clipboard = clipboard.and_then(|host| {
+        ClipboardBridge::start(sender.clone_handle(), host)
+            .inspect_err(|e| log::warn!("yserver: no clipboard bridge: {e}"))
+            .ok()
+    });
+
+    log::info!("yserver: entering single-threaded core loop");
+    let result = core_loop::run_core(
+        poll,
+        rx,
+        sender,
+        &mut state,
+        &mut backend,
+        listeners,
+        &ClientIdAllocator::new(),
+        auth,
+        opts.reset_policy,
+        xdmcp,
+    );
+    if let Some(clipboard) = clipboard {
+        clipboard.stop();
+    }
+    if let Err(err) = &result {
+        log::warn!("yserver: run_core returned error: {err}");
+    }
+
+    for entry in backend.take_shutdown_present_events() {
+        yserver_core::core_loop::process_request::fire_present_completion_events(
+            &mut state, &entry,
+        );
+    }
+    backend.signal_all_retained_present_wakes();
+    yserver_core::core_loop::process_request::shutdown_drain_present_pending_exec(
+        &mut state,
+        &mut backend,
+    );
+    backend.shutdown_destroy_drawables();
+    #[cfg(unix)]
+    let _ = fs::remove_file(&socket_path);
+    log::info!("yserver: exiting");
+    result
+}
+
+/// Resolve the display, take its lock and bind its Unix socket.
+#[cfg(unix)]
+fn bind_display(
+    opts: &launch::LaunchOptions,
+) -> io::Result<(
+    u16,
+    std::os::unix::net::UnixListener,
+    Option<launch::LockGuard>,
+    PathBuf,
+)> {
+    let socket_dir = PathBuf::from("/tmp/.X11-unix");
+    fs::create_dir_all(&socket_dir).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("create_dir_all({}): {e}", socket_dir.display()),
+        )
+    })?;
+    let (display, listener, lock_guard, socket_path) = match launch::resolve(opts) {
+        launch::Resolution::Explicit { display, lock } => {
+            let guard = if lock {
+                Some(launch::acquire_lock(&PathBuf::from("/tmp"), display)?)
+            } else {
+                None
+            };
+            let (listener, socket_path) = launch::bind_explicit(&socket_dir, display)?;
+            (display, listener, guard, socket_path)
+        }
+        launch::Resolution::AutoPick => {
+            let (display, listener, socket_path) = launch::autopick(&socket_dir)?;
+            (display, listener, None, socket_path)
+        }
+        launch::Resolution::FirstFree { first } => {
+            let (display, guard, listener, socket_path) =
+                launch::autopick_locked(&PathBuf::from("/tmp"), &socket_dir, first)?;
+            (display, listener, Some(guard), socket_path)
+        }
+    };
+    log::info!("yserver: listening on unix socket DISPLAY=:{display}");
+    Ok((display, listener, lock_guard, socket_path))
+}

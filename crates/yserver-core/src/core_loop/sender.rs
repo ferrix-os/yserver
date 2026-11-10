@@ -171,6 +171,21 @@ impl BoundSender {
 }
 
 impl CoreReceiver {
+    /// Block indefinitely for one tagged core message. Use
+    /// [`Self::recv_tagged_timeout`] for lifecycle waits that must be bounded.
+    pub fn recv_tagged(&self) -> Result<(Generation, Message), crossbeam_channel::RecvError> {
+        self.rx.recv()
+    }
+
+    /// Wait a bounded time for one tagged core message. The VT release pause
+    /// barrier uses this so a dead input producer cannot freeze the core loop.
+    pub fn recv_tagged_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(Generation, Message), crossbeam_channel::RecvTimeoutError> {
+        self.rx.recv_timeout(timeout)
+    }
+
     /// Drain everything currently buffered, discarding each message's
     /// generation tag. Non-blocking; stops at the first empty
     /// `try_recv`. This is the pre-existing, behaviour-preserving
